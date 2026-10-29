@@ -378,7 +378,7 @@ class CertificateTests(unittest.TestCase):
         self.assertNotIn(self.controller.config['secret_id'], state_text)
         self.assertNotIn(self.controller.config['secret_key'], state_text)
 
-    def test_near_expiry_pending_certificate_does_not_block_renewal(self):
+    def test_near_expiry_pending_certificate_is_reissued_before_deployment(self):
         self.configure_runtime_mocks()
         self.prepare_candidate('short')
         certctl.save_json(self.controller.state / 'pending.json', {
@@ -386,18 +386,178 @@ class CertificateTests(unittest.TestCase):
         calls = []
         def renewal(args):
             calls.append(args)
-            if '--renew' in args:
+            if '--issue' in args:
+                self.assertFalse(self.controller.candidate_dir().exists())
                 self.prepare_candidate('new')
                 return 0
             if '--deploy' in args:
                 self.install_current('new')
                 return 0
-            self.fail('pending certificate should be renewed, not reissued with force')
+            self.fail('unusable candidate should be reissued from a clean domain directory')
         self.controller.invoke_acme = mock.Mock(side_effect=renewal)
         self.controller.run()
-        self.assertIn('--renew', calls[0])
+        self.assertIn('--issue', calls[0])
         self.assertEqual(certctl.fingerprint(self.controller.current_cert()), self.new_fingerprint)
         self.assertFalse((self.controller.state / 'pending.json').exists())
+
+    def test_corrupt_pending_material_is_reissued_without_reusing_old_key_or_schedule(self):
+        self.configure_runtime_mocks()
+        for filename in ('fullchain.cer', 'ca.cer', 'ttxli.cn.key', 'ttxli.cn.cer', 'missing-leaf'):
+            with self.subTest(filename=filename):
+                self.install_current('old')
+                self.prepare_candidate()
+                directory = self.controller.candidate_dir()
+                conf = directory / 'ttxli.cn.conf'
+                with conf.open('a') as handle:
+                    handle.write("Le_NextRenewTime='4102444800'\n")
+                (directory / 'ttxli.cn.csr').write_text('unusable old CSR')
+                certctl.save_json(self.controller.state / 'pending.json', {'at': certctl.now()})
+                if filename == 'missing-leaf':
+                    self.controller.candidate().unlink()
+                else:
+                    (directory / filename).write_text('TRUNCATED')
+
+                def acme(args):
+                    if '--issue' in args:
+                        self.assertFalse(directory.exists())
+                        self.assertEqual(certctl.fingerprint(self.controller.current_cert()), self.old_fingerprint)
+                        self.assertEqual(args, ['--issue', '--dns', 'dns_tencent', '--keylength', '2048',
+                            '--accountemail', 'operator@example.com', '-d', 'ttxli.cn', '-d', '*.ttxli.cn'])
+                        self.prepare_candidate()
+                        return 0
+                    if '--deploy' in args:
+                        self.install_current('new')
+                        return 0
+                    self.fail('damaged candidate must not use scheduled renewal')
+
+                self.controller.invoke_acme = mock.Mock(side_effect=acme)
+                self.controller.run()
+                self.assertEqual(certctl.fingerprint(self.controller.current_cert()), self.new_fingerprint)
+                self.assertFalse((self.controller.state / 'pending.json').exists())
+                self.assertFalse((self.controller.state / 'recovery.json').exists())
+                snapshots = list((self.controller.state / 'recovery-backups').iterdir())
+                self.assertLessEqual(len(snapshots), certctl.RECOVERY_LIMIT)
+                self.assertTrue(any((path / 'ttxli.cn' / 'ttxli.cn.csr').read_text() == 'unusable old CSR'
+                                    for path in snapshots))
+
+    def test_failed_recovery_is_rate_limited_and_stops_after_three_attempts(self):
+        self.configure_runtime_mocks()
+        self.prepare_candidate()
+        (self.controller.candidate_dir() / 'fullchain.cer').write_text('TRUNCATED')
+        pending = self.controller.state / 'pending.json'
+        certctl.save_json(pending, {'at': certctl.now()})
+
+        def failed_issue(args):
+            self.assertIn('--issue', args)
+            self.prepare_candidate()
+            (self.controller.candidate_dir() / 'fullchain.cer').write_text('TRUNCATED')
+            return 1
+
+        self.controller.invoke_acme = mock.Mock(side_effect=failed_issue)
+        start = 2000000000
+        for attempt in range(certctl.RECOVERY_LIMIT):
+            with mock.patch.object(certctl.time, 'time', return_value=start + attempt * certctl.RECOVERY_INTERVAL):
+                with self.assertRaisesRegex(certctl.Failure, '签发或续期失败'):
+                    self.controller.run()
+            self.assertEqual(self.controller.invoke_acme.call_count, attempt + 1)
+            self.assertTrue(pending.exists())
+            self.assertEqual(certctl.fingerprint(self.controller.current_cert()), self.old_fingerprint)
+            if attempt == 0:
+                with mock.patch.object(certctl.time, 'time', return_value=start + 60):
+                    with self.assertRaisesRegex(certctl.Failure, '不足 24 小时'):
+                        self.controller.run()
+                self.assertEqual(self.controller.invoke_acme.call_count, 1)
+        with mock.patch.object(certctl.time, 'time', return_value=start + 4 * certctl.RECOVERY_INTERVAL):
+            with self.assertRaisesRegex(certctl.Failure, '连续尝试 3 次'):
+                self.controller.run()
+        self.assertEqual(self.controller.invoke_acme.call_count, 3)
+        self.assertEqual(certctl.read_json(self.controller.state / 'recovery.json')['attempts'], 3)
+
+    def test_corruption_after_success_is_recovered_without_existing_pending_marker(self):
+        self.configure_runtime_mocks()
+        for filename in ('ttxli.cn.cer', 'fullchain.cer'):
+            with self.subTest(filename=filename):
+                self.install_current('old')
+                self.prepare_candidate('old')
+                (self.controller.candidate_dir() / filename).write_text('TRUNCATED')
+                self.assertFalse((self.controller.state / 'pending.json').exists())
+
+                def acme(args):
+                    if '--issue' in args:
+                        self.assertFalse(self.controller.candidate_dir().exists())
+                        self.assertTrue((self.controller.state / 'pending.json').exists())
+                        self.prepare_candidate()
+                        return 0
+                    self.assertIn('--deploy', args)
+                    self.install_current('new')
+                    return 0
+
+                self.controller.invoke_acme = mock.Mock(side_effect=acme)
+                self.controller.run()
+                self.assertEqual(certctl.fingerprint(self.controller.current_cert()), self.new_fingerprint)
+                self.assertFalse((self.controller.state / 'pending.json').exists())
+
+    def test_valid_candidate_clears_interrupted_recovery_before_retrying_deployment(self):
+        self.configure_runtime_mocks()
+        self.prepare_candidate()
+        certctl.save_json(self.controller.state / 'pending.json', {'at': certctl.now()})
+        recovery = self.controller.state / 'recovery.json'
+        certctl.save_json(recovery, {'domains': self.controller.config['domains'],
+            'attempts': certctl.RECOVERY_LIMIT, 'last_attempt': 2000000000})
+        self.controller.invoke_acme = mock.Mock(return_value=1)
+        with self.assertRaisesRegex(certctl.Failure, 'DSM 部署失败'):
+            self.controller.run()
+        self.controller.invoke_acme.assert_called_once_with(
+            ['--deploy', '-d', 'ttxli.cn', '--deploy-hook', 'synology_dsm'])
+        self.assertFalse(recovery.exists())
+        self.assertTrue((self.controller.state / 'pending.json').exists())
+
+    def test_recovery_validates_saved_config_before_quarantine_or_issuance(self):
+        self.configure_runtime_mocks()
+        self.prepare_candidate()
+        directory = self.controller.candidate_dir()
+        (directory / 'fullchain.cer').write_text('TRUNCATED')
+        with (directory / 'ttxli.cn.conf').open('a') as handle:
+            handle.write("Le_PreHook='unexpected-command'\n")
+        certctl.save_json(self.controller.state / 'pending.json', {'at': certctl.now()})
+        self.controller.invoke_acme = mock.Mock()
+        with self.assertRaisesRegex(certctl.Failure, '额外命令'):
+            self.controller.run()
+        self.controller.invoke_acme.assert_not_called()
+        self.assertTrue(directory.exists())
+        self.assertFalse((self.controller.state / 'recovery.json').exists())
+
+    def test_recovered_valid_candidate_retries_deployment_without_another_issuance(self):
+        self.configure_runtime_mocks()
+        self.prepare_candidate()
+        (self.controller.candidate_dir() / 'fullchain.cer').write_text('TRUNCATED')
+        pending = self.controller.state / 'pending.json'
+        certctl.save_json(pending, {'at': certctl.now()})
+
+        def first_attempt(args):
+            if '--issue' in args:
+                self.prepare_candidate()
+                return 0
+            self.assertIn('--deploy', args)
+            return 1
+
+        self.controller.invoke_acme = mock.Mock(side_effect=first_attempt)
+        with self.assertRaisesRegex(certctl.Failure, 'DSM 部署失败'):
+            self.controller.run()
+        self.assertTrue(pending.exists())
+        self.assertFalse((self.controller.state / 'recovery.json').exists())
+
+        def second_attempt(args):
+            if '--deploy' in args:
+                self.install_current('new')
+                return 0
+            self.assertIn('--renew', args)
+            return 2
+
+        self.controller.invoke_acme = mock.Mock(side_effect=second_attempt)
+        self.controller.run()
+        self.assertFalse(pending.exists())
+        self.assertEqual(certctl.fingerprint(self.controller.current_cert()), self.new_fingerprint)
 
     def test_deployed_certificate_with_stale_tls_is_retried_next_run(self):
         self.configure_runtime_mocks()

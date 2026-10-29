@@ -26,6 +26,8 @@ ACME_VERSION = '3.1.6'
 CA = 'https://acme-v02.api.letsencrypt.org/directory'
 TEMP_USER = 'sc-acmesh-tmp'
 SYSTEM_PATH = '/usr/syno/sbin:/usr/syno/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin'
+RECOVERY_INTERVAL = 24 * 60 * 60
+RECOVERY_LIMIT = 3
 
 
 class Failure(Exception):
@@ -293,7 +295,12 @@ class Controller:
             raise Failure('未找到可替换的现有证书，请先在 DSM 导入或创建证书。')
         for index, (key, value) in enumerate(choices, 1):
             cert = self.archive / key / 'cert.pem'
-            names = ', '.join(certificate_domains(cert)) if cert.is_file() else '无证书文件'
+            try:
+                if not cert.is_file():
+                    raise Failure('缺少证书文件')
+                names = ', '.join(certificate_domains(cert))
+            except (Failure, OSError) as error:
+                names = '不可用：{}'.format(error)
             print('{}: {}  描述={!r}  域名={}'.format(index, key, value.get('desc', ''), names))
         selection = input('选择当前用于 ttxli.cn 的证书编号: ').strip()
         if not selection.isdigit() or not 1 <= int(selection) <= len(choices):
@@ -427,6 +434,42 @@ class Controller:
                 if os.path.exists(temporary):
                     os.unlink(temporary)
 
+    def recover_candidate(self):
+        # 隔离整个损坏工作目录，避免未来续期时间、坏私钥或旧 CSR 阻止重新签发。
+        self.prepare_acme_config()
+        path = self.state / 'recovery.json'
+        attempts, last_attempt = 0, 0
+        if path.exists():
+            private(path)
+            previous = read_json(path)
+            if (not isinstance(previous, dict) or previous.get('domains') != self.config['domains']
+                    or type(previous.get('attempts')) is not int
+                    or not 1 <= previous['attempts'] <= RECOVERY_LIMIT
+                    or type(previous.get('last_attempt')) is not int):
+                raise Failure('证书恢复状态无效或域名已改变，请核查 state/recovery.json。')
+            attempts, last_attempt = previous['attempts'], previous['last_attempt']
+        timestamp = int(time.time())
+        if attempts >= RECOVERY_LIMIT:
+            raise Failure('证书自动恢复已连续尝试 3 次，请检查日志并修复原因后再清除 state/recovery.json。')
+        if attempts and timestamp - last_attempt < RECOVERY_INTERVAL:
+            raise Failure('证书恢复距离上次尝试不足 24 小时，本次不重复申请，保留现有服务证书。')
+        source = self.candidate_dir()
+        if source.exists():
+            private(source, directory=True)
+        backups = self.state / 'recovery-backups'
+        backups.mkdir(mode=0o700, exist_ok=True)
+        private(backups, directory=True)
+        save_json(path, {'domains': self.config['domains'], 'attempts': attempts + 1,
+                         'last_attempt': timestamp})
+        if source.exists():
+            snapshot = Path(tempfile.mkdtemp(prefix='attempt-', dir=str(backups)))
+            os.replace(source, snapshot / source.name)
+        snapshots = sorted((item for item in backups.iterdir() if item.is_dir() and not item.is_symlink()),
+                           key=lambda item: item.stat().st_mtime, reverse=True)
+        for item in snapshots[RECOVERY_LIMIT:]:
+            shutil.rmtree(item)
+        self.log('已隔离无效 ACME 工作目录，准备第 {} 次恢复申请。'.format(attempts + 1))
+
     def invoke_acme(self, arguments):
         # 不继承代理、调试、部署相关环境，避免凭据经代理外发或误用历史配置。
         env = {'PATH': SYSTEM_PATH, 'HOME': str(self.home), 'LANG': 'C', 'LC_ALL': 'C',
@@ -529,22 +572,25 @@ class Controller:
         self.backup(info)
         save_json(baseline, {'certificate_id': self.config['certificate_id'], 'bindings': before})
         pending = self.state / 'pending.json'
+        primary = self.config['domains'][0]
+        conf = self.candidate_dir() / (primary + '.conf')
+        if self.candidate().exists() and not conf.is_file():
+            raise Failure('已有 ACME 证书但配置缺失，停止以避免错误跳过续期。')
         if pending.exists():
             self.log('发现待完成部署，先检查已签发证书。')
+        if pending.exists() or self.candidate().exists():
             try:
                 self.candidate_valid()
             except Failure:
-                # 旧待部署证书即将过期或已损坏时，应重新续期而非永久卡在重试。
-                self.log('待部署证书已不能直接使用，将先申请有效证书。')
+                save_json(pending, {'at': now(), 'needs_recovery': True})
+                self.recover_candidate()
             else:
-                self.deploy_and_verify(before)
-        elif not self.candidate().exists():
+                (self.state / 'recovery.json').unlink(missing_ok=True)
+                if pending.exists():
+                    self.deploy_and_verify(before)
+        else:
             self.verify_probes(fingerprint(self.current_cert()))
-        primary = self.config['domains'][0]
-        conf = self.candidate_dir() / (primary + '.conf')
         if self.candidate().exists():
-            if not conf.is_file():
-                raise Failure('已有 ACME 证书但配置缺失，停止以避免错误跳过续期。')
             args = ['--renew', '-d', primary]
         else:
             args = ['--issue', '--dns', 'dns_tencent', '--keylength', '2048', '--accountemail', self.config['email']]
@@ -556,8 +602,10 @@ class Controller:
         if result not in (0, 2):
             raise Failure('签发或续期失败；部署前备份已保留。详见 state/acme-last.log。')
         if not self.candidate().is_file():
+            save_json(pending, {'at': now(), 'needs_recovery': True})
             raise Failure('ACME 未生成预期证书，不能将跳过状态当作签发成功。')
         self.candidate_valid()
+        (self.state / 'recovery.json').unlink(missing_ok=True)
         if self.binding_state(self.metadata()) != before:
             raise Failure('续期后服务绑定发生变化，请核对备份，停止后续自动操作。')
         expected = fingerprint(self.candidate())
