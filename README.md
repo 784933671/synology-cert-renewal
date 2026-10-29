@@ -1,0 +1,119 @@
+# DS218+ / DNSPod 证书自动续期
+
+在群晖本机为 `ttxli.cn` 现有证书自动续期并部署。使用 Let's Encrypt、DNSPod DNS 验证和 acme.sh 的群晖部署功能；无需开放公网 80 端口。包装器使用 Python 3.8 以上标准库，无第三方 Python 依赖。
+
+当前已完成本地工具和测试，并通过 DSM 网页确认设备版本、启用 SSH。尚未通过 SSH 登录或在 NAS 安装、签发和替换证书；远程 SSH 入口待下次配置。已确认环境和后续步骤见 [部署进度](DEPLOYMENT.md)。
+
+## 安装前准备
+
+1. 在“控制面板 → 信息中心”确认 DSM 为 6.2.4 或 7.x。若没有 Python 3.8 以上，在套件中心安装或更新 Python3。
+2. 在“控制面板 → 安全性 → 证书”找到目标证书，记录其覆盖域名和服务绑定。将描述改为唯一的英文、数字、横线或下划线组合，例如 `ttxli-cn`。描述只用于精确定位，不影响域名。
+3. 首次建议在该页面导出证书，保存至安全位置。工具后续也会自动备份，最多保留最近 5 份不同证书或配置版本。
+4. 确认 NAS 能访问 DNSPod API、Let's Encrypt 和 GitHub，系统时间准确。
+5. 本方案使用临时管理员模式。若 NAS 开启了“强制双重验证”，工具会停止；不会自动关闭此策略。已有 `sc-acmesh-tmp` 同名账号时也会停止，先核实账号来源，再决定是否清理。不要为了通过检查直接关闭登录保护。
+
+## 腾讯云 API 权限
+
+在腾讯云访问管理中创建专用子账号和 API 密钥，仅给 `ttxli.cn` 对应 DNSPod 域名资源授予以下操作：
+
+- `dnspod:DescribeRecordList`
+- `dnspod:CreateRecord`
+- `dnspod:DescribeRecordFilterList`
+- `dnspod:DeleteRecord`
+
+`dns-policy.example.json` 提供策略模板；将资源中的主账号 UIN 和 DNSPod DomainId 替换为控制台真实值，再绑定给子账号。模板中的资源标识不是域名字符串。实际授权需要在 DNSPod/CAM 中验证。
+
+插件仅添加、清理验证用 TXT 记录，但上述 CAM 授权是域名资源级权限，并非“只能修改 TXT”。密钥在 NAS 交互配置时输入，不要发送到聊天、提交到代码仓库或写进任务命令。
+
+## 首次安装
+
+先检查是否已有 acme.sh 容器或续期任务；本机 NAS 的 `docker` 共享文件夹存在 `acmesh` 和 `compose.yaml`，其用途与运行状态尚待核查。确认不会重复更新同一张证书后，再安装本工具。
+
+在群晖“控制面板 → 终端机和 SNMP”中开启 SSH。局域网安装不需要新增公网端口映射。通过 File Station 将整个安装包放到 NAS 的一个文件夹，然后从电脑连接 NAS：
+
+```sh
+ssh -p 22 你的用户名@NAS局域网IP
+sudo -i
+cd /你在NAS上放置安装包的实际路径
+sh install.sh
+```
+
+若 SSH 使用其他端口，请替换 `22`。远程安装时按实际可达入口使用 `ssh -p 外部SSH端口 用户名@ttxli.cn`；NAS 内部端口与路由器外部端口可能不同，不能使用 DSM 网页端口代替。
+
+安装脚本会检查 DSM、Python 和本机工具，下载并校验固定版本 acme.sh。已有安装目录时会停止，不覆盖配置和证书。
+
+安装位置为 `/usr/local/share/synology-cert-renewal`。安装器不创建定时任务、不自动签发、不修改系统证书。
+
+进入交互配置：
+
+```sh
+PYTHON=$(cat /usr/local/share/synology-cert-renewal/python-path)
+"$PYTHON" -I /usr/local/share/synology-cert-renewal/certctl.py --home /usr/local/share/synology-cert-renewal configure
+```
+
+按提示选择现有证书，并填写邮箱、腾讯云 SecretId/SecretKey、DSM 本机 HTTP 端口和需要检查的 HTTPS 服务端点。HTTP 默认 `5000`，HTTPS 常见为 `5001`；以 NAS 的实际设置为准。程序沿用选中证书已有的 DNS 域名，不自动增加泛域名或扩大覆盖范围。
+
+证书部署接口只连接 NAS 本机回环地址。HTTPS 验证端点使用实际服务地址、端口及域名，例如本机 DSM 可使用 `127.0.0.1`、`5001`、证书实际覆盖的域名。若该证书绑定在反向代理服务上，应添加相应服务端点，而不是假定 DSM 登录页使用同一张证书。服务器名称用于 TLS SNI，通配符证书应填写真实子域名。
+
+先检查，再首次运行：
+
+```sh
+"$PYTHON" -I /usr/local/share/synology-cert-renewal/certctl.py --home /usr/local/share/synology-cert-renewal check
+"$PYTHON" -I /usr/local/share/synology-cert-renewal/certctl.py --home /usr/local/share/synology-cert-renewal run
+"$PYTHON" -I /usr/local/share/synology-cert-renewal/certctl.py --home /usr/local/share/synology-cert-renewal status
+```
+
+`check` 不签发、不部署，不修改 DNS 或 DSM 业务状态；可能写入本工具日志和互斥锁。`run` 按需签发或续期，再部署并检查证书指纹。首次部署失败时，再次执行 `run` 可重试已有证书，不需要强制重新申请。
+
+配置、私钥、日志和备份均保存在仅 root 可访问的安装目录中。`acme.sh` 也会持久保存 API 密钥，因此备份整个目录时必须同样保护。初始化完成后可关闭 SSH；DSM 任务计划仍可运行。
+
+## 每日自动运行和故障通知
+
+在 DSM“控制面板 → 任务计划”新建“计划的任务 → 用户定义的脚本”：
+
+- 用户：`root`。
+- 计划：每天 `03:17`，或 NAS 固定开机时段。
+- 用户定义的脚本：
+
+```sh
+/bin/sh /usr/local/share/synology-cert-renewal/run-task.sh
+```
+
+启动脚本使用安装时探测到的 Python 绝对路径。不要依赖任务计划的交互式环境变量，也不要把 API 密钥写进任务设置。
+
+在 DSM 中配置可用的邮件发送方式，任务设置勾选“通过电子邮件发送运行详情”和“仅当脚本异常终止时发送运行详情”。证书注册邮箱不会自动成为 DSM 的任务通知邮箱；通知邮箱需要在任务中单独填写。保存后点击“运行”，确认任务成功。另建一个临时通知测试任务，脚本填写 `exit 1`，使用相同邮件设置并手动运行，确认失败邮件送达后删除测试任务。不要修改正式任务来模拟故障。
+
+工具每天只检查是否需要续期，不会每天强制签发。任务互斥执行，部署后核验目标 HTTPS 服务实际出示的证书，失败以非零退出码报告。不要同时运行其他更新同一张证书的脚本或 DSM 任务。
+
+## 验收和故障处理
+
+首次配置后确认：DNSPod 验证 TXT 记录已清理；群晖证书有效期更新；服务绑定与原来一致；浏览器访问目标域名时证书正确。NAS 重启后再手动运行一次任务；DSM 或 Python 套件升级后也要复查任务。Python 路径若发生变化，检查 `python-path` 和 `run-task.sh` 后更新到真实路径。
+
+失败时先看任务详情、`status`、`state/events.log` 和 `state/acme-last.log`；自动备份位于 `state/backups`。DNS 授权失败时检查 DomainId、UIN、子账号策略和 DNSPod 解析托管；DNS 验证失败时确认网络及记录传播。部署失败时核查唯一证书描述、DSM HTTP 端口、强制双重验证状态及临时账号。HTTPS 指纹不一致时核对服务绑定、验证端口、SNI 域名和是否经过其他代理。
+
+若提示存在 `state/deployment-active.json`，说明任务曾异常中断。先暂停任务，检查 DSM 中 `sc-acmesh-tmp` 是否为该次任务创建的遗留账号，确认后在控制面板清理；核对强制双重验证策略和服务证书。确认恢复后，才移除这个中断标记并重新执行 `check`。工具不会自动删除来源不明的已有账号。
+
+若提示前次操作后绑定发生变化，根据 `state/backups/` 恢复原绑定；若是你有意调整服务绑定，确认当前状态后重新执行 `configure` 接受新配置。
+
+需要恢复旧证书时，先暂停证书更新任务，在 DSM 的证书页面对同一个目标证书执行“替换现有证书”，从安全备份导入私钥、证书和中间证书，再核对原服务绑定和 HTTPS 访问。不要直接覆盖群晖系统证书目录。
+
+安装器对已有目录会退出。如需更新工具，先暂停任务并备份现有配置和状态，再按经过验证的升级步骤处理；不要删掉目录后重新初始化。acme.sh 固定版本且关闭自动升级，更新后应重新验证临时管理员和证书部署行为。
+
+## 版本和来源
+
+- acme.sh：`3.1.6`。
+- 固定提交：`807da6498377ee5e0cf43a78091f46f12dc59a89`。
+- 官方源码归档 SHA-256：`ddbe1bcbd1a44a2623a2af167ebdc678669e6e2eb396742f2d1d28e02dc14220`。
+- [acme.sh 群晖指南](https://github.com/acmesh-official/acme.sh/wiki/Synology-NAS-Guide)
+- [固定版群晖部署源码](https://github.com/acmesh-official/acme.sh/blob/807da6498377ee5e0cf43a78091f46f12dc59a89/deploy/synology_dsm.sh)
+- [固定版 DNSPod 插件](https://github.com/acmesh-official/acme.sh/blob/807da6498377ee5e0cf43a78091f46f12dc59a89/dnsapi/dns_tencent.sh)
+- [Let's Encrypt DNS 验证](https://letsencrypt.org/docs/challenge-types/#dns-01-challenge)
+
+本地验证命令（需要 Python3 和 OpenSSL）：
+
+```sh
+python3 -m unittest discover -s tests -v
+sh -n install.sh
+```
+
+41 项测试通过，涵盖证书域名/密钥/链、真实本地 TLS 握手与 SNI、部署失败补偿、绑定保护、输入及权限检查。安装器另验证了固定归档校验、安全解包和已有安装保护。测试不调用真实 DNSPod 或 ACME 签发接口，不代表已经在你的 NAS 上完成签发、服务重载和故障邮件验收。

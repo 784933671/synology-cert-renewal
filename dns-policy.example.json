@@ -1,0 +1,17 @@
+{
+  "version": "2.0",
+  "statement": [
+    {
+      "effect": "allow",
+      "action": [
+        "dnspod:DescribeRecordList",
+        "dnspod:CreateRecord",
+        "dnspod:DescribeRecordFilterList",
+        "dnspod:DeleteRecord"
+      ],
+      "resource": [
+        "qcs::dnspod::uin/REPLACE_WITH_OWNER_UIN:domain/REPLACE_WITH_DOMAIN_ID"
+      ]
+    }
+  ]
+}

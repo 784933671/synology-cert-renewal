@@ -1,0 +1,29 @@
+# 本机缓存
+.DS_Store
+__pycache__/
+*.py[cod]
+.venv/
+
+# NAS 配置、凭据与运行状态
+config.json
+previous-config.json
+account.conf
+.env
+.env.*
+!.env.example
+/acme/
+/state/
+/output/
+/run-task.sh
+/python-path
+/ACME-VERSION
+
+# 证书、私钥、日志和打包产物
+*.key
+*.pem
+*.cer
+*.crt
+*.p12
+*.pfx
+*.log
+*.zip
