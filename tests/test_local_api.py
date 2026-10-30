@@ -73,7 +73,7 @@ class LocalApiTests(unittest.TestCase):
             certctl.validate_config(legacy)
 
     def test_configure_selects_native_without_prompting_http_port(self):
-        answers = ['1', 'operator@example.com', '', '', '', 'n']
+        answers = ['1', 'operator@example.com', '', '', '', '', 'n']
         with mock.patch.object(certctl.shutil, 'which', return_value='/usr/syno/bin/synowebapi'), \
              mock.patch.object(certctl.sys.stdin, 'isatty', return_value=True), \
              mock.patch.object(self.controller, 'system_check'), \
@@ -84,6 +84,7 @@ class LocalApiTests(unittest.TestCase):
             self.controller.configure()
         saved = certctl.read_json(self.controller.config_file)
         self.assertEqual(saved['deployment_method'], 'local_api')
+        self.assertEqual(saved['renew_before_days'], 2)
         self.assertEqual(saved['certificate_description'], '家庭 NAS 证书')
         self.assertEqual(saved['certificate_id'], 'ABC123')
         self.assertFalse(any('HTTP 端口' in call.args[0] for call in prompts.call_args_list))

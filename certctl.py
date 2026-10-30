@@ -27,6 +27,7 @@ CA = 'https://acme-v02.api.letsencrypt.org/directory'
 TEMP_USER = 'sc-acmesh-tmp'
 SYSTEM_PATH = '/usr/syno/sbin:/usr/syno/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin'
 RECOVERY_INTERVAL = 24 * 60 * 60
+SHORT_RECOVERY_INTERVAL = 6 * 60 * 60
 RECOVERY_LIMIT = 3
 
 
@@ -97,6 +98,16 @@ def fingerprint(path):
     return hashlib.sha256(capture(['openssl', 'x509', '-in', str(path), '-outform', 'DER'])).hexdigest()
 
 
+def certificate_expiry(path):
+    value = capture(['openssl', 'x509', '-in', str(path), '-noout', '-enddate']).decode().strip()
+    try:
+        if not value.startswith('notAfter='):
+            raise ValueError()
+        return int(ssl.cert_time_to_seconds(value[len('notAfter='):]))
+    except (ValueError, OverflowError):
+        raise Failure('无法读取证书到期时间。')
+
+
 def pem_chain(path):
     try:
         content = path.read_text()
@@ -137,6 +148,9 @@ def validate_config(config):
     method = config.get('deployment_method', 'synology_dsm')
     if method not in ('local_api', 'synology_dsm'):
         raise Failure('证书部署方式无效，请重新 configure。')
+    if 'renew_before_days' in config and (type(config['renew_before_days']) is not int
+                                         or not 1 <= config['renew_before_days'] <= 30):
+        raise Failure('提前续期天数必须是 1 到 30 的整数。')
     for key in ('certificate_id', 'certificate_description', 'email', 'secret_id', 'secret_key'):
         if not isinstance(config.get(key), str) or not config[key].strip():
             raise Failure('配置缺少字段：{}'.format(key))
@@ -383,6 +397,9 @@ class Controller:
         if sum(value.get('desc') == description for _, value in choices) != 1:
             raise Failure('证书描述重复，请先在 DSM 修改为唯一描述。')
         email = input('证书注册邮箱: ').strip()
+        renew_days = input('提前续期天数 [2]: ').strip() or '2'
+        if not renew_days.isdigit() or not 1 <= int(renew_days) <= 30:
+            raise Failure('提前续期天数必须是 1 到 30 的整数。')
         http_port = port_prompt('DSM HTTP 端口', 5000) if method == 'synology_dsm' else 5000
         probes = []
         while True:
@@ -395,6 +412,7 @@ class Controller:
         secret_id = getpass.getpass('腾讯云子账号 SecretId（不回显）: ').strip()
         secret_key = getpass.getpass('腾讯云子账号 SecretKey（不回显）: ').strip()
         self.config = {'version': 1, 'deployment_method': method,
+                       'renew_before_days': int(renew_days),
                        'certificate_id': key, 'certificate_description': description,
                        'domains': domains, 'email': email, 'secret_id': secret_id,
                        'secret_key': secret_key, 'dsm_http_port': http_port, 'probes': probes}
@@ -414,12 +432,23 @@ class Controller:
     def candidate(self):
         return self.candidate_dir() / (self.config['domains'][0] + '.cer')
 
+    def renewal_time(self):
+        days = self.config.get('renew_before_days')
+        return certificate_expiry(self.candidate()) - days * 86400 if days is not None else None
+
+    def renewal_due(self):
+        renewal = self.renewal_time()
+        return renewal is not None and time.time() >= renewal
+
     def candidate_valid(self):
         cert = self.candidate()
         key = self.candidate_dir() / (self.config['domains'][0] + '.key')
         if set(certificate_domains(cert)) != set(self.config['domains']):
             raise Failure('新证书域名与已配置域名不一致，拒绝部署。')
-        capture(['openssl', 'x509', '-in', str(cert), '-noout', '-checkend', '1209600'])
+        # 已部署证书正常变老时走续期；新导入的证书仍须至少剩余 14 天。
+        minimum = 0 if ('renew_before_days' in self.config
+                        and fingerprint(cert) == fingerprint(self.current_cert())) else 1209600
+        capture(['openssl', 'x509', '-in', str(cert), '-noout', '-checkend', str(minimum)])
         public_cert = capture(['openssl', 'x509', '-in', str(cert), '-pubkey', '-noout'])
         public_key = capture(['openssl', 'pkey', '-in', str(key), '-pubout'])
         if public_cert.strip() != public_key.strip():
@@ -458,7 +487,7 @@ class Controller:
         for path in backups[5:]:
             shutil.rmtree(path)
 
-    def prepare_acme_config(self):
+    def prepare_acme_config(self, sync_schedule=True):
         path = self.candidate_dir() / (self.config['domains'][0] + '.conf')
         if not path.exists():
             return
@@ -490,12 +519,26 @@ class Controller:
             raise Failure('历史 ACME 配置包含其他部署钩子，停止运行。')
         if values.get('Le_Webroot') != 'dns_tencent' or values.get('Le_API') != CA:
             raise Failure('历史 ACME 配置的 DNS 验证方式或签发机构不匹配。')
+        # 迁移已有续期时间；仅传 --days 不会重算旧证书的 NextRenewTime。
+        updates = {}
+        if sync_schedule and 'renew_before_days' in self.config and self.candidate().is_file():
+            renewal = self.renewal_time()
+            updates = {'Le_RenewalDays': str(-self.config['renew_before_days']),
+                       'Le_NextRenewTime': str(renewal),
+                       'Le_NextRenewTimeStr': datetime.datetime.fromtimestamp(
+                           renewal, datetime.timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ'),
+                       'NO_ARI': '1'}
         # 阻止 renew 内置部署，让新证书先校验，再由包装器显式导入 DSM。
-        if 'Le_DeployHook' in values:
+        if 'Le_DeployHook' in values or any(values.get(key) != value for key, value in updates.items()):
             fd, temporary = tempfile.mkstemp(prefix='.domain-conf-', dir=str(path.parent))
             try:
                 with os.fdopen(fd, 'w') as handle:
-                    handle.write('\n'.join(line for line in lines if not line.startswith('Le_DeployHook=')) + '\n')
+                    removed = ('Le_DeployHook=',) + tuple(key + '=' for key in updates)
+                    retained = [line for line in lines if not line.startswith(removed)]
+                    retained.extend("{}='{}'".format(key, value) for key, value in updates.items())
+                    handle.write('\n'.join(retained) + '\n')
+                    handle.flush()
+                    os.fsync(handle.fileno())
                 os.replace(temporary, path)
             finally:
                 if os.path.exists(temporary):
@@ -503,7 +546,7 @@ class Controller:
 
     def recover_candidate(self):
         # 隔离整个损坏工作目录，避免未来续期时间、坏私钥或旧 CSR 阻止重新签发。
-        self.prepare_acme_config()
+        self.prepare_acme_config(sync_schedule=False)
         path = self.state / 'recovery.json'
         attempts, last_attempt = 0, 0
         if path.exists():
@@ -518,8 +561,9 @@ class Controller:
         timestamp = int(time.time())
         if attempts >= RECOVERY_LIMIT:
             raise Failure('证书自动恢复已连续尝试 3 次，请检查日志并修复原因后再清除 state/recovery.json。')
-        if attempts and timestamp - last_attempt < RECOVERY_INTERVAL:
-            raise Failure('证书恢复距离上次尝试不足 24 小时，本次不重复申请，保留现有服务证书。')
+        interval = SHORT_RECOVERY_INTERVAL if self.config.get('renew_before_days', 30) <= 2 else RECOVERY_INTERVAL
+        if attempts and timestamp - last_attempt < interval:
+            raise Failure('证书恢复距离上次尝试不足 {} 小时，本次不重复申请，保留现有服务证书。'.format(interval // 3600))
         source = self.candidate_dir()
         if source.exists():
             private(source, directory=True)
@@ -545,6 +589,10 @@ class Controller:
         env = {'PATH': SYSTEM_PATH, 'HOME': str(self.home), 'LANG': 'C', 'LC_ALL': 'C',
                'NO_PROXY': '127.0.0.1,localhost', 'no_proxy': '127.0.0.1,localhost',
                'Tencent_SecretId': self.config['secret_id'], 'Tencent_SecretKey': self.config['secret_key']}
+        arguments = list(arguments)
+        if 'renew_before_days' in self.config and arguments and arguments[0] in ('--issue', '--renew'):
+            env['NO_ARI'] = '1'
+            arguments.extend(['--days', str(-self.config['renew_before_days'])])
         if not native:
             env.update({'SYNO_USE_TEMP_ADMIN': '1', 'SYNO_HOSTNAME': '127.0.0.1', 'SYNO_SCHEME': 'http',
                         'SYNO_PORT': str(self.config['dsm_http_port']),
@@ -694,7 +742,7 @@ class Controller:
                 self.recover_candidate()
             else:
                 (self.state / 'recovery.json').unlink(missing_ok=True)
-                if pending.exists():
+                if pending.exists() and not self.renewal_due():
                     self.deploy_and_verify(before)
         else:
             self.verify_probes(fingerprint(self.current_cert()))
@@ -704,7 +752,14 @@ class Controller:
             args = ['--issue', '--dns', 'dns_tencent', '--keylength', '2048', '--accountemail', self.config['email']]
             for domain in self.config['domains']:
                 args.extend(['-d', domain])
-        result = self.invoke_acme(args)
+        if 'renew_before_days' in self.config and self.candidate().exists():
+            self.prepare_acme_config()
+        if 'renew_before_days' in self.config and self.candidate().exists() and not self.renewal_due():
+            # 门控在包装器中执行，历史 ACME 日期或 CA 窗口不能提前触发签发。
+            result = 2
+            self.log('尚未进入到期前 {} 天的续期窗口，本次不申请证书。'.format(self.config['renew_before_days']))
+        else:
+            result = self.invoke_acme(args)
         if self.candidate().exists() and fingerprint(self.candidate()) != fingerprint(self.current_cert()):
             save_json(pending, {'fingerprint': fingerprint(self.candidate()), 'at': now()})
         if result not in (0, 2):
@@ -713,6 +768,8 @@ class Controller:
             save_json(pending, {'at': now(), 'needs_recovery': True})
             raise Failure('ACME 未生成预期证书，不能将跳过状态当作签发成功。')
         self.candidate_valid()
+        if self.renewal_due():
+            raise Failure('已进入续期窗口，但尚未获得有效的新证书；下次任务重试。')
         (self.state / 'recovery.json').unlink(missing_ok=True)
         if self.binding_state(self.metadata()) != before:
             raise Failure('续期后服务绑定发生变化，请核对备份，停止后续自动操作。')
@@ -734,6 +791,11 @@ class Controller:
         self.metadata()
         print('域名：' + ', '.join(self.config['domains']))
         print('部署方式：' + self.deployment_method())
+        if 'renew_before_days' in self.config:
+            print('续期策略：到期前 {} 天开始续期。'.format(self.config['renew_before_days']))
+            if self.candidate().is_file():
+                print('最早续期时间（UTC）：' + datetime.datetime.fromtimestamp(
+                    self.renewal_time(), datetime.timezone.utc).isoformat())
         print('证书描述：' + self.config['certificate_description'])
         print(capture(['openssl', 'x509', '-in', str(self.current_cert()), '-noout', '-dates']).decode().strip())
         print('待部署：' + ('是' if (self.state / 'pending.json').exists() else '否'))

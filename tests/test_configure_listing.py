@@ -69,7 +69,7 @@ class ConfigureListingTests(unittest.TestCase):
             yield output, prompt, secret, preflight
 
     def test_valid_target_can_be_configured_with_unusable_unrelated_certificates(self):
-        with self.interaction(['5', 'operator@example.com', '', '', '', '', 'n']) as state:
+        with self.interaction(['5', 'operator@example.com', '', '', '', '', '', 'n']) as state:
             output, prompt, secret, preflight = state
             self.controller.configure()
         listing = output.getvalue().splitlines()
@@ -83,7 +83,8 @@ class ConfigureListingTests(unittest.TestCase):
         saved = certctl.read_json(self.controller.config_file)
         self.assertEqual(saved['certificate_id'], 'E_Target')
         self.assertEqual(saved['domains'], ['ttxli.cn', '*.ttxli.cn'])
-        self.assertEqual(prompt.call_count, 7)
+        self.assertEqual(prompt.call_count, 8)
+        self.assertEqual(saved['renew_before_days'], 2)
         self.assertEqual(secret.call_count, 2)
         preflight.assert_called_once_with()
 

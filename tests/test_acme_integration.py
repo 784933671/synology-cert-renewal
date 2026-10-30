@@ -77,6 +77,26 @@ class AcmeIntegrationTests(unittest.TestCase):
         self.assertFalse(self.network_calls.exists())
         self.assertFalse(self.controller.marker.exists())
 
+    def test_fixed_policy_migrates_stale_schedule_and_real_acme_skips_offline(self):
+        self.controller.config['renew_before_days'] = 2
+        self.fixture.prepare_candidate('old')
+        conf = self.controller.candidate_dir() / 'ttxli.cn.conf'
+        with conf.open('a') as handle:
+            handle.write("Le_RenewalDays='60'\nLe_NextRenewTime='1'\n"
+                         "Le_NextRenewTimeStr='old overdue schedule'\n")
+        result = self.controller.invoke_acme(['--renew', '-d', 'ttxli.cn'])
+        self.assertEqual(result, 2)
+        text = conf.read_text()
+        self.assertIn("Le_RenewalDays='-2'", text)
+        match = re.search(r"(?m)^Le_NextRenewTime='([0-9]+)'$", text)
+        self.assertIsNotNone(match)
+        self.assertEqual(int(match.group(1)), certctl.certificate_expiry(self.controller.candidate()) - 172800)
+        self.assertIn('Skipping. Next renewal time is:',
+                      (self.controller.state / 'acme-last.log').read_text())
+        self.assertFalse(self.network_calls.exists())
+        self.assertFalse(self.controller.marker.exists())
+        self.assertEqual(certctl.fingerprint(self.controller.current_cert()), self.fixture.old_fingerprint)
+
     def test_run_reissues_damaged_pending_before_saved_renewal_time(self):
         self.damaged_pending()
         real_popen = subprocess.Popen
