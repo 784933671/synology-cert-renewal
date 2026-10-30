@@ -3,6 +3,9 @@
 import argparse
 import contextlib
 import datetime
+from email.message import EmailMessage
+from email.policy import SMTP
+from email.utils import format_datetime
 import fcntl
 import getpass
 import hashlib
@@ -164,6 +167,10 @@ def validate_config(config):
         raise Failure('域名配置不能重复。')
     if not re.fullmatch(r'[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,63}', config['email']):
         raise Failure('邮箱格式无效；请使用常规 ASCII 邮箱地址。')
+    if 'success_notify_email' in config and (not isinstance(config['success_notify_email'], str)
+            or config['success_notify_email'].startswith('-')
+            or not re.fullmatch(r'[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,63}', config['success_notify_email'])):
+        raise Failure('成功通知邮箱格式无效；禁用时请移除 success_notify_email。')
     if any(not re.fullmatch(r'[A-Za-z0-9+/=_-]+', config[key]) for key in ('secret_id', 'secret_key')):
         raise Failure('腾讯云密钥格式无效，请直接复制控制台生成的密钥，不要添加引号。')
     if method == 'synology_dsm' and (type(config.get('dsm_http_port')) is not int
@@ -423,17 +430,33 @@ class Controller:
                 break
         secret_id = getpass.getpass('腾讯云子账号 SecretId（不回显）: ').strip()
         secret_key = getpass.getpass('腾讯云子账号 SecretKey（不回显）: ').strip()
+        previous = None
+        if self.config_file.exists():
+            private(self.config_file)
+            previous = read_json(self.config_file)
         self.config = {'version': 1, 'deployment_method': method,
                        'renew_before_days': int(renew_days),
                        'certificate_id': key, 'certificate_description': description,
                        'domains': domains, 'email': email, 'secret_id': secret_id,
                        'secret_key': secret_key, 'dsm_http_port': http_port, 'probes': probes}
+        if isinstance(previous, dict) and 'success_notify_email' in previous:
+            self.config['success_notify_email'] = previous['success_notify_email']
         validate_config(self.config)
         self.preflight()
-        if self.config_file.exists():
-            private(self.config_file)
-            save_json(self.state / 'previous-config.json', read_json(self.config_file))
+        notification = self.state / 'success-notification.json'
+        if os.path.lexists(notification):
+            private(notification)
+        same_target = (isinstance(previous, dict)
+                       and previous.get('certificate_id') == self.config['certificate_id']
+                       and previous.get('domains') == self.config['domains'])
+        if same_target:
+            self.initialize_success_notification()
+        if previous is not None:
+            save_json(self.state / 'previous-config.json', previous)
         save_json(self.config_file, self.config)
+        if not same_target:
+            notification.unlink(missing_ok=True)
+            self.initialize_success_notification()
         (self.state / 'run-baseline.json').unlink(missing_ok=True)
         (self.state / 'import-bindings.json').unlink(missing_ok=True)
         (self.state / 'pending.json').unlink(missing_ok=True)
@@ -757,8 +780,113 @@ class Controller:
             finally:
                 self.marker.unlink(missing_ok=True)
 
+    def initialize_success_notification(self):
+        if 'success_notify_email' not in self.config:
+            return None
+        path = self.state / 'success-notification.json'
+        if not os.path.lexists(path):
+            # 首次启用只建立当前证书基线，不补发历史成功通知。
+            state = {'version': 1, 'certificate_id': self.config['certificate_id'],
+                     'last_notified_fingerprint': fingerprint(self.current_cert()), 'pending': None}
+            save_json(path, state)
+            return state
+        private(path)
+        state = read_json(path)
+        valid_fingerprint = lambda value: isinstance(value, str) and re.fullmatch(r'[0-9a-f]{64}', value)
+        if (not isinstance(state, dict) or state.get('version') != 1
+                or state.get('certificate_id') != self.config['certificate_id']
+                or not valid_fingerprint(state.get('last_notified_fingerprint')) or 'pending' not in state):
+            raise Failure('成功通知状态与当前证书不匹配，请核查 state/success-notification.json。')
+        event = state['pending']
+        if event is not None:
+            try:
+                if (not isinstance(event, dict) or not valid_fingerprint(event.get('fingerprint'))
+                        or event.get('domains') != self.config['domains']
+                        or type(event.get('expires_at')) is not int or event['expires_at'] <= 0
+                        or not isinstance(event.get('completed_at'), str)):
+                    raise ValueError()
+                completed = datetime.datetime.fromisoformat(event['completed_at'])
+                datetime.datetime.fromtimestamp(event['expires_at'], datetime.timezone.utc)
+                if completed.tzinfo is None:
+                    raise ValueError()
+            except (ValueError, OverflowError, OSError):
+                raise Failure('待发送成功通知格式无效，请核查 state/success-notification.json。')
+        return state
+
+    def queue_success_notification(self, expected):
+        state = self.initialize_success_notification()
+        if state is None or state['last_notified_fingerprint'] == expected:
+            return
+        if state['pending'] is None or state['pending']['fingerprint'] != expected:
+            state['pending'] = {'fingerprint': expected, 'completed_at': now(),
+                                'expires_at': certificate_expiry(self.current_cert()),
+                                'domains': list(self.config['domains'])}
+            save_json(self.state / 'success-notification.json', state)
+
+    def deliver_success_notification(self, event):
+        try:
+            settings = self.call_local_api('SYNO.Core.Notification.Mail.Conf', 'get')
+        except Failure:
+            raise Failure('无法读取群晖邮件配置；证书已生效，待发送成功通知已保留。')
+        sender = settings.get('sender_mail')
+        if (settings.get('enable_mail') is not True or not isinstance(sender, str)
+                or sender.startswith('-')
+                or not re.fullmatch(r'[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,63}', sender)):
+            raise Failure('群晖邮件服务未启用或发件邮箱无效；证书已生效，待发送成功通知已保留。')
+        beijing = datetime.timezone(datetime.timedelta(hours=8))
+        completed = datetime.datetime.fromisoformat(event['completed_at']).astimezone(beijing)
+        expires = datetime.datetime.fromtimestamp(event['expires_at'], beijing)
+        # DSM ssmtp 从标准输入读取 LF 文本，再自行转换 SMTP 行结束符。
+        message = EmailMessage(policy=SMTP.clone(linesep='\n', max_line_length=0))
+        message['From'] = sender
+        message['To'] = self.config['success_notify_email']
+        message['Subject'] = self.config['domains'][0] + ' 证书续期并替换成功'
+        message['Date'] = format_datetime(datetime.datetime.now(datetime.timezone.utc))
+        domain = self.config['domains'][0]
+        domain = domain[2:] if domain.startswith('*.') else domain
+        message['Message-ID'] = '<synology-cert-{}-{}@{}>'.format(
+            self.config['certificate_id'], event['fingerprint'], domain)
+        message.set_content('群晖证书已更新，实际 HTTPS 服务验证通过。\n\n'
+                            '域名：{}\n完成时间：{}（北京时间）\n新到期时间：{}（北京时间）\n'
+                            'SHA-256 指纹：{}\n'.format(', '.join(event['domains']),
+                                completed.strftime('%Y-%m-%d %H:%M:%S'),
+                                expires.strftime('%Y-%m-%d %H:%M:%S'), event['fingerprint']), cte='8bit')
+        env = {'PATH': SYSTEM_PATH, 'HOME': str(self.home), 'LANG': 'C', 'LC_ALL': 'C'}
+        proc = None
+        try:
+            proc = subprocess.Popen(['/bin/ssmtp', '-f', sender, self.config['success_notify_email']], env=env,
+                                    stdin=subprocess.PIPE, stdout=subprocess.DEVNULL,
+                                    stderr=subprocess.DEVNULL, start_new_session=True)
+            try:
+                proc.communicate(message.as_bytes(), timeout=60)
+            except (subprocess.TimeoutExpired, KeyboardInterrupt, InterruptedError):
+                self.stop_process(proc)
+                raise Failure('证书已生效，但成功通知发送超时或被中断；下次任务将重试通知。')
+            if proc.returncode:
+                raise Failure('证书已生效，但成功通知发送失败；请检查 DSM 邮件配置，下次任务将重试通知。')
+        except OSError:
+            raise Failure('无法调用群晖邮件程序；证书已生效，待发送成功通知已保留。')
+        finally:
+            if proc is not None and proc.poll() is None:
+                self.stop_process(proc)
+
+    def send_success_notification(self, expected):
+        state = self.initialize_success_notification()
+        if state is None or state['pending'] is None:
+            return
+        event = state['pending']
+        if event['fingerprint'] != expected or fingerprint(self.current_cert()) != expected:
+            raise Failure('待发送成功通知与当前服务证书不一致，停止发送并保留记录。')
+        if state['last_notified_fingerprint'] != expected:
+            self.deliver_success_notification(event)
+        state['last_notified_fingerprint'] = expected
+        state['pending'] = None
+        save_json(self.state / 'success-notification.json', state)
+        self.log('证书更新成功通知已提交群晖邮件服务。')
+
     def deploy_and_verify(self, before):
         self.candidate_valid()
+        self.initialize_success_notification()
         # 跨续期只保护目标绑定；导入前后仍核对全部绑定，捕获接口副作用。
         current = self.binding_state(self.metadata())
         if self.target_bindings(current) != self.target_bindings(before):
@@ -781,6 +909,7 @@ class Controller:
         if fingerprint(self.current_cert()) != expected:
             raise Failure('部署接口返回成功，但 DSM 中证书指纹未更新；下次任务将重试。')
         self.verify_probes(expected, attempts=6)
+        self.queue_success_notification(expected)
         (self.state / 'pending.json').unlink(missing_ok=True)
         self.log('新证书已部署；所有配置的 HTTPS 端点证书链、域名及指纹校验通过。')
 
@@ -788,6 +917,7 @@ class Controller:
         self.load()
         cleanup_ok = self.retry_dns_cleanup()
         info = self.preflight(check_endpoints=False)
+        self.initialize_success_notification()
         before = self.binding_state(info)
         import_bindings = self.state / 'import-bindings.json'
         if import_bindings.exists():
@@ -860,6 +990,7 @@ class Controller:
         baseline.unlink(missing_ok=True)
         if not cleanup_ok or self.dns_cleanup_count():
             raise Failure('证书及 HTTPS 已验证，但 DNS 验证记录清理失败；下次任务独立重试清理，详见 state/dns-cleanup.json 和清理日志。')
+        self.send_success_notification(expected)
         save_json(self.state / 'last-result.json', {'at': now(), 'success': True, 'fingerprint': expected})
         self.log('本次检查完成，证书及 HTTPS 服务均正常。')
 
