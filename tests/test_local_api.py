@@ -33,7 +33,7 @@ class LocalApiTests(unittest.TestCase):
         certctl.save_json(self.fixture.archive / 'INFO', self.fixture.info)
         self.controller.log = mock.Mock()
         self.controller.probe_fingerprint = mock.Mock(
-            side_effect=lambda probe: certctl.fingerprint(self.controller.current_cert()))
+            side_effect=lambda probe, **kwargs: certctl.fingerprint(self.controller.current_cert()))
 
     def target(self, is_default=True):
         return {'id': 'ABC123', 'desc': self.controller.config['certificate_description'],
@@ -242,7 +242,7 @@ class LocalApiTests(unittest.TestCase):
                 certctl.save_json(self.fixture.archive / 'INFO', original)
                 (self.fixture.archive / 'DEFAULT').write_text('ABC123')
                 before = self.before()
-                self.controller.probe_fingerprint = mock.Mock(side_effect=lambda probe:
+                self.controller.probe_fingerprint = mock.Mock(side_effect=lambda probe, **kwargs:
                     self.fixture.old_fingerprint if failure == 'tls'
                     else certctl.fingerprint(self.controller.current_cert()))
 

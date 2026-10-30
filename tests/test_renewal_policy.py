@@ -83,7 +83,7 @@ class RenewalPolicyTests(unittest.TestCase):
     def test_fixed_policy_wait_still_detects_wrong_live_tls(self):
         self.installed_candidate('ten')
         self.controller.probe_fingerprint.return_value = None
-        self.controller.probe_fingerprint.side_effect = lambda probe: '0' * 64
+        self.controller.probe_fingerprint.side_effect = lambda probe, **kwargs: '0' * 64
         self.controller.invoke_acme = mock.Mock(side_effect=AssertionError('窗口外不得申请'))
         with self.assertRaises(certctl.Failure):
             self.controller.run()

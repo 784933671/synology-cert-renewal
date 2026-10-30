@@ -263,6 +263,10 @@ class Controller:
                 raise Failure('已存在 {}，请先核实其来源并清理残留，工具不会删除已有账号。'.format(TEMP_USER))
         private(self.acme, directory=True)
         private(self.acme / 'acme.sh')
+        for path in (self.home / 'dns_cleanup.py', self.home / 'dns_cleanup_retry.sh',
+                     self.acme / 'dnsapi' / 'dns_tencent.sh',
+                     self.acme / 'dnsapi' / 'dns_tencent_upstream.sh'):
+            private(path)
         output = capture(['/bin/sh', str(self.acme / 'acme.sh'), '--version']).decode()
         if not re.search(r'(?m)^v' + re.escape(ACME_VERSION) + r'\s*$', output):
             raise Failure('acme.sh 版本与安装包固定版本不符，请检查安装文件。')
@@ -296,6 +300,13 @@ class Controller:
         return {'services': {key: sorted(value.get('services', []), key=lambda x: json.dumps(x, sort_keys=True)) for key, value in info.items()
                              if isinstance(value, dict)},
                 'default': default.read_text().strip() if default.exists() else None}
+
+    def target_bindings(self, bindings):
+        identifier = self.config['certificate_id']
+        if not isinstance(bindings, dict) or identifier not in bindings.get('services', {}):
+            raise Failure('运行基线缺少目标证书绑定，请核查备份。')
+        return {'services': bindings['services'][identifier],
+                'is_default': bindings.get('default') == identifier}
 
     def call_local_api(self, api, method, params=None, timeout=30):
         command = shutil.which('synowebapi')
@@ -345,7 +356,8 @@ class Controller:
         if set(certificate_domains(self.current_cert())) != set(self.config['domains']):
             raise Failure('当前群晖证书域名已改变，停止自动替换；请重新 configure。')
         if check_endpoints:
-            self.verify_probes(fingerprint(self.current_cert()), attempts=1)
+            # 首次配置只核对旧证书归属，允许随后替换过期或自签名证书。
+            self.verify_probes(fingerprint(self.current_cert()), attempts=1, verify_chain=False)
         if self.deployment_method() == 'local_api':
             self.local_api_target(self.binding_state(info))
             return info
@@ -423,6 +435,7 @@ class Controller:
             save_json(self.state / 'previous-config.json', read_json(self.config_file))
         save_json(self.config_file, self.config)
         (self.state / 'run-baseline.json').unlink(missing_ok=True)
+        (self.state / 'import-bindings.json').unlink(missing_ok=True)
         (self.state / 'pending.json').unlink(missing_ok=True)
         self.log('配置已保存；当前服务与所选证书一致。尚未申请新证书。')
 
@@ -581,14 +594,55 @@ class Controller:
             shutil.rmtree(item)
         self.log('已隔离无效 ACME 工作目录，准备第 {} 次恢复申请。'.format(attempts + 1))
 
+    def operation_environment(self):
+        # 不继承代理、调试、部署相关环境，避免凭据经代理外发。
+        return {'PATH': SYSTEM_PATH, 'HOME': str(self.home), 'LANG': 'C', 'LC_ALL': 'C',
+                'NO_PROXY': '127.0.0.1,localhost', 'no_proxy': '127.0.0.1,localhost',
+                'CERTCTL_HOME': str(self.home), 'CERTCTL_PYTHON': sys.executable,
+                'Tencent_SecretId': self.config['secret_id'], 'Tencent_SecretKey': self.config['secret_key']}
+
+    def dns_cleanup_count(self):
+        journal = self.state / 'dns-cleanup.json'
+        if not os.path.lexists(journal):
+            return 0
+        private(journal)
+        helper = self.home / 'dns_cleanup.py'
+        private(helper)
+        count = capture([sys.executable, '-I', str(helper), str(self.home), 'count']).decode().strip()
+        if not count.isdigit():
+            raise Failure('DNS 清理状态无效，请检查 state/dns-cleanup.json。')
+        return int(count)
+
+    def retry_dns_cleanup(self):
+        if not self.dns_cleanup_count():
+            return True
+        helper = self.home / 'dns_cleanup_retry.sh'
+        private(helper)
+        output = self.state / 'dns-cleanup-last.log'
+        if output.exists():
+            private(output)
+        proc = None
+        try:
+            with output.open('wb') as log:
+                proc = subprocess.Popen(['/bin/sh', str(helper)], env=self.operation_environment(),
+                                        stdin=subprocess.DEVNULL, stdout=log, stderr=log, start_new_session=True)
+                try:
+                    result = proc.wait(timeout=180)
+                except subprocess.TimeoutExpired:
+                    self.stop_process(proc)
+                    result = 1
+            if result:
+                self.log('DNS 验证记录尚未清理完成，本轮继续检查证书，结束时报告失败。')
+            return result == 0
+        finally:
+            if proc is not None and proc.poll() is None:
+                self.stop_process(proc)
+
     def invoke_acme(self, arguments):
-        # 不继承代理、调试、部署相关环境，避免凭据经代理外发或误用历史配置。
         native = self.deployment_method() == 'local_api'
         if native and (not arguments or arguments[0] not in ('--issue', '--renew')):
             raise Failure('本机 API 模式仅允许 acme.sh 签发或续期，部署由本机 API 完成。')
-        env = {'PATH': SYSTEM_PATH, 'HOME': str(self.home), 'LANG': 'C', 'LC_ALL': 'C',
-               'NO_PROXY': '127.0.0.1,localhost', 'no_proxy': '127.0.0.1,localhost',
-               'Tencent_SecretId': self.config['secret_id'], 'Tencent_SecretKey': self.config['secret_key']}
+        env = self.operation_environment()
         arguments = list(arguments)
         if 'renew_before_days' in self.config and arguments and arguments[0] in ('--issue', '--renew'):
             env['NO_ARI'] = '1'
@@ -639,25 +693,31 @@ class Controller:
                 os.killpg(proc.pid, signal.SIGKILL)
                 proc.wait()
 
-    def probe_fingerprint(self, probe):
-        # 对已知目标使用预期证书指纹校验，兼容首次替换过期证书。
-        context = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
-        context.check_hostname = False
-        context.verify_mode = ssl.CERT_NONE
+    def probe_fingerprint(self, probe, verify_chain=True):
         try:
+            if verify_chain:
+                # 使用系统根证书验证服务实际提供的链，不加载候选证书的中间链。
+                context = ssl.create_default_context()
+            else:
+                context = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+                context.check_hostname = False
+                context.verify_mode = ssl.CERT_NONE
             with socket.create_connection((probe['host'], probe['port']), timeout=10) as raw:
                 with context.wrap_socket(raw, server_hostname=probe['server_name']) as secure:
                     der = secure.getpeercert(binary_form=True)
+        except ssl.SSLCertVerificationError:
+            raise Failure('HTTPS 验证端点 {}:{} ({}) 的证书链、域名或有效期校验失败。'.format(
+                probe['host'], probe['port'], probe['server_name']))
         except (OSError, ssl.SSLError):
             raise Failure('无法连接 HTTPS 验证端点 {}:{}。'.format(probe['host'], probe['port']))
         return hashlib.sha256(der).hexdigest()
 
-    def verify_probes(self, expected, attempts=1):
+    def verify_probes(self, expected, attempts=1, verify_chain=True):
         for attempt in range(attempts):
             errors = []
             for probe in self.config['probes']:
                 try:
-                    if self.probe_fingerprint(probe) != expected:
+                    if self.probe_fingerprint(probe, verify_chain=verify_chain) != expected:
                         errors.append('{}:{} ({}) 仍呈现其他证书'.format(probe['host'], probe['port'], probe['server_name']))
                 except Failure as error:
                     errors.append(str(error))
@@ -699,8 +759,15 @@ class Controller:
 
     def deploy_and_verify(self, before):
         self.candidate_valid()
+        # 跨续期只保护目标绑定；导入前后仍核对全部绑定，捕获接口副作用。
+        current = self.binding_state(self.metadata())
+        if self.target_bindings(current) != self.target_bindings(before):
+            raise Failure('导入前目标证书绑定已改变，停止导入证书。')
+        before = current
         expected = fingerprint(self.candidate())
         save_json(self.state / 'pending.json', {'fingerprint': expected, 'at': now()})
+        import_bindings = self.state / 'import-bindings.json'
+        save_json(import_bindings, before)
         if self.deployment_method() == 'local_api':
             self.deploy_local_api(before)
         else:
@@ -710,20 +777,28 @@ class Controller:
         after = self.metadata()
         if self.binding_state(after) != before:
             raise Failure('证书部署后服务绑定发生变化，请根据备份在 DSM 中核对恢复。')
+        import_bindings.unlink(missing_ok=True)
         if fingerprint(self.current_cert()) != expected:
             raise Failure('部署接口返回成功，但 DSM 中证书指纹未更新；下次任务将重试。')
         self.verify_probes(expected, attempts=6)
         (self.state / 'pending.json').unlink(missing_ok=True)
-        self.log('新证书已部署；所有配置的 HTTPS 端点指纹一致。')
+        self.log('新证书已部署；所有配置的 HTTPS 端点证书链、域名及指纹校验通过。')
 
     def run(self):
         self.load()
+        cleanup_ok = self.retry_dns_cleanup()
         info = self.preflight(check_endpoints=False)
         before = self.binding_state(info)
+        import_bindings = self.state / 'import-bindings.json'
+        if import_bindings.exists():
+            if read_json(import_bindings) != before:
+                raise Failure('前次导入后服务绑定发生变化，请先按备份核查恢复。')
+            import_bindings.unlink()
         baseline = self.state / 'run-baseline.json'
         if baseline.exists():
             previous = read_json(baseline)
-            if previous.get('certificate_id') != self.config['certificate_id'] or previous.get('bindings') != before:
+            if (previous.get('certificate_id') != self.config['certificate_id']
+                    or self.target_bindings(previous.get('bindings')) != self.target_bindings(before)):
                 raise Failure('前次操作后服务绑定发生变化，请先按备份核查恢复，或确认当前绑定后重新 configure。')
         self.backup(info)
         save_json(baseline, {'certificate_id': self.config['certificate_id'], 'bindings': before})
@@ -745,7 +820,7 @@ class Controller:
                 if pending.exists() and not self.renewal_due():
                     self.deploy_and_verify(before)
         else:
-            self.verify_probes(fingerprint(self.current_cert()))
+            self.verify_probes(fingerprint(self.current_cert()), verify_chain=False)
         if self.candidate().exists():
             args = ['--renew', '-d', primary]
         else:
@@ -771,7 +846,7 @@ class Controller:
         if self.renewal_due():
             raise Failure('已进入续期窗口，但尚未获得有效的新证书；下次任务重试。')
         (self.state / 'recovery.json').unlink(missing_ok=True)
-        if self.binding_state(self.metadata()) != before:
+        if self.target_bindings(self.binding_state(self.metadata())) != self.target_bindings(before):
             raise Failure('续期后服务绑定发生变化，请核对备份，停止后续自动操作。')
         expected = fingerprint(self.candidate())
         if expected != fingerprint(self.current_cert()) or pending.exists():
@@ -782,8 +857,10 @@ class Controller:
             except Failure:
                 save_json(pending, {'fingerprint': expected, 'at': now()})
                 raise
-        save_json(self.state / 'last-result.json', {'at': now(), 'success': True, 'fingerprint': expected})
         baseline.unlink(missing_ok=True)
+        if not cleanup_ok or self.dns_cleanup_count():
+            raise Failure('证书及 HTTPS 已验证，但 DNS 验证记录清理失败；下次任务独立重试清理，详见 state/dns-cleanup.json 和清理日志。')
+        save_json(self.state / 'last-result.json', {'at': now(), 'success': True, 'fingerprint': expected})
         self.log('本次检查完成，证书及 HTTPS 服务均正常。')
 
     def status(self):

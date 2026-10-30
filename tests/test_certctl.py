@@ -210,11 +210,11 @@ class CertificateTests(unittest.TestCase):
     def configure_runtime_mocks(self):
         self.controller.load = mock.Mock()
         self.controller.preflight = mock.Mock(side_effect=lambda **kwargs: self.controller.metadata())
-        self.controller.probe_fingerprint = mock.Mock(side_effect=lambda probe:
+        self.controller.probe_fingerprint = mock.Mock(side_effect=lambda probe, **kwargs:
             certctl.fingerprint(self.controller.current_cert()))
         self.controller.log = mock.Mock()
 
-    def test_live_local_tls_probe_reads_leaf_fingerprint_and_sends_sni(self):
+    def test_bootstrap_tls_probe_reads_untrusted_leaf_fingerprint_and_sends_sni(self):
         context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
         context.load_cert_chain(str(self.fixtures / 'new.pem'), str(self.fixtures / 'new.key'))
         received_names = []
@@ -239,7 +239,7 @@ class CertificateTests(unittest.TestCase):
         thread.start()
         try:
             actual = self.controller.probe_fingerprint({
-                'host': '127.0.0.1', 'port': port, 'server_name': 'ttxli.cn'})
+                'host': '127.0.0.1', 'port': port, 'server_name': 'ttxli.cn'}, verify_chain=False)
             self.assertEqual(actual, self.new_fingerprint)
         finally:
             thread.join(timeout=6)

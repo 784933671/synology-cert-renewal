@@ -69,7 +69,9 @@ PYTHON=$(cat /usr/local/share/synology-cert-renewal/python-path)
 "$PYTHON" -I /usr/local/share/synology-cert-renewal/certctl.py --home /usr/local/share/synology-cert-renewal status
 ```
 
-`check` 不签发、不部署，不修改 DNS 或 DSM 业务状态；可能写入本工具日志和互斥锁。`run` 按需签发或续期，再部署并检查证书指纹。首次部署失败时，再次执行 `run` 可重试已有证书，不需要强制重新申请。
+`check` 用于首次安装预检，只核对旧服务证书的归属，允许旧证书过期或自签；不签发、不部署，不修改 DNS 或 DSM 业务状态，可能写入本工具日志和互斥锁。`run` 按需签发或续期，再部署并通过系统根证书验证服务实际提供的证书链、域名、有效期和叶证书指纹。缺少中间证书也会报告失败、保留待部署状态。首次部署失败时，再次执行 `run` 可重试已有证书，不需要强制重新申请。
+
+跨轮重试和续期过程只保护目标证书的服务绑定及默认状态，其他证书的正常增删不会阻断续期。实际导入前后仍核对全部绑定；若导入期间发生变化，保留 `state/import-bindings.json` 并停止后续自动部署，核查恢复后才能继续。
 
 固定提前天数时，已部署证书只要仍有效，就允许正常等待或进入续期窗口，不会因剩余不足 14 天而提前重新申请。不同指纹的新候选仍须至少剩余 14 天，并通过域名、私钥和证书链校验后才允许导入。
 
@@ -95,6 +97,8 @@ PYTHON=$(cat /usr/local/share/synology-cert-renewal/python-path)
 
 工具每小时检查是否进入续期窗口；未进入时不发起签发请求，并继续验证当前 HTTPS 证书。普通续期失败会随后续任务重试；任务互斥执行，部署后核验目标 HTTPS 服务实际出示的证书，失败以非零退出码报告。不要同时运行其他更新同一张证书的脚本或 DSM 任务。
 
+每条 DNS 验证 TXT 在创建前先写入私有 `state/dns-cleanup.json`。清理按完整名称、TXT 类型和验证值精确匹配，不删除其他记录。删除请求失败、响应异常或结果尚未确认时保留清理记录；有效的新证书仍可正常部署，但任务以失败状态触发通知。下一次任务会先独立重试清理，即使尚未进入续期窗口也会执行，不会为此重复申请证书。腾讯云索引短暂延迟时，工具保留记录等待确认。
+
 ## 验收和故障处理
 
 首次配置后确认：DNSPod 验证 TXT 记录已清理；群晖证书有效期更新；服务绑定与原来一致；浏览器访问目标域名时证书正确。NAS 重启后再手动运行一次任务；DSM 或 Python 套件升级后也要复查任务。Python 路径若发生变化，检查 `python-path` 和 `run-task.sh` 后更新到真实路径。
@@ -105,7 +109,9 @@ PYTHON=$(cat /usr/local/share/synology-cert-renewal/python-path)
 
 若提示存在 `state/deployment-active.json`，说明任务曾异常中断。先暂停任务并核对实际服务证书、目标 ID 和绑定；临时管理员模式还需核实 `sc-acmesh-tmp` 是否为该次任务遗留账号，以及双重验证策略是否正常。确认恢复后，才移除标记并重新执行 `check`。工具不会自动删除来源不明的已有账号。
 
-若提示前次操作后绑定发生变化，根据 `state/backups/` 恢复原绑定；若是你有意调整服务绑定，确认当前状态后重新执行 `configure` 接受新配置。
+若提示前次操作后绑定发生变化，根据 `state/backups/` 恢复原绑定；若是你有意调整服务绑定，确认当前状态后重新执行 `configure` 接受新配置。不要直接删除导入绑定保护标记来忽略尚未核查的接口副作用。
+
+DNS 清理失败时核查 `state/dns-cleanup-last.log`、`state/acme-last.log` 和专用子账号的查询/删除权限。故障解决后再次运行任务即可重试，不要删除 `dns-cleanup.json`，否则会丢失待清理记录。该日志包含验证值，需与其他运行状态一样保持私有。
 
 需要恢复旧证书时，先暂停证书更新任务，在 DSM 的证书页面对同一个目标证书执行“替换现有证书”，从安全备份导入私钥、证书和中间证书，再核对原服务绑定和 HTTPS 访问。不要直接覆盖群晖系统证书目录。
 
@@ -116,6 +122,7 @@ PYTHON=$(cat /usr/local/share/synology-cert-renewal/python-path)
 - acme.sh：`3.1.6`。
 - 固定提交：`807da6498377ee5e0cf43a78091f46f12dc59a89`。
 - 官方源码归档 SHA-256：`ddbe1bcbd1a44a2623a2af167ebdc678669e6e2eb396742f2d1d28e02dc14220`。
+- 安装器将固定版 DNSPod 原文件原样保留为 `acme/dnsapi/dns_tencent_upstream.sh`，入口 `dns_tencent.sh` 使用本项目的清理跟踪钩子，继续复用固定版签名和 API 实现。ACME 主程序保持原样。
 - [acme.sh 群晖指南](https://github.com/acmesh-official/acme.sh/wiki/Synology-NAS-Guide)
 - [固定版群晖部署源码](https://github.com/acmesh-official/acme.sh/blob/807da6498377ee5e0cf43a78091f46f12dc59a89/deploy/synology_dsm.sh)
 - [固定版 DNSPod 插件](https://github.com/acmesh-official/acme.sh/blob/807da6498377ee5e0cf43a78091f46f12dc59a89/dnsapi/dns_tencent.sh)
@@ -132,10 +139,10 @@ python3 -m unittest discover -s tests -v
 sh -n install.sh
 ```
 
-离线 ACME 集成测试需要提供安装器所固定提交的源码目录；未指定时这 2 项测试会跳过，其余测试照常运行：
+离线 ACME 集成测试需要提供安装器所固定提交的源码目录；未指定时相关集成测试会跳过，其余测试照常运行：
 
 ```sh
 ACME_TEST_SOURCE=/固定提交的acme.sh源码目录 python3 -m unittest discover -s tests -v
 ```
 
-共 70 项测试，包含 2 项可选离线集成测试，涵盖证书域名/密钥/链、真实本地 TLS 握手与 SNI、部署失败补偿、损坏候选恢复及频率限制、异常证书列表、绑定保护、输入及权限检查。本机 API 后端还覆盖强制双重验证保持、临时文件被接口消耗、目标 ID/默认状态、错误响应和部署后核验。离线集成测试使用真实 acme.sh 验证续期跳过行为，签发和 DSM 部署仍为模拟且阻断 HTTP 客户端。安装器另验证了固定归档校验、安全解包和已有安装保护。这些验证不代表已经在你的 NAS 上完成签发、服务重载和故障邮件验收。
+测试覆盖证书域名/密钥/链、真实 TLS 三级链与缺失中间证书、部署补偿、48 小时策略、损坏材料恢复、绑定保护及旧基线迁移。DNS 测试覆盖精确删除、分页、失败持久化、独立重试、异常响应、权限、进程超时和告警退出码；固定版真实 acme.sh 的离线测试验证清理错误被吞掉时仍能保留恢复记录。安装器测试检查原上游钩子保留、辅助文件和私有权限。模拟的签发、DNS API 和 DSM 导入不等于真实设备验收；NAS 实测结果见 [部署验收记录](DEPLOYMENT.md)。
