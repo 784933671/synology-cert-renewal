@@ -42,7 +42,7 @@ class InstallationTests(unittest.TestCase):
         self.assertEqual((base / 'acme/dnsapi/dns_tencent_upstream.sh').read_bytes(), original_hook)
         self.assertEqual((base / 'acme/dnsapi/dns_tencent.sh').read_bytes(),
                          (SOURCE / 'dns_tencent_tracked.sh').read_bytes())
-        for name in ('certctl.py', 'dns_cleanup.py', 'dns_cleanup_retry.sh'):
+        for name in ('certctl.py', 'failure_diagnostics.py', 'dns_cleanup.py', 'dns_cleanup_retry.sh'):
             self.assertEqual((base / name).read_bytes(), (SOURCE / name).read_bytes())
         for path in [base] + list(base.rglob('*')):
             self.assertFalse(stat.S_IMODE(path.stat().st_mode) & 0o077, str(path))

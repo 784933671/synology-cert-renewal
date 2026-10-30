@@ -9,6 +9,7 @@ from email.utils import format_datetime
 import fcntl
 import getpass
 import hashlib
+import importlib.util
 import json
 import os
 from pathlib import Path
@@ -32,6 +33,12 @@ SYSTEM_PATH = '/usr/syno/sbin:/usr/syno/bin:/usr/local/bin:/usr/bin:/bin:/usr/sb
 RECOVERY_INTERVAL = 24 * 60 * 60
 SHORT_RECOVERY_INTERVAL = 6 * 60 * 60
 RECOVERY_LIMIT = 3
+
+# -I 模式不搜索脚本目录，按固定文件位置加载随安装包交付的诊断模块。
+_diagnostic_spec = importlib.util.spec_from_file_location(
+    'certificate_failure_diagnostics', Path(__file__).with_name('failure_diagnostics.py'))
+diagnostics = importlib.util.module_from_spec(_diagnostic_spec)
+_diagnostic_spec.loader.exec_module(diagnostics)
 
 
 class Failure(Exception):
@@ -207,6 +214,111 @@ class Controller:
         self.config_file = home / 'config.json'
         self.marker = self.state / 'deployment-active.json'
         self.config = None
+        self.failure_stage = 'preflight'
+        self.diagnostic_logs = {}
+        self.acme_evidence = ''
+        self.acme_events = []
+        self.cleanup_events = []
+        self.diagnostic_directory = None
+        self.operation_number = 0
+
+    def diagnostic_operation(self, kind):
+        private(self.state, directory=True)
+        if self.diagnostic_directory is None:
+            self.diagnostic_directory = Path(tempfile.mkdtemp(prefix='.diagnostics-', dir=str(self.state)))
+        private(self.diagnostic_directory, directory=True)
+        self.operation_number += 1
+        prefix = '{}-{}'.format(kind, self.operation_number)
+        return self.diagnostic_directory / (prefix + '.jsonl'), prefix
+
+    def capture_diagnostic_operation(self, output, event_file, prefix):
+        # 捕获本次调用，后续 ACME/清理调用覆盖 last.log 时不会丢失本轮证据。
+        events, text = [], ''
+        try:
+            if output is not None and output.exists():
+                private(output)
+                if output.stat().st_size <= 1024 * 1024:
+                    text = output.read_text(encoding='utf-8', errors='replace')
+                else:
+                    text = '[日志超过 1 MiB，未复制原始内容；请在 NAS 检查对应 last.log。]'
+            if event_file.exists():
+                private(event_file)
+                if event_file.stat().st_size > 64 * 1024:
+                    raise ValueError()
+                for line in event_file.read_text().splitlines():
+                    event = json.loads(line)
+                    if not isinstance(event, dict):
+                        raise ValueError()
+                    events.append(event)
+        except (Failure, OSError, ValueError):
+            events.append({'stage': 'dns_cleanup' if prefix.startswith('cleanup') else 'dns_query',
+                           'action': 'Journal', 'code': 'DiagnosticWriteFailed', 'category': 'local_state'})
+        self.diagnostic_logs[prefix + '.log'] = text
+        self.diagnostic_logs[prefix + '-events.jsonl'] = '\n'.join(json.dumps(e, ensure_ascii=False) for e in events)
+        return text, events
+
+    def diagnostic_secrets(self):
+        config = self.config if isinstance(self.config, dict) else {}
+        values = [config.get(key, '') for key in ('secret_id', 'secret_key')]
+        try:
+            path = self.state / 'dns-cleanup.json'
+            if path.exists():
+                private(path)
+                if path.stat().st_size <= 256 * 1024:
+                    data = read_json(path)
+                    if isinstance(data, dict) and isinstance(data.get('entries'), list):
+                        values.extend(item.get('value', '') for item in data['entries'] if isinstance(item, dict))
+        except (Failure, OSError):
+            pass
+        return tuple(value for value in values if isinstance(value, str) and value)
+
+    def report_failure(self, error):
+        secrets = self.diagnostic_secrets()
+        message = str(error) if isinstance(error, Failure) else '系统操作失败或被中断，请检查权限、网络及本机日志。'
+        message = diagnostics.sanitize(message, secrets=secrets, limit=600)
+        stage = self.failure_stage
+        events = self.acme_events if stage == 'acme' else self.cleanup_events if stage == 'dns_cleanup' else []
+        evidence = self.acme_evidence if stage == 'acme' else ''
+        try:
+            report = diagnostics.classify(stage, message=message, acme_log=evidence, dns_events=events)
+        except (ValueError, TypeError, KeyError):
+            report = {'stage': 'unknown', 'stage_label': '未能确定失败阶段', 'category': 'unknown',
+                      'code': '', 'summary': '本轮执行失败，现有证据不足以确定具体原因。',
+                      'hint': '查看本次失败记录并检查运行目录权限及网络。', 'evidence': 'unknown'}
+        report.update({'at': now(), 'message': message})
+        try:
+            private(self.state, directory=True)
+            archive = diagnostics.archive_failure(self.state, report, self.diagnostic_logs, secrets=secrets)
+        except (Failure, OSError, ValueError):
+            archive = {'archive_path': None, 'archive_error': '无法保存失败日志，请检查运行目录权限和可用空间。'}
+        report.update(archive)
+        try:
+            private(self.state, directory=True)
+            save_json(self.state / 'last-result.json', {'at': report['at'], 'success': False,
+                                                       'message': message, 'failure': report})
+        except (Failure, OSError):
+            report['archive_error'] = '无法更新运行结果，请检查运行目录权限和可用空间。'
+        lines = ['失败阶段：' + report['stage_label'], '错误摘要：' + report['summary']]
+        if report.get('code'):
+            lines.append('错误码：' + report['code'])
+        lines.extend(['详细说明：' + message, '处理建议：' + report['hint']])
+        if report.get('archive_path'):
+            lines.append('失败记录：' + str(report['archive_path']))
+        if report.get('archive_error'):
+            lines.append('日志留存：' + report['archive_error'])
+        public_paths = [report['archive_path']] if report.get('archive_path') else []
+        print(diagnostics.sanitize('\n'.join(lines), secrets=secrets, public_paths=public_paths),
+              file=sys.stderr, flush=True)
+        return 1
+
+    def cleanup_diagnostics(self):
+        if self.diagnostic_directory is not None:
+            try:
+                private(self.diagnostic_directory, directory=True)
+                shutil.rmtree(self.diagnostic_directory)
+            except (Failure, OSError):
+                pass
+            self.diagnostic_directory = None
 
     @contextlib.contextmanager
     def locked(self):
@@ -637,6 +749,7 @@ class Controller:
         return int(count)
 
     def retry_dns_cleanup(self):
+        self.failure_stage = 'dns_cleanup'
         if not self.dns_cleanup_count():
             return True
         helper = self.home / 'dns_cleanup_retry.sh'
@@ -644,10 +757,15 @@ class Controller:
         output = self.state / 'dns-cleanup-last.log'
         if output.exists():
             private(output)
+        event_file, prefix = self.diagnostic_operation('cleanup')
+        env = self.operation_environment()
+        env['CERTCTL_DIAGNOSTIC_FILE'] = str(event_file)
         proc = None
+        output_ready = False
         try:
             with output.open('wb') as log:
-                proc = subprocess.Popen(['/bin/sh', str(helper)], env=self.operation_environment(),
+                output_ready = True
+                proc = subprocess.Popen(['/bin/sh', str(helper)], env=env,
                                         stdin=subprocess.DEVNULL, stdout=log, stderr=log, start_new_session=True)
                 try:
                     result = proc.wait(timeout=180)
@@ -660,6 +778,8 @@ class Controller:
         finally:
             if proc is not None and proc.poll() is None:
                 self.stop_process(proc)
+            _, events = self.capture_diagnostic_operation(output if output_ready else None, event_file, prefix)
+            self.cleanup_events.extend(events)
 
     def invoke_acme(self, arguments):
         native = self.deployment_method() == 'local_api'
@@ -674,8 +794,12 @@ class Controller:
             env.update({'SYNO_USE_TEMP_ADMIN': '1', 'SYNO_HOSTNAME': '127.0.0.1', 'SYNO_SCHEME': 'http',
                         'SYNO_PORT': str(self.config['dsm_http_port']),
                         'SYNO_CERTIFICATE': self.config['certificate_description'], 'SYNO_CREATE': ''})
+        self.failure_stage = 'preflight'
         self.system_check()
         self.prepare_acme_config()
+        operation_stage = 'dsm_deploy' if arguments[0] == '--deploy' else 'acme'
+        event_file, prefix = self.diagnostic_operation('deploy' if arguments[0] == '--deploy' else 'acme')
+        env['CERTCTL_DIAGNOSTIC_FILE'] = str(event_file)
         output = self.state / 'acme-last.log'
         if output.exists():
             private(output)
@@ -685,12 +809,15 @@ class Controller:
             marker['temporary_user'] = TEMP_USER
         save_json(self.marker, marker)
         proc = None
+        output_ready = False
         try:
             with output.open('wb') as log:
+                output_ready = True
                 proc = subprocess.Popen(['/bin/sh', str(self.acme / 'acme.sh'), '--home', str(self.acme),
                                          '--config-home', str(self.acme), '--server', CA] + arguments,
                                         env=env, stdin=subprocess.DEVNULL, stdout=log, stderr=log,
                                         start_new_session=True)
+                self.failure_stage = operation_stage
                 try:
                     result = proc.wait(timeout=1200)
                 except (subprocess.TimeoutExpired, KeyboardInterrupt, InterruptedError):
@@ -700,6 +827,10 @@ class Controller:
         finally:
             if proc is not None and proc.poll() is None:
                 self.stop_process(proc)
+            evidence, events = self.capture_diagnostic_operation(output if output_ready else None, event_file, prefix)
+            if arguments[0] != '--deploy':
+                self.acme_evidence, self.acme_events = evidence, events
+                self.cleanup_events.extend(event for event in events if event.get('stage') == 'dns_cleanup')
             if not native and self.temp_user_exists():
                 capture(['synouser', '--del', TEMP_USER])
                 if self.temp_user_exists():
@@ -885,8 +1016,11 @@ class Controller:
         self.log('证书更新成功通知已提交群晖邮件服务。')
 
     def deploy_and_verify(self, before):
+        self.failure_stage = 'certificate_validation'
         self.candidate_valid()
+        self.failure_stage = 'success_notification'
         self.initialize_success_notification()
+        self.failure_stage = 'dsm_deploy'
         # 跨续期只保护目标绑定；导入前后仍核对全部绑定，捕获接口副作用。
         current = self.binding_state(self.metadata())
         if self.target_bindings(current) != self.target_bindings(before):
@@ -908,16 +1042,25 @@ class Controller:
         import_bindings.unlink(missing_ok=True)
         if fingerprint(self.current_cert()) != expected:
             raise Failure('部署接口返回成功，但 DSM 中证书指纹未更新；下次任务将重试。')
+        self.failure_stage = 'tls_verify'
         self.verify_probes(expected, attempts=6)
+        self.failure_stage = 'success_notification'
         self.queue_success_notification(expected)
         (self.state / 'pending.json').unlink(missing_ok=True)
         self.log('新证书已部署；所有配置的 HTTPS 端点证书链、域名及指纹校验通过。')
 
     def run(self):
+        self.cleanup_diagnostics()
+        self.failure_stage = 'preflight'
+        self.diagnostic_logs = {}
+        self.acme_evidence, self.acme_events, self.cleanup_events = '', [], []
         self.load()
         cleanup_ok = self.retry_dns_cleanup()
+        self.failure_stage = 'preflight'
         info = self.preflight(check_endpoints=False)
+        self.failure_stage = 'success_notification'
         self.initialize_success_notification()
+        self.failure_stage = 'preflight'
         before = self.binding_state(info)
         import_bindings = self.state / 'import-bindings.json'
         if import_bindings.exists():
@@ -930,8 +1073,10 @@ class Controller:
             if (previous.get('certificate_id') != self.config['certificate_id']
                     or self.target_bindings(previous.get('bindings')) != self.target_bindings(before)):
                 raise Failure('前次操作后服务绑定发生变化，请先按备份核查恢复，或确认当前绑定后重新 configure。')
+        self.failure_stage = 'backup'
         self.backup(info)
         save_json(baseline, {'certificate_id': self.config['certificate_id'], 'bindings': before})
+        self.failure_stage = 'preflight'
         pending = self.state / 'pending.json'
         primary = self.config['domains'][0]
         conf = self.candidate_dir() / (primary + '.conf')
@@ -940,16 +1085,19 @@ class Controller:
         if pending.exists():
             self.log('发现待完成部署，先检查已签发证书。')
         if pending.exists() or self.candidate().exists():
+            self.failure_stage = 'certificate_validation'
             try:
                 self.candidate_valid()
             except Failure:
                 save_json(pending, {'at': now(), 'needs_recovery': True})
+                self.failure_stage = 'recovery'
                 self.recover_candidate()
             else:
                 (self.state / 'recovery.json').unlink(missing_ok=True)
                 if pending.exists() and not self.renewal_due():
                     self.deploy_and_verify(before)
         else:
+            self.failure_stage = 'tls_verify'
             self.verify_probes(fingerprint(self.current_cert()), verify_chain=False)
         if self.candidate().exists():
             args = ['--renew', '-d', primary]
@@ -958,17 +1106,21 @@ class Controller:
             for domain in self.config['domains']:
                 args.extend(['-d', domain])
         if 'renew_before_days' in self.config and self.candidate().exists():
+            self.failure_stage = 'preflight'
             self.prepare_acme_config()
         if 'renew_before_days' in self.config and self.candidate().exists() and not self.renewal_due():
             # 门控在包装器中执行，历史 ACME 日期或 CA 窗口不能提前触发签发。
             result = 2
             self.log('尚未进入到期前 {} 天的续期窗口，本次不申请证书。'.format(self.config['renew_before_days']))
         else:
+            self.failure_stage = 'acme'
             result = self.invoke_acme(args)
         if self.candidate().exists() and fingerprint(self.candidate()) != fingerprint(self.current_cert()):
             save_json(pending, {'fingerprint': fingerprint(self.candidate()), 'at': now()})
         if result not in (0, 2):
+            self.failure_stage = 'acme'
             raise Failure('签发或续期失败；部署前备份已保留。详见 state/acme-last.log。')
+        self.failure_stage = 'certificate_validation'
         if not self.candidate().is_file():
             save_json(pending, {'at': now(), 'needs_recovery': True})
             raise Failure('ACME 未生成预期证书，不能将跳过状态当作签发成功。')
@@ -976,21 +1128,26 @@ class Controller:
         if self.renewal_due():
             raise Failure('已进入续期窗口，但尚未获得有效的新证书；下次任务重试。')
         (self.state / 'recovery.json').unlink(missing_ok=True)
+        self.failure_stage = 'dsm_deploy'
         if self.target_bindings(self.binding_state(self.metadata())) != self.target_bindings(before):
             raise Failure('续期后服务绑定发生变化，请核对备份，停止后续自动操作。')
         expected = fingerprint(self.candidate())
         if expected != fingerprint(self.current_cert()) or pending.exists():
             self.deploy_and_verify(before)
         else:
+            self.failure_stage = 'tls_verify'
             try:
                 self.verify_probes(expected, attempts=3)
             except Failure:
                 save_json(pending, {'fingerprint': expected, 'at': now()})
                 raise
         baseline.unlink(missing_ok=True)
+        self.failure_stage = 'dns_cleanup'
         if not cleanup_ok or self.dns_cleanup_count():
             raise Failure('证书及 HTTPS 已验证，但 DNS 验证记录清理失败；下次任务独立重试清理，详见 state/dns-cleanup.json 和清理日志。')
+        self.failure_stage = 'success_notification'
         self.send_success_notification(expected)
+        self.failure_stage = 'result_recording'
         save_json(self.state / 'last-result.json', {'at': now(), 'success': True, 'fingerprint': expected})
         self.log('本次检查完成，证书及 HTTPS 服务均正常。')
 
@@ -1033,7 +1190,13 @@ def main(argv=None):
             if args.command == 'configure':
                 controller.configure()
             elif args.command == 'run':
-                controller.run()
+                try:
+                    controller.run()
+                except (Failure, OSError, KeyboardInterrupt, InterruptedError) as error:
+                    # 在互斥锁内归档，避免下一轮覆盖本次日志或运行结果。
+                    return controller.report_failure(error)
+                finally:
+                    controller.cleanup_diagnostics()
             elif args.command == 'check':
                 controller.load()
                 controller.preflight()
@@ -1045,14 +1208,10 @@ def main(argv=None):
         print(str(error))
         return 0
     except (Failure, OSError, KeyboardInterrupt, InterruptedError) as error:
+        if args.command == 'run':
+            return controller.report_failure(error)
         message = str(error) if isinstance(error, Failure) else '系统操作失败或被中断，请检查文件权限、网络及本机日志。'
-        print('失败：' + message, file=sys.stderr)
-        if args.command == 'run' and controller.state.is_dir():
-            try:
-                private(controller.state, directory=True)
-                save_json(controller.state / 'last-result.json', {'at': now(), 'success': False, 'message': message})
-            except (OSError, Failure):
-                pass
+        print('失败：' + diagnostics.sanitize(message, secrets=controller.diagnostic_secrets()), file=sys.stderr)
         return 1
 
 

@@ -13,10 +13,120 @@ import time
 
 EMPTY_GRACE = 300
 PAGE_SIZE = 100
+DIAGNOSTIC_LIMIT = 64 * 1024
+API_ACTIONS = {'DescribeRecordList', 'CreateRecord', 'DescribeRecordFilterList', 'DeleteRecord'}
+ERROR_ROOTS = {'AuthFailure', 'FailedOperation', 'InternalError', 'InvalidAction', 'InvalidParameter',
+               'InvalidParameterValue', 'LimitExceeded', 'MissingParameter', 'OperationDenied',
+               'RequestLimitExceeded', 'ResourceInUse', 'ResourceInsufficient', 'ResourceNotFound',
+               'ResourceUnavailable', 'UnauthorizedOperation', 'UnknownParameter', 'UnsupportedOperation'}
+ERROR_CODES = {'AuthFailure.SecretIdNotFound', 'AuthFailure.SignatureFailure', 'AuthFailure.SignatureExpire',
+               'AuthFailure.InvalidAuthorization', 'AuthFailure.TokenFailure',
+               'AuthFailure.UnauthorizedOperation', 'UnauthorizedOperation.CamNoPermission',
+               'UnauthorizedOperation.PermissionDenied', 'ResourceNotFound.NoDataOfDomain',
+               'ResourceNotFound.NoDataOfRecord', 'InvalidParameter.DomainInvalid',
+               'InvalidParameterValue.DomainInvalid', 'FailedOperation.DomainIsLocked'}
+LOCAL_CODES = {'NetworkError', 'InvalidResponse', 'MissingCredentials', 'StateError',
+               'UnknownError', 'RecordStillPresent', 'IndexNotReady'}
 
 
 class CleanupError(Exception):
     pass
+
+
+class DiagnosticError(CleanupError):
+    pass
+
+
+def safe_error_code(value):
+    if not isinstance(value, str):
+        return 'UnknownError'
+    if value in ERROR_CODES or value in ERROR_ROOTS:
+        return value
+    if value.split('.', 1)[0] in ERROR_ROOTS:
+        return value.split('.', 1)[0]
+    return 'UnknownError'
+
+
+def diagnostic(home, stage, action, category, code):
+    destination = os.environ.get('CERTCTL_DIAGNOSTIC_FILE')
+    if not destination:
+        return
+    try:
+        if (stage not in ('dns_query', 'dns_create', 'dns_cleanup') or
+                action not in API_ACTIONS | {'Credentials', 'Journal'} or
+                category not in ('api', 'network', 'invalid_response', 'credentials', 'local_state') or
+                code not in ERROR_CODES | ERROR_ROOTS | LOCAL_CODES):
+            raise DiagnosticError()
+        state = home / 'state'
+        path = Path(destination)
+        relative = path.relative_to(state)
+        if not path.is_absolute() or len(relative.parts) < 2 or '..' in relative.parts:
+            raise DiagnosticError()
+        check_private(home, directory=True)
+        check_private(state, directory=True)
+        parent = state
+        for part in relative.parts[:-1]:
+            parent = parent / part
+            check_private(parent, directory=True)
+        fd = os.open(str(path), os.O_WRONLY | os.O_APPEND | os.O_CREAT | os.O_NOFOLLOW, 0o600)
+        try:
+            info = os.fstat(fd)
+            if (not stat.S_ISREG(info.st_mode) or info.st_uid != os.geteuid() or info.st_mode & 0o077):
+                raise DiagnosticError()
+            fcntl.flock(fd, fcntl.LOCK_EX)
+            data = (json.dumps({'stage': stage, 'action': action, 'code': code,
+                                'category': category}, separators=(',', ':')) + '\n').encode()
+            if os.fstat(fd).st_size + len(data) > DIAGNOSTIC_LIMIT:
+                raise DiagnosticError()
+            if os.write(fd, data) != len(data):
+                raise DiagnosticError()
+            os.fsync(fd)
+        finally:
+            os.close(fd)
+    except (OSError, ValueError, CleanupError):
+        raise DiagnosticError('DNS_DIAGNOSTIC_WRITE_FAILED')
+
+
+def api_response(home, stage, action, mode, transport_ok, raw):
+    if action not in API_ACTIONS or mode not in ('normal', 'root'):
+        raise CleanupError('未知 DNS API 操作。')
+    try:
+        payload = json.loads(raw)
+        response = payload.get('Response') if isinstance(payload, dict) else None
+    except ValueError:
+        response = None
+    if isinstance(response, dict) and isinstance(response.get('Error'), dict):
+        code = safe_error_code(response['Error'].get('Code'))
+        if transport_ok and action == 'DescribeRecordList' and mode == 'root':
+            # 探测不存在的子域是正常过程，只在最终没有找到根域时报告。
+            print(code)
+            return 2
+        if transport_ok and action == 'DescribeRecordFilterList' and code == 'ResourceNotFound.NoDataOfRecord':
+            return 0
+        diagnostic(home, stage, action, 'api', code)
+        return 1
+    if not transport_ok:
+        diagnostic(home, stage, action, 'network', 'NetworkError')
+        return 1
+    valid = (isinstance(response, dict) and isinstance(response.get('RequestId'), str)
+             and bool(response['RequestId']) and 'Error' not in response)
+    if valid and action == 'CreateRecord':
+        valid = type(response.get('RecordId')) is int and response['RecordId'] > 0
+    elif valid and action == 'DescribeRecordList':
+        counts = response.get('RecordCountInfo')
+        total = counts.get('TotalCount') if isinstance(counts, dict) else response.get('TotalCount')
+        valid = type(total) is int and total >= 0 and isinstance(response.get('RecordList'), list)
+    elif valid and action == 'DescribeRecordFilterList':
+        records = response.get('RecordList')
+        valid = isinstance(records, list) and len(records) <= PAGE_SIZE
+        if valid:
+            valid = all(isinstance(item, dict) and type(item.get('RecordId')) is int
+                        and item['RecordId'] > 0 and all(isinstance(item.get(key), str)
+                        for key in ('Name', 'Value', 'Type')) for item in records)
+    if not valid:
+        diagnostic(home, stage, action, 'invalid_response', 'InvalidResponse')
+        return 1
+    return 0
 
 
 def validate_pair(name, value):
@@ -152,7 +262,12 @@ def main(argv=None):
     argv = sys.argv[1:] if argv is None else argv
     try:
         home, action, arguments = Path(argv[0]), argv[1], argv[2:]
-        if action == 'response':
+        if action == 'diagnostic':
+            diagnostic(home, *arguments)
+        elif action == 'api':
+            stage, operation, mode, transport = arguments
+            return api_response(home, stage, operation, mode, transport == '0', sys.stdin.read())
+        elif action == 'response':
             response_data(sys.stdin.read())
         elif action == 'created':
             response = response_data(sys.stdin.read())
@@ -164,6 +279,9 @@ def main(argv=None):
         else:
             journal_command(home, action, arguments)
         return 0
+    except DiagnosticError:
+        print('DNS_DIAGNOSTIC_WRITE_FAILED', file=sys.stderr)
+        return 1
     except (CleanupError, OSError, ValueError, IndexError, TypeError):
         # 不输出响应内容、验证值或密钥。
         print('DNS 清理操作未完成，待清理记录已保留；请检查权限、网络及本机日志。', file=sys.stderr)

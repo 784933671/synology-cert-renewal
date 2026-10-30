@@ -14,7 +14,7 @@ fail() { printf '%s\n' "$*" >&2; exit 1; }
 [ "$(id -u)" = 0 ] || fail '请在 NAS 上先执行 sudo -i，再运行安装脚本。'
 [ -f /etc.defaults/VERSION ] || fail '当前设备不是可识别的 DSM；请在群晖 NAS 本机安装。'
 [ ! -e "$BASE" ] && [ ! -L "$BASE" ] || fail "安装目录已存在，保留原配置并停止：$BASE"
-for source_file in certctl.py dns_cleanup.py dns_cleanup_retry.sh dns_tencent_tracked.sh; do
+for source_file in certctl.py failure_diagnostics.py dns_cleanup.py dns_cleanup_retry.sh dns_tencent_tracked.sh; do
     [ -f "$SOURCE_DIR/$source_file" ] && [ ! -L "$SOURCE_DIR/$source_file" ] || fail "安装包缺少 $source_file，或该文件是符号链接。"
 done
 
@@ -98,7 +98,7 @@ with tarfile.open(archive, 'r:gz') as tar:
 required = ('acme.sh', 'dnsapi/dns_tencent.sh', 'deploy/synology_dsm.sh')
 if not all((acme / name).is_file() for name in required):
     sys.exit('下载包缺少所需组件，停止安装。')
-for name in ('certctl.py', 'dns_cleanup.py', 'dns_cleanup_retry.sh'):
+for name in ('certctl.py', 'failure_diagnostics.py', 'dns_cleanup.py', 'dns_cleanup_retry.sh'):
     shutil.copyfile(source / name, package / name)
 # 保留固定上游文件；项目钩子只增加持久清理和精确删除，不改变 DNS 提供商配置。
 upstream = acme / 'dnsapi' / 'dns_tencent.sh'
