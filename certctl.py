@@ -122,16 +122,27 @@ def covers(domains, name):
                                   and name.endswith(d[1:]) for d in domains)
 
 
+def validate_description(description, method):
+    if method == 'local_api':
+        if (not isinstance(description, str) or not description.strip() or len(description) > 256
+                or re.search(r'[\x00-\x1f\x7f-\x9f]', description)):
+            raise Failure('证书描述须为 1 到 256 个字符，且不能包含控制字符。')
+    elif not isinstance(description, str) or not re.fullmatch(r'[A-Za-z0-9_-]{1,80}', description):
+        raise Failure('请先在 DSM 中将证书描述改为唯一英文标识，例如 ttxli-cn-auto。')
+
+
 def validate_config(config):
     if not isinstance(config, dict) or config.get('version') != 1:
         raise Failure('配置版本无效，请重新 configure。')
+    method = config.get('deployment_method', 'synology_dsm')
+    if method not in ('local_api', 'synology_dsm'):
+        raise Failure('证书部署方式无效，请重新 configure。')
     for key in ('certificate_id', 'certificate_description', 'email', 'secret_id', 'secret_key'):
         if not isinstance(config.get(key), str) or not config[key].strip():
             raise Failure('配置缺少字段：{}'.format(key))
     if not re.fullmatch(r'[A-Za-z0-9_-]+', config['certificate_id']):
         raise Failure('证书 ID 格式无效。')
-    if not re.fullmatch(r'[A-Za-z0-9_-]{1,80}', config['certificate_description']):
-        raise Failure('请先在 DSM 中将证书描述改为唯一英文标识，例如 ttxli-cn-auto。')
+    validate_description(config['certificate_description'], method)
     domains = config.get('domains')
     if not isinstance(domains, list) or not domains or not all(valid_domain(x) for x in domains):
         raise Failure('域名配置无效；请使用小写 ASCII 域名或其通配符。')
@@ -141,7 +152,8 @@ def validate_config(config):
         raise Failure('邮箱格式无效；请使用常规 ASCII 邮箱地址。')
     if any(not re.fullmatch(r'[A-Za-z0-9+/=_-]+', config[key]) for key in ('secret_id', 'secret_key')):
         raise Failure('腾讯云密钥格式无效，请直接复制控制台生成的密钥，不要添加引号。')
-    if type(config.get('dsm_http_port')) is not int or not 1 <= config['dsm_http_port'] <= 65535:
+    if method == 'synology_dsm' and (type(config.get('dsm_http_port')) is not int
+                                    or not 1 <= config['dsm_http_port'] <= 65535):
         raise Failure('DSM HTTP 端口无效。')
     probes = config.get('probes')
     if not isinstance(probes, list) or not probes:
@@ -206,6 +218,9 @@ class Controller:
         self.config = read_json(self.config_file)
         validate_config(self.config)
 
+    def deployment_method(self):
+        return (self.config or {}).get('deployment_method', 'synology_dsm')
+
     def system_check(self):
         version_path = Path('/etc.defaults/VERSION')
         if not version_path.is_file():
@@ -217,14 +232,21 @@ class Controller:
             raise Failure('无法识别 DSM 版本。')
         if not number or number[0] not in (6, 7) or number < (6, 2, 4):
             raise Failure('需要 DSM 6.2.4 或更新版本。')
-        for command in ('curl', 'openssl', 'synouser', 'synogroup', 'synosetkeyvalue', 'synogetkeyvalue'):
+        method = self.deployment_method()
+        dependencies = ('curl', 'openssl')
+        if method == 'local_api':
+            dependencies += ('synowebapi',)
+        else:
+            dependencies += ('synouser', 'synogroup', 'synosetkeyvalue', 'synogetkeyvalue')
+        for command in dependencies:
             if not shutil.which(command):
                 raise Failure('缺少系统命令：{}'.format(command))
-        policy = capture(['synogetkeyvalue', '/etc/synoinfo.conf', 'otp_enforce_option']).decode().strip()
-        if policy not in ('', 'none'):
-            raise Failure('DSM 已开启强制双重验证；当前临时管理员方案已停止，不会修改该策略。')
-        if self.temp_user_exists():
-            raise Failure('已存在 {}，请先核实其来源并清理残留，工具不会删除已有账号。'.format(TEMP_USER))
+        if method == 'synology_dsm':
+            policy = capture(['synogetkeyvalue', '/etc/synoinfo.conf', 'otp_enforce_option']).decode().strip()
+            if policy not in ('', 'none'):
+                raise Failure('DSM 已开启强制双重验证；当前临时管理员方案已停止，不会修改该策略。')
+            if self.temp_user_exists():
+                raise Failure('已存在 {}，请先核实其来源并清理残留，工具不会删除已有账号。'.format(TEMP_USER))
         private(self.acme, directory=True)
         private(self.acme / 'acme.sh')
         output = capture(['/bin/sh', str(self.acme / 'acme.sh'), '--version']).decode()
@@ -261,15 +283,58 @@ class Controller:
                              if isinstance(value, dict)},
                 'default': default.read_text().strip() if default.exists() else None}
 
+    def call_local_api(self, api, method, params=None, timeout=30):
+        command = shutil.which('synowebapi')
+        if not command:
+            raise Failure('缺少系统命令：synowebapi')
+        arguments = [command, '--exec', 'api=' + api, 'method=' + method, 'version=1']
+        arguments.extend(key + '=' + json.dumps(value, ensure_ascii=False)
+                         for key, value in (params or {}).items())
+        body = capture(arguments, timeout=timeout)
+        try:
+            response = json.loads(body)
+            if (not isinstance(response, dict) or response.get('success') is not True
+                    or response.get('error') is not None):
+                raise ValueError()
+            data = response.get('data', {})
+            if not isinstance(data, dict):
+                raise ValueError()
+        except (ValueError, UnicodeError):
+            raise Failure('DSM 本机证书 API 未返回有效成功结果，保留待部署证书。')
+        return data
+
+    def local_api_list(self):
+        data = self.call_local_api('SYNO.Core.Certificate.CRT', 'list')
+        certificates = data.get('certificates')
+        if not isinstance(certificates, list) or not all(isinstance(item, dict) for item in certificates):
+            raise Failure('DSM 本机证书列表格式不受支持。')
+        return certificates
+
+    def local_api_target(self, before):
+        certificates = self.local_api_list()
+        matches = [item for item in certificates if item.get('desc') == self.config['certificate_description']]
+        identifier = self.config['certificate_id']
+        if (len(matches) != 1 or matches[0].get('id') != identifier
+                or sum(item.get('id') == identifier for item in certificates) != 1):
+            raise Failure('DSM 本机 API 中目标证书 ID 或唯一描述不匹配，拒绝导入。')
+        target = matches[0]
+        if (type(target.get('is_default')) is not bool
+                or target['is_default'] != (before['default'] == identifier)):
+            raise Failure('DSM 本机 API 与证书默认绑定状态不一致，拒绝导入。')
+        return target
+
     def preflight(self, check_endpoints=True):
         self.system_check()
         if self.marker.exists():
-            raise Failure('发现上次中断标记，请先检查临时账号及证书状态；确认恢复后移除 state/deployment-active.json。')
+            raise Failure('发现上次中断标记，请先检查部署及证书状态；确认恢复后移除 state/deployment-active.json。')
         info = self.metadata()
         if set(certificate_domains(self.current_cert())) != set(self.config['domains']):
             raise Failure('当前群晖证书域名已改变，停止自动替换；请重新 configure。')
         if check_endpoints:
             self.verify_probes(fingerprint(self.current_cert()), attempts=1)
+        if self.deployment_method() == 'local_api':
+            self.local_api_target(self.binding_state(info))
+            return info
         port = self.config['dsm_http_port']
         body = capture(['curl', '--noproxy', '*', '--fail', '--silent', '--show-error',
                         '--connect-timeout', '5', '--max-time', '15',
@@ -285,6 +350,8 @@ class Controller:
     def configure(self):
         if not sys.stdin.isatty():
             raise Failure('configure 必须在交互终端运行，密钥只在 NAS 本机输入。')
+        method = 'local_api' if shutil.which('synowebapi') else 'synology_dsm'
+        self.config = {'deployment_method': method}
         self.system_check()
         info = read_json(self.archive / 'INFO')
         if not isinstance(info, dict):
@@ -312,12 +379,11 @@ class Controller:
             domains.insert(0, 'ttxli.cn')
         name = next((x for x in domains if not x.startswith('*.')), 'nas.' + domains[0][2:])
         description = entry.get('desc', '')
-        if not re.fullmatch(r'[A-Za-z0-9_-]{1,80}', description):
-            raise Failure('请先在 DSM 将此证书的描述改为唯一英文标识（如 ttxli-cn-auto），再运行 configure。')
+        validate_description(description, method)
         if sum(value.get('desc') == description for _, value in choices) != 1:
             raise Failure('证书描述重复，请先在 DSM 修改为唯一描述。')
         email = input('证书注册邮箱: ').strip()
-        http_port = port_prompt('DSM HTTP 端口', 5000)
+        http_port = port_prompt('DSM HTTP 端口', 5000) if method == 'synology_dsm' else 5000
         probes = []
         while True:
             host = input('HTTPS 验证主机/IP [127.0.0.1]: ').strip() or '127.0.0.1'
@@ -328,7 +394,8 @@ class Controller:
                 break
         secret_id = getpass.getpass('腾讯云子账号 SecretId（不回显）: ').strip()
         secret_key = getpass.getpass('腾讯云子账号 SecretKey（不回显）: ').strip()
-        self.config = {'version': 1, 'certificate_id': key, 'certificate_description': description,
+        self.config = {'version': 1, 'deployment_method': method,
+                       'certificate_id': key, 'certificate_description': description,
                        'domains': domains, 'email': email, 'secret_id': secret_id,
                        'secret_key': secret_key, 'dsm_http_port': http_port, 'probes': probes}
         validate_config(self.config)
@@ -472,18 +539,26 @@ class Controller:
 
     def invoke_acme(self, arguments):
         # 不继承代理、调试、部署相关环境，避免凭据经代理外发或误用历史配置。
+        native = self.deployment_method() == 'local_api'
+        if native and (not arguments or arguments[0] not in ('--issue', '--renew')):
+            raise Failure('本机 API 模式仅允许 acme.sh 签发或续期，部署由本机 API 完成。')
         env = {'PATH': SYSTEM_PATH, 'HOME': str(self.home), 'LANG': 'C', 'LC_ALL': 'C',
                'NO_PROXY': '127.0.0.1,localhost', 'no_proxy': '127.0.0.1,localhost',
-               'Tencent_SecretId': self.config['secret_id'], 'Tencent_SecretKey': self.config['secret_key'],
-               'SYNO_USE_TEMP_ADMIN': '1', 'SYNO_HOSTNAME': '127.0.0.1', 'SYNO_SCHEME': 'http',
-               'SYNO_PORT': str(self.config['dsm_http_port']),
-               'SYNO_CERTIFICATE': self.config['certificate_description'], 'SYNO_CREATE': ''}
+               'Tencent_SecretId': self.config['secret_id'], 'Tencent_SecretKey': self.config['secret_key']}
+        if not native:
+            env.update({'SYNO_USE_TEMP_ADMIN': '1', 'SYNO_HOSTNAME': '127.0.0.1', 'SYNO_SCHEME': 'http',
+                        'SYNO_PORT': str(self.config['dsm_http_port']),
+                        'SYNO_CERTIFICATE': self.config['certificate_description'], 'SYNO_CREATE': ''})
         self.system_check()
         self.prepare_acme_config()
         output = self.state / 'acme-last.log'
         if output.exists():
             private(output)
-        save_json(self.marker, {'at': now(), 'pid': os.getpid(), 'temporary_user': TEMP_USER})
+        marker = {'at': now(), 'pid': os.getpid(), 'deployment_method': self.deployment_method(),
+                  'operation': 'acme'}
+        if not native:
+            marker['temporary_user'] = TEMP_USER
+        save_json(self.marker, marker)
         proc = None
         try:
             with output.open('wb') as log:
@@ -500,7 +575,7 @@ class Controller:
         finally:
             if proc is not None and proc.poll() is None:
                 self.stop_process(proc)
-            if self.temp_user_exists():
+            if not native and self.temp_user_exists():
                 capture(['synouser', '--del', TEMP_USER])
                 if self.temp_user_exists():
                     raise Failure('临时管理员清理失败，请立即在 DSM 核查。')
@@ -544,13 +619,46 @@ class Controller:
                 time.sleep(5)
         raise Failure('；'.join(errors) + '。请检查服务证书绑定、端口和域名。')
 
+    def deploy_local_api(self, before):
+        self.system_check()
+        if self.marker.exists():
+            raise Failure('存在未核实的部署中断标记，停止导入证书。')
+        if self.binding_state(self.metadata()) != before:
+            raise Failure('导入前证书绑定已改变，停止导入证书。')
+        target = self.local_api_target(before)
+        # 使用副本供 DSM 导入，避免内置 API 移走上传文件后破坏 ACME 续期材料。
+        with tempfile.TemporaryDirectory(prefix='dsm-import-', dir=str(self.state)) as directory:
+            staging = Path(directory)
+            staging.chmod(0o700)
+            files = {'key_tmp': self.candidate_dir() / (self.config['domains'][0] + '.key'),
+                     'cert_tmp': self.candidate(), 'inter_cert_tmp': self.candidate_dir() / 'ca.cer'}
+            params = {'id': self.config['certificate_id'],
+                      'desc': self.config['certificate_description'],
+                      'as_default': 'true' if target['is_default'] else 'false'}
+            for name, source in files.items():
+                destination = staging / (name + '.pem')
+                shutil.copyfile(source, destination)
+                destination.chmod(0o600)
+                params[name] = str(destination)
+            save_json(self.marker, {'at': now(), 'pid': os.getpid(),
+                                    'deployment_method': 'local_api', 'operation': 'import'})
+            try:
+                data = self.call_local_api('SYNO.Core.Certificate', 'import', params, timeout=120)
+                if 'id' in data and data['id'] != self.config['certificate_id']:
+                    raise Failure('DSM 导入返回了不同的证书 ID，请核对备份及服务绑定。')
+            finally:
+                self.marker.unlink(missing_ok=True)
+
     def deploy_and_verify(self, before):
         self.candidate_valid()
         expected = fingerprint(self.candidate())
         save_json(self.state / 'pending.json', {'fingerprint': expected, 'at': now()})
-        result = self.invoke_acme(['--deploy', '-d', self.config['domains'][0], '--deploy-hook', 'synology_dsm'])
-        if result:
-            raise Failure('证书已取得，但 DSM 部署失败；保留待部署标记，下次重试。详见 state/acme-last.log。')
+        if self.deployment_method() == 'local_api':
+            self.deploy_local_api(before)
+        else:
+            result = self.invoke_acme(['--deploy', '-d', self.config['domains'][0], '--deploy-hook', 'synology_dsm'])
+            if result:
+                raise Failure('证书已取得，但 DSM 部署失败；保留待部署标记，下次重试。详见 state/acme-last.log。')
         after = self.metadata()
         if self.binding_state(after) != before:
             raise Failure('证书部署后服务绑定发生变化，请根据备份在 DSM 中核对恢复。')
@@ -625,6 +733,7 @@ class Controller:
         self.load()
         self.metadata()
         print('域名：' + ', '.join(self.config['domains']))
+        print('部署方式：' + self.deployment_method())
         print('证书描述：' + self.config['certificate_description'])
         print(capture(['openssl', 'x509', '-in', str(self.current_cert()), '-noout', '-dates']).decode().strip())
         print('待部署：' + ('是' if (self.state / 'pending.json').exists() else '否'))

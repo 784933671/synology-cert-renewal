@@ -26,9 +26,14 @@ for candidate in "$PATH_PYTHON" /var/packages/Python3/target/usr/local/bin/pytho
     fi
 done
 [ -n "$PYTHON" ] || fail '需要 Python 3.8 或以上及标准库。请先在套件中心安装/更新 Python3，再重试。'
-for dependency in curl openssl synouser synogroup synosetkeyvalue synogetkeyvalue; do
+for dependency in curl openssl; do
     command -v "$dependency" >/dev/null 2>&1 || fail "缺少群晖本机依赖：$dependency"
 done
+if ! command -v synowebapi >/dev/null 2>&1; then
+    for dependency in synouser synogroup synosetkeyvalue synogetkeyvalue; do
+        command -v "$dependency" >/dev/null 2>&1 || fail "缺少群晖本机依赖：$dependency"
+    done
+fi
 "$PYTHON" -I - <<'PY'
 import pathlib, re, sys
 text = pathlib.Path('/etc.defaults/VERSION').read_text()
