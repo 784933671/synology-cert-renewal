@@ -61,7 +61,7 @@ Challenge = {
 
 ### 运行健康与执行记录接口
 
-- GET `/api/health`：返回 `server_time`、`timezone`、`runtime`、`supervisor`、`upgrade`、`events`、`monitor`。`runtime` 含 `checked_at`、`stale`、`stale_after_seconds:45`、固定 `components` 和容器安全指标；组件键为 `container/bridge/tls/access/monitor`，状态为 `ok/warning/error/unknown`。`monitor` 含独立检查时间、`stale_after_seconds:180`、任务启停、计划支持情况、最后完成时间、下次应执行时间、漏跑次数、证书剩余秒数、事件和脱敏投递状态。快照过期、来自未来或监测设置尚未应用时，不显示为健康；前端按服务器时刻加单调经过时长更新过期状态。
+- GET `/api/health`：返回 `server_time`、`timezone`、`runtime`、`supervisor`、`upgrade`、`events`、`monitor`。`runtime` 含 `checked_at`、`stale`、`stale_after_seconds:45`、固定 `components` 和容器安全指标；组件键为 `container/bridge/tls/access/monitor`，状态为 `ok/warning/error/unknown`。`monitor` 含独立检查时间、`stale_after_seconds:180`、任务启停、计划支持情况、最后完成时间、下次应执行时间、漏跑次数、证书剩余秒数、事件和脱敏投递状态。快照过期、来自未来或监测设置尚未应用时，不显示为健康；前端按服务器时刻、保守计入的本次请求耗时及接收后的单调经过时长判断过期；刷新等待期间不能重置旧快照年龄。
 - GET `/api/monitor`：返回 `{revision,enabled,missed_runs,grace_minutes,expiry_hours,notification_enabled,recipient,interval_seconds:60}`。`recipient` 脱敏，发送开关和收件人来自原任务失败通知设置。
 - PUT `/api/monitor`：只接受 `{revision,enabled,missed_runs,grace_minutes,expiry_hours}`；`revision` 为 64 位十六进制摘要，整数范围分别为 `1..6/5..120/1..168`。有独立配置锁、原子写入和冲突校验，不修改续期计划或证书。成功表示已保存，监测将在下一次检查应用；结果未知时必须重新读取确认。
 - GET `/api/runs?offset=0&limit=20`：返回 `{items,total,offset,limit,warning}`；只允许这两个查询参数，不接受重复参数，`offset:0..500`、`limit:1..50`。列表为摘要，阶段详情由详情接口读取；保存记录故障时 `warning` 为固定中文提示，否则为 null。

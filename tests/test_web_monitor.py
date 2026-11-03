@@ -56,6 +56,23 @@ class MonitorTests(unittest.TestCase):
     def codes(self, snapshot):
         return {item['code'] for item in snapshot['alerts']}
 
+    def native_source_with_broken_completion(self):
+        source = object.__new__(monitor.NativeSource)
+        source.home, source.uid = self.native, self.uid
+        source.scheduler = Mock()
+        source.scheduler.get.return_value = {'enable': True,
+            'extra': {'notify_enable': True, 'notify_mail': 'operator@example.com'}}
+        source.bridge = Mock()
+        source.bridge.read_schedule.return_value = self.source.data['schedule']
+        source.bridge.executor.certificate_expiry.return_value = self.now + 3600
+        controller = Mock(); controller.config = {'certificate_id': 'ABC123'}
+        source.controller = Mock(return_value=controller)
+        source.deliver = Mock()
+        monitor.write_json(self.state / 'last-result.json', {'at': 'broken-time', 'success': False}, self.uid)
+        self.source = source
+        self.service = self.make_monitor()
+        return source, controller
+
     def test_hourly_uses_actual_minute_and_grace_not_elapsed_period(self):
         self.service.tick()
         self.assertNotIn('task_missed', self.codes(self.advance(91 * 60)))
@@ -127,6 +144,116 @@ class MonitorTests(unittest.TestCase):
             self.advance(3600)
         state = monitor.read_json(self.service.path, uid=self.uid)
         self.assertLessEqual(state['incidents']['certificate_expiry']['next_attempt'] - self.now, 3600)
+
+    def test_backward_clock_retry_resumes_after_grace_without_duplicate_alert(self):
+        self.source.data['expires_at'] = self.now + 3600
+        expiry = self.source.data['expires_at']
+        self.source.deliver.side_effect = RuntimeError('mail unavailable')
+        self.service.tick()
+        self.now -= 7200
+        self.source.data['last_completed'] = self.now
+        self.service.tick()
+        self.source.deliver.side_effect = None
+        result = self.advance(900)
+        self.assertEqual(self.source.data['expires_at'], expiry)
+        self.assertNotIn('clock_anomaly', self.codes(result))
+        self.assertEqual(self.source.deliver.call_count, 2)
+        self.assertFalse(self.source.deliver.call_args.kwargs['recovered'])
+        self.service = self.make_monitor(); self.advance(60)
+        self.assertEqual(self.source.deliver.call_count, 2)
+
+    def test_restart_normalizes_persisted_retry_even_when_anchor_is_in_the_past(self):
+        self.service.tick()
+        self.now += 3 * 3600; self.mono += 3 * 3600
+        self.source.data.update(last_completed=self.now, expires_at=self.now + 3600)
+        expiry = self.source.data['expires_at']
+        self.source.deliver.side_effect = RuntimeError('mail unavailable')
+        self.service.tick()
+        self.now -= 7200
+        self.source.data['last_completed'] = self.now
+        self.source.deliver.side_effect = None
+        self.service = self.make_monitor(); self.service.tick()
+        event = monitor.read_json(self.service.path, uid=self.uid)['incidents']['certificate_expiry']
+        self.assertLessEqual(event['next_attempt'] - self.now, 3600)
+        self.source.data['last_completed'] = self.now + 3600
+        self.advance(3600)
+        self.assertEqual(self.source.data['expires_at'], expiry)
+        self.assertEqual(self.source.deliver.call_count, 2)
+        self.service = self.make_monitor(); self.advance(60)
+        self.assertEqual(self.source.deliver.call_count, 2)
+
+    def test_recovery_retry_after_clock_rollback_is_not_a_new_alert(self):
+        self.source.data['expires_at'] = self.now + 3600
+        self.service.tick()
+        self.source.data['expires_at'] = self.now + 30 * 86400
+        self.source.deliver.side_effect = RuntimeError('mail unavailable')
+        self.advance(60)
+        expiry = self.source.data['expires_at']
+        self.now -= 7200
+        self.source.data['last_completed'] = self.now
+        self.source.deliver.side_effect = None
+        self.service = self.make_monitor(); self.service.tick(); self.advance(900)
+        self.assertEqual(self.source.data['expires_at'], expiry)
+        self.assertEqual([call.kwargs['recovered'] for call in self.source.deliver.call_args_list],
+                         [False, True, True])
+        self.assertNotIn('certificate_expiry', monitor.read_json(self.service.path, uid=self.uid)['incidents'])
+        self.service = self.make_monitor(); self.advance(60)
+        self.assertEqual(self.source.deliver.call_count, 3)
+
+    def test_broken_completion_does_not_block_native_expiry_alert_or_recovery(self):
+        source, _ = self.native_source_with_broken_completion()
+        data = source.collect()
+        self.assertTrue(data['task_ok'] and data['certificate_ok'])
+        self.assertFalse(data['completion_ok'])
+        result = self.service.tick()
+        self.assertEqual(result['status'], 'unknown')
+        self.assertIn('source_unavailable', self.codes(result))
+        source.deliver.assert_called_once()
+        self.service = self.make_monitor(); self.advance(60)
+        source.deliver.assert_called_once()
+        source.bridge.executor.certificate_expiry.return_value = self.now + 30 * 86400
+        self.advance(60)
+        self.assertEqual(source.deliver.call_count, 2)
+        self.assertTrue(source.deliver.call_args.kwargs['recovered'])
+        self.service = self.make_monitor(); self.advance(60)
+        self.assertEqual(source.deliver.call_count, 2)
+
+    def test_partial_completion_target_switch_does_not_recover_old_certificate(self):
+        source, controller = self.native_source_with_broken_completion()
+        self.service.tick(); source.deliver.assert_called_once()
+        controller.config['certificate_id'] = 'NEW123'
+        source.bridge.executor.certificate_expiry.return_value = self.now + 30 * 86400
+        result = self.advance(60)
+        self.assertNotIn('certificate_expiry', self.codes(result))
+        source.deliver.assert_called_once()
+        source.bridge.executor.certificate_expiry.return_value = self.now + 3600
+        self.advance(60)
+        self.assertEqual(source.deliver.call_count, 2)
+        self.assertFalse(source.deliver.call_args.kwargs['recovered'])
+        self.service = self.make_monitor(); self.advance(60)
+        self.assertEqual(source.deliver.call_count, 2)
+
+    def test_partial_completion_preserves_alert_until_certificate_can_be_read(self):
+        source, _ = self.native_source_with_broken_completion()
+        self.service.tick(); source.deliver.assert_called_once()
+        source.bridge.executor.certificate_expiry.side_effect = ValueError('cannot read certificate')
+        self.assertIn('certificate_expiry', self.codes(self.advance(60)))
+        source.deliver.assert_called_once()
+        source.bridge.executor.certificate_expiry.side_effect = None
+        source.bridge.executor.certificate_expiry.return_value = self.now + 30 * 86400
+        self.advance(60)
+        self.assertEqual(source.deliver.call_count, 2)
+        self.assertTrue(source.deliver.call_args.kwargs['recovered'])
+
+    def test_partial_completion_waits_for_readable_notification_settings(self):
+        source, _ = self.native_source_with_broken_completion()
+        source.scheduler.get.side_effect = RuntimeError('cannot read task')
+        result = self.service.tick()
+        self.assertFalse(result['delivery']['enabled'])
+        self.assertIsNone(result['delivery']['recipient'])
+        source.deliver.assert_not_called()
+        source.scheduler.get.side_effect = None
+        self.advance(60); source.deliver.assert_called_once()
 
     def test_pausing_task_cancels_only_missed_event_not_certificate_alert(self):
         self.source.data['expires_at'] = self.now + 7200

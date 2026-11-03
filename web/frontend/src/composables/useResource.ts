@@ -2,23 +2,29 @@ import { onMounted, onUnmounted, shallowRef } from 'vue'
 import { api, errorText, isAborted } from '../lib/api'
 export function useResource<T>(path: string) {
   const data = shallowRef<T | null>(null),
+    dataRequestedAt = shallowRef<number | null>(null),
     loading = shallowRef(false),
     error = shallowRef('')
   let active: AbortController | undefined
+  let disposed = false
   async function reload() {
-    if (loading.value) return
+    if (disposed || loading.value) return
     active = new AbortController()
+    const requestedAt = performance.now()
     loading.value = true
     error.value = ''
     try {
-      data.value = await api<T>(path, { signal: active.signal })
+      const value = await api<T>(path, { signal: active.signal })
+      if (disposed) return
+      dataRequestedAt.value = requestedAt
+      data.value = value
     } catch (cause) {
-      if (!isAborted(cause)) error.value = errorText(cause)
+      if (!disposed && !isAborted(cause)) error.value = errorText(cause)
     } finally {
-      loading.value = false
+      if (!disposed) loading.value = false
     }
   }
   onMounted(reload)
-  onUnmounted(() => active?.abort())
-  return { data, loading, error, reload }
+  onUnmounted(() => { disposed = true; active?.abort() })
+  return { data, dataRequestedAt, loading, error, reload }
 }

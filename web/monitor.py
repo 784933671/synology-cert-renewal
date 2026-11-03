@@ -154,6 +154,10 @@ def masked_email(value):
     return local[:1] + '***@' + domain
 
 
+def retry_delay(attempts):
+    return min(3600, 60 * (2 ** min(attempts - 1, 6))) if attempts else 0
+
+
 def schedule_window(schedule, after, until):
     """返回宽限后已到期的计划次数和下一计划，固定沿用现有北京时间计划。"""
     if schedule.get('mode') == 'hourly':
@@ -277,6 +281,9 @@ class Monitor:
             for field in ('since', 'next_attempt'):
                 if type(event[field]) not in (int, float) or not math.isfinite(event[field]) or event[field] < 0:
                     raise ValueError('监测事件时间无效')
+            if not (event['active'] and event['notified']):
+                # 校时或重启后，旧墙上时间不能把待发邮件推迟到退避上限之外。
+                event['next_attempt'] = min(event['next_attempt'], now + retry_delay(event['attempts']))
         return value
 
     def incident(self, state, code, active, now):
@@ -317,15 +324,16 @@ class Monitor:
         enabled = data['task']['enable'] if data['task_ok'] else None
         identity = hashlib.sha256(json.dumps({'settings': settings, 'schedule': schedule,
                                              'enabled': enabled, 'target': data['target']}, sort_keys=True).encode()).hexdigest()
+        if data['certificate_ok'] and state['target'] != data['target']:
+            # 完成记录不可读时仍能核验当前目标，不把换目标误报为旧证书恢复。
+            state['incidents'].pop('certificate_expiry', None)
+            state['target'] = data['target']
         if complete and state['identity'] != identity:
             # 初次安装允许读取已有完成时间；后续计划/目标/设置变化重新开始观察。
             if state['identity'] is not None:
                 state['anchor'] = now
                 state['incidents'].pop('task_missed', None)
             state['identity'] = identity
-            if state['target'] is not None and state['target'] != data['target']:
-                state['incidents'].pop('certificate_expiry', None)
-            state['target'] = data['target']
             self.started = monotonic
             state['running_since'] = None
         remaining = int(data['expires_at'] - now) if data['certificate_ok'] else None
@@ -358,7 +366,7 @@ class Monitor:
             self.incident(state, 'task_missed', missed_decision, now)
             self.incident(state, 'certificate_expiry', remaining <= settings['expiry_hours'] * 3600
                           if remaining is not None and not clock_bad else None, now)
-        delivery_enabled = settings['enabled'] and data['delivery_enabled']
+        delivery_enabled = settings['enabled'] and data['task_ok'] and data['delivery_enabled']
         last_error = None
         # 先持久化事件；异常/重启不会丢失待发状态，发送结果提交后才清除。
         write_json(self.path, state, self.uid)
@@ -369,7 +377,9 @@ class Monitor:
             if not delivery_enabled or self.stopping:
                 event['notification_status'] = 'disabled'
                 continue
-            if not complete or clock_bad or (code == 'task_missed' and missed_decision is None):
+            ready = (data['certificate_ok'] if code == 'certificate_expiry'
+                     else complete and missed_decision is not None)
+            if not ready or clock_bad:
                 continue
             if event['active'] and event['notified']:
                 event['notification_status'] = 'sent'
@@ -380,7 +390,7 @@ class Monitor:
                 self.source.deliver(data['recipient'], event, recovered=not event['active'])
             except Exception:
                 event['attempts'] = min(100, event['attempts'] + 1)
-                event['next_attempt'] = now + min(3600, 60 * (2 ** min(event['attempts'] - 1, 6)))
+                event['next_attempt'] = now + retry_delay(event['attempts'])
                 event['notification_status'] = 'failed'
                 last_error = '监测邮件发送失败，已保留并安排重试'
             else:
