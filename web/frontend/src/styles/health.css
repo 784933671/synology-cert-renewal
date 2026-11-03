@@ -1,0 +1,39 @@
+.health-component-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(180px, 1fr)); gap: 16px; }
+.health-component { min-width: 0; padding: 18px; border: 1px solid #edf0f4; border-radius: 8px; background: #fbfcfe; }
+.health-component-heading { display: flex; align-items: flex-start; justify-content: space-between; gap: 12px; flex-wrap: wrap; }
+.health-component-heading h3 { margin: 0; font-size: 14px; font-weight: 600; }
+.health-component p, .health-alert-item p { margin: 12px 0 0; color: #667085; line-height: 1.7; overflow-wrap: anywhere; }
+.health-component .ant-tag { margin-right: 0; }
+.health-container-details { margin-top: 24px; }
+.health-summary-grid { display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1.15fr); gap: 24px; }
+.health-summary-grid > .ant-card { min-width: 0; }
+.health-last-stop { margin-top: 20px; padding-top: 20px; border-top: 1px solid #edf0f4; }
+.health-last-stop p { margin: 12px 0 8px; line-height: 1.7; overflow-wrap: anywhere; }
+.health-event-heading { display: flex; gap: 8px; flex-wrap: wrap; margin: 0; color: #667085; font-size: 12px; }
+.health-events-card .ant-timeline { max-height: 360px; padding: 4px 4px 0 0; overflow-y: auto; }
+.health-events-card .ant-timeline-item:last-child { padding-bottom: 0; }
+.health-alert-list { display: grid; gap: 14px; margin-top: 20px; }
+.health-alert-item { padding: 16px 18px; border: 1px solid #ffe1a6; border-radius: 8px; background: #fffdf7; }
+.health-alert-item > .monitoring-muted { display: block; margin-top: 10px; font-size: 12px; }
+.health-monitor-card .ant-empty { margin: 28px 0 0; }
+.health-monitor-toggle { margin-bottom: 24px; }
+.health-monitor-fields { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 20px; }
+.health-monitor-fields .ant-input-number-group-wrapper { width: 100%; }
+.health-settings-empty { min-height: 180px; }
+.health-page .ant-alert { margin-bottom: 0; }
+.health-page .ant-card-body > .ant-alert { margin-bottom: 18px; }
+.run-detail { display: grid; gap: 20px; padding-top: 8px; }
+.run-detail-toolbar { display: flex; align-items: center; justify-content: space-between; gap: 12px; flex-wrap: wrap; }
+.run-detail .ant-alert, .run-detail .monitoring-section-title { margin: 0; }
+.run-stage-heading { display: flex; align-items: center; flex-wrap: wrap; gap: 10px; margin-bottom: 10px; }
+.run-timeline { margin: 4px 0 0; }
+.run-timeline .monitoring-muted { font-size: 12px; line-height: 1.7; }
+.run-timeline .monitoring-result-message { margin-bottom: 0; }
+.overview-monitoring-links { display: flex; flex-wrap: wrap; gap: 12px; }
+@media (max-width: 1000px) { .health-summary-grid { grid-template-columns: 1fr; } }
+@media (max-width: 760px) {
+  .health-monitor-fields { grid-template-columns: 1fr; gap: 0; }
+  .health-component-grid { grid-template-columns: 1fr; }
+  .health-settings-card .ant-card-head { flex-wrap: wrap; }
+  .run-detail-toolbar > .ant-btn { width: 100%; }
+}

@@ -21,6 +21,9 @@ import AppIcon from '../components/AppIcon.vue'
 import NoticeBar from '../components/NoticeBar.vue'
 import { dateText, remainingText } from '../lib/format'
 import { useStatus } from '../composables/useStatus'
+import '../styles/health.css'
+
+const emit = defineEmits<{ navigate: [page: 'health' | 'runs'] }>()
 
 const { status, loading, error, actionError, message, waiting, busy, manualRunning, pendingRecovery, cooldownActive, renewDisabled, refresh, execute } = useStatus()
 const renewConfirmOpen = shallowRef(false)
@@ -83,6 +86,7 @@ const renewalSteps = [
     </NoticeBar>
     <NoticeBar v-if="actionError" type="error">{{ actionError }}</NoticeBar>
     <NoticeBar v-if="message">{{ message }}</NoticeBar>
+    <div class="overview-monitoring-links"><Button @click="emit('navigate', 'health')"><template #icon><AppIcon name="health" /></template>查看运行健康</Button><Button @click="emit('navigate', 'runs')"><template #icon><AppIcon name="runs" /></template>查看执行记录</Button></div>
 
     <Card v-if="!status" class="monitoring-empty-card">
       <Spin v-if="loading" tip="正在读取证书状态…">

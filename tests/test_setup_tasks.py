@@ -166,7 +166,7 @@ class PreparationTests(unittest.TestCase):
         self.native = self.root / 'native';self.native.mkdir(mode=0o700)
         for name in ('config.json', 'certctl.py'):(self.native / name).write_text('{}')
         self.source = self.root / 'source';self.source.mkdir(mode=0o700)
-        self.sources = ['Dockerfile', 'compose.yaml', 'deployment.py', 'host_bridge.py', 'login_mail.py',
+        self.sources = ['Dockerfile', 'compose.yaml', 'deployment.py', 'host_bridge.py', 'login_mail.py', 'monitor.py', 'observability.py',
                         'access_policy.py', 'backend/app.py', 'frontend/package.json']
         for name in self.sources:
             path = self.source / name;path.parent.mkdir(parents=True, exist_ok=True)
@@ -197,10 +197,12 @@ class PreparationTests(unittest.TestCase):
     def test_resume_restores_missing_bridge_without_touching_database_or_runtime(self):
         installer.prepare(self.args)
         credential = self.args.home / 'data/auth.sqlite3';credential.write_bytes(b'keep-auth-data')
-        (self.native / 'web/login_mail.py').unlink()
+        for name in ('login_mail.py', 'monitor.py', 'observability.py'):
+            (self.native / 'web' / name).unlink()
         installer.prepare(self.args)
         self.assertEqual(credential.read_bytes(), b'keep-auth-data')
-        self.assertEqual((self.native / 'web/login_mail.py').read_bytes(), b'{}')
+        for name in ('login_mail.py', 'monitor.py', 'observability.py'):
+            self.assertEqual((self.native / 'web' / name).read_bytes(), b'{}')
         self.assertEqual(json.loads((self.args.home / 'deployment.json').read_text())['task_id'], 31)
 
     def test_unknown_existing_directory_and_changed_source_are_not_overwritten(self):

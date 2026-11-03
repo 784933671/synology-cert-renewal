@@ -45,6 +45,17 @@ def hostname(value, ip_allowed=True):
         fail()
 
 
+def monitor(value):
+    exact_keys(value, {"revision", "enabled", "missed_runs", "grace_minutes", "expiry_hours"})
+    if not isinstance(value["revision"], str) or not re.fullmatch(r"[a-f0-9]{64}", value["revision"]):
+        fail()
+    boolean(value["enabled"])
+    integer(value["missed_runs"], 1, 6)
+    integer(value["grace_minutes"], 5, 120)
+    integer(value["expiry_hours"], 1, 168)
+    return value
+
+
 def settings(value):
     exact_keys(value, {"revision", "certificate_id", "email", "renew_before_days", "probes", "schedule", "notifications"}, {"secret_id", "secret_key"})
     if not isinstance(value["revision"], str) or not re.fullmatch(r"[a-f0-9]{64}", value["revision"]):

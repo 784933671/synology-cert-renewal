@@ -159,6 +159,8 @@ export interface Security {
 }
 export type Page =
   | 'overview'
+  | 'health'
+  | 'runs'
   | 'certificate'
   | 'renewal'
   | 'notifications'
@@ -167,3 +169,81 @@ export type Page =
   | 'security'
   | 'account'
 export type SettingsPage = 'certificate' | 'renewal' | 'notifications'
+
+export type HealthState = 'ok' | 'warning' | 'error' | 'unknown'
+export interface MonitorDraft {
+  enabled: boolean
+  missed_runs: number
+  grace_minutes: number
+  expiry_hours: number
+}
+export interface MonitorSettings extends MonitorDraft {
+  revision: string
+  notification_enabled: boolean
+  recipient: string
+  interval_seconds: number
+}
+export interface HealthSnapshot {
+  server_time: string
+  timezone: string
+  runtime: {
+    checked_at: string | null
+    stale: boolean
+    stale_after_seconds: number
+    components: { key: string; label: string; status: HealthState; message: string }[]
+    container: {
+      running: boolean | null
+      health: string
+      restart_count: number | null
+      oom_killed: boolean | null
+      started_at: string | null
+      uptime_seconds: number | null
+    }
+  }
+  supervisor: { status: string; stage: string; message: string; at: string | null } | null
+  upgrade: { phase: string; label: string } | null
+  events: { at: string; category: 'maintenance' | 'fault' | 'recovery' | 'info'; status: string; stage: string; message: string }[]
+  monitor: {
+    checked_at: string | null
+    stale: boolean
+    stale_after_seconds: number
+    status: HealthState | 'disabled'
+    task_enabled: boolean | null
+    schedule_supported: boolean | null
+    last_completed_at: string | null
+    next_expected_at: string | null
+    missed_runs: number | null
+    certificate_remaining_seconds: number | null
+    alerts: { code: string; label: string; since: string | null; message: string; notification_status: string }[]
+    delivery: { enabled: boolean; recipient: string; last_error: string }
+    settings: MonitorDraft & { version: 1 }
+  }
+}
+export type RunState = 'running' | 'succeeded' | 'skipped' | 'failed' | 'interrupted'
+export interface RunRecord {
+  id: string
+  kind: 'routine' | 'forced' | 'recovery' | 'check'
+  status: RunState
+  started_at: string
+  finished_at: string | null
+  duration_seconds: number | null
+  domains: string[]
+  certificate_id: string
+  summary: string
+  stages: {
+    stage: string
+    label: string
+    status: RunState | 'unknown'
+    started_at: string | null
+    finished_at: string | null
+    duration_seconds: number | null
+    message: string
+  }[]
+}
+export interface RunPage {
+  items: RunRecord[]
+  total: number
+  offset: number
+  limit: number
+  warning?: string | null
+}

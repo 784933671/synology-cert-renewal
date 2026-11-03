@@ -87,7 +87,7 @@ describe('失败归档与审计组件', () => {
   it('审计表格分页保留所有记录，操作名称与成功失败正确展示', async () => {
     const items: AuditItem[] = Array.from({ length: 11 }, (_, index) => ({
       at: `2026-11-03T00:00:${String(index).padStart(2, '0')}Z`,
-      action: index ? 'settings.update' : 'login', success: index !== 0,
+      action: index === 1 ? 'monitor.update' : index ? 'settings.update' : 'login', success: index !== 0,
       message: `审计记录-${index}`,
     }))
     vi.mocked(api).mockResolvedValue({ items })
@@ -96,6 +96,8 @@ describe('失败归档与审计组件', () => {
     expect(wrapper.find('.ant-table').exists()).toBe(true)
     expect(wrapper.text()).toContain('登录')
     expect(wrapper.text()).toContain('更新配置')
+    expect(wrapper.text()).toContain('修改预警设置')
+    expect(wrapper.text()).not.toContain('monitor.update')
     expect(wrapper.text()).toContain('失败')
     expect(wrapper.text()).toContain('成功')
     expect(wrapper.text()).toContain('共 11 条记录')

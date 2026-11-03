@@ -45,6 +45,12 @@ _diagnostic_spec = importlib.util.spec_from_file_location(
     'certificate_failure_diagnostics', Path(__file__).with_name('failure_diagnostics.py'))
 diagnostics = importlib.util.module_from_spec(_diagnostic_spec)
 _diagnostic_spec.loader.exec_module(diagnostics)
+try:
+    _history_spec = importlib.util.spec_from_file_location('certificate_run_history', Path(__file__).with_name('run_history.py'))
+    history_module = importlib.util.module_from_spec(_history_spec)
+    _history_spec.loader.exec_module(history_module)
+except Exception:
+    history_module = None
 
 
 class Failure(Exception):
@@ -227,6 +233,121 @@ class Controller:
         self.cleanup_events = []
         self.diagnostic_directory = None
         self.operation_number = 0
+        self.history_uid = os.geteuid()
+        self.history_recorder = None
+        self.history_error = None
+        self.history_actions = False
+        self.history_finished = False
+
+    def _history_warning(self):
+        if self.history_error is None:
+            self.history_error = '运行记录未能完整保存，请检查记录组件、状态目录权限和可用空间；证书任务仍按原安全规则执行。'
+            try:
+                print(self.history_error, file=sys.stderr, flush=True)
+            except InterruptedError:
+                raise
+            except OSError:
+                pass
+            if history_module is not None:
+                try:
+                    history_module.RunHistory(self.state, uid=self.history_uid).note_error()
+                except InterruptedError:
+                    raise
+                except Exception:
+                    pass
+
+    def _history_write(self, action, *args, **kwargs):
+        if self.history_recorder is None:
+            return
+        try:
+            getattr(self.history_recorder, action)(*args, **kwargs)
+        except InterruptedError:
+            raise
+        except Exception:
+            self._history_warning()
+
+    def begin_history(self, kind='routine'):
+        self.history_recorder = None
+        self.history_error = None
+        self.history_actions = False
+        self.history_finished = False
+        config = self.config or {}
+        try:
+            if history_module is None:
+                raise RuntimeError()
+            self.history_recorder = history_module.RunHistory(self.state, uid=self.history_uid).start(
+                kind, domains=config.get('domains', []), certificate_id=config.get('certificate_id', ''),
+                secrets=self.diagnostic_secrets())
+        except InterruptedError:
+            raise
+        except Exception:
+            self._history_warning()
+
+    def history_context(self, kind=None):
+        if self.history_recorder is not None and self.config is not None:
+            self._history_write('context', kind or self.history_recorder.record['kind'],
+                                self.config['domains'], self.config['certificate_id'], self.diagnostic_secrets())
+
+    def history_stage(self, stage, status='running', message='', timed=True):
+        if status == 'running':
+            self._history_write('begin', stage, message)
+        elif not timed:
+            self._history_write('observe', stage, status, message)
+        else:
+            self._history_write('finish', stage, status, message)
+
+    def finish_history(self, status='succeeded', summary=''):
+        if self.history_finished:
+            return
+        self.history_finished = True
+        if self.history_recorder is not None:
+            if status in ('failed', 'interrupted'):
+                mapping = {'acme': 'issuance', 'dsm_deploy': 'deployment',
+                           'success_notification': 'notification', 'dns_cleanup': 'dns_cleanup_check'}
+                stage = mapping.get(self.failure_stage, self.failure_stage)
+                if (stage in history_module.STAGES and not any(item['status'] == 'running'
+                        for item in self.history_recorder.record['stages'])
+                        and not any(item['stage'] == stage and item['status'] in ('failed', 'interrupted')
+                                    for item in self.history_recorder.record['stages'])):
+                    self.history_stage(stage, status, '本阶段未完成，请查看失败记录。', timed=False)
+            recorded = {item['stage'] for item in self.history_recorder.record['stages']}
+            for stage in ('preflight', 'backup', 'certificate_validation', 'dns_validation', 'issuance',
+                          'deployment', 'tls_verify', 'dns_cleanup', 'dns_cleanup_check', 'notification'):
+                if stage not in recorded:
+                    self.history_stage(stage, 'skipped', '本轮未执行；不表示该阶段成功。')
+        self._history_write('result', status, summary)
+
+    @contextlib.contextmanager
+    def history_step(self, stage, message=''):
+        self.history_stage(stage, message=message)
+        try:
+            yield
+        except BaseException as error:
+            status = 'interrupted' if isinstance(error, (KeyboardInterrupt, InterruptedError, SystemExit)) else 'failed'
+            self.history_stage(stage, status, '阶段被中断。' if status == 'interrupted' else '阶段未完成，请查看本轮失败记录。')
+            raise
+        else:
+            self.history_stage(stage, 'succeeded', (message + '；已完成。') if message else '阶段完成。')
+
+    def history_recovery(self):
+        if self.history_recorder is not None and self.history_recorder.record['kind'] == 'routine':
+            self.history_context('recovery')
+
+    def history_dns(self):
+        try:
+            errors = [item for item in self.acme_events if isinstance(item, dict)
+                      and item.get('stage') in ('dns_query', 'dns_create')]
+            if errors:
+                report = diagnostics.classify('acme', dns_events=errors)
+                self.history_stage('dns_validation', 'failed', report['stage_label'] + '：' + report['summary']
+                                   + '（未采集独立阶段起止时间）', timed=False)
+            else:
+                self.history_stage('dns_validation', 'unknown',
+                                   'DNS 验证由 acme.sh 处理，未采集独立结果和耗时；可能复用已有域名授权。', timed=False)
+        except InterruptedError:
+            raise
+        except Exception:
+            self._history_warning()
 
     def diagnostic_operation(self, kind):
         private(self.state, directory=True)
@@ -822,6 +943,10 @@ class Controller:
         return renewal is not None and time.time() >= renewal
 
     def candidate_valid(self):
+        with self.history_step('certificate_validation', '核对域名、有效期、密钥及系统信任链'):
+            return self._candidate_valid()
+
+    def _candidate_valid(self):
         cert = self.candidate()
         key = self.candidate_dir() / (self.config['domains'][0] + '.key')
         if set(certificate_domains(cert)) != set(self.config['domains']):
@@ -844,6 +969,10 @@ class Controller:
                      '-untrusted', str(ca), str(cert)])
 
     def backup(self, info):
+        with self.history_step('backup', '确认部署前证书与服务绑定备份'):
+            return self._backup(info)
+
+    def _backup(self, info):
         signature = fingerprint(self.current_cert()) + hashlib.sha256(
             json.dumps(self.binding_state(info), sort_keys=True).encode()).hexdigest()[:12]
         root = self.state / 'backups'
@@ -929,6 +1058,13 @@ class Controller:
                     os.unlink(temporary)
 
     def recover_candidate(self):
+        self.history_recovery()
+        with self.history_step('recovery', '校验恢复限制并隔离损坏材料'):
+            result = self._recover_candidate()
+            self.history_actions = True
+            return result
+
+    def _recover_candidate(self):
         # 隔离整个损坏工作目录，避免未来续期时间、坏私钥或旧 CSR 阻止重新签发。
         self.prepare_acme_config(sync_schedule=False)
         path = self.state / 'recovery.json'
@@ -987,7 +1123,11 @@ class Controller:
     def retry_dns_cleanup(self):
         self.failure_stage = 'dns_cleanup'
         if not self.dns_cleanup_count():
+            self.history_stage('dns_cleanup', 'skipped', '没有遗留 DNS 验证记录需要清理。')
             return True
+        self.history_recovery()
+        self.history_actions = True
+        self.history_stage('dns_cleanup', message='重试清理此前保留的 DNS 验证记录')
         helper = self.home / 'dns_cleanup_retry.sh'
         private(helper)
         output = self.state / 'dns-cleanup-last.log'
@@ -1010,6 +1150,9 @@ class Controller:
                     result = 1
             if result:
                 self.log('DNS 验证记录尚未清理完成，本轮继续检查证书，结束时报告失败。')
+            self.history_stage('dns_cleanup', 'succeeded' if result == 0 else 'failed',
+                               '清理调用返回成功，仍需在 DNS 清理结果检查中确认没有遗留记录。' if result == 0
+                               else '清理未完成，记录保留供后续重试。')
             return result == 0
         finally:
             if proc is not None and proc.poll() is None:
@@ -1103,6 +1246,11 @@ class Controller:
         return hashlib.sha256(der).hexdigest()
 
     def verify_probes(self, expected, attempts=1, verify_chain=True):
+        message = '验证实际服务的信任链、域名和证书指纹' if verify_chain else '核对实际服务证书指纹（本阶段不验证信任链）'
+        with self.history_step('tls_verify', message):
+            return self._verify_probes(expected, attempts, verify_chain)
+
+    def _verify_probes(self, expected, attempts=1, verify_chain=True):
         for attempt in range(attempts):
             errors = []
             for probe in self.config['probes']:
@@ -1241,6 +1389,15 @@ class Controller:
     def send_success_notification(self, expected):
         state = self.initialize_success_notification()
         if state is None or state['pending'] is None:
+            self.history_stage('notification', 'skipped', '本轮没有需要发送的证书成功通知。')
+            return
+        self.history_actions = True
+        with self.history_step('notification', '向 DSM 邮件服务提交证书成功通知'):
+            return self._send_success_notification(expected)
+
+    def _send_success_notification(self, expected):
+        state = self.initialize_success_notification()
+        if state is None or state['pending'] is None:
             return
         event = state['pending']
         if event['fingerprint'] != expected or fingerprint(self.current_cert()) != expected:
@@ -1258,6 +1415,7 @@ class Controller:
         self.failure_stage = 'success_notification'
         self.initialize_success_notification()
         self.failure_stage = 'dsm_deploy'
+        self.history_stage('deployment', message='导入候选证书并核对服务绑定')
         # 跨续期只保护目标绑定；导入前后仍核对全部绑定，捕获接口副作用。
         current = self.binding_state(self.metadata())
         if self.target_bindings(current) != self.target_bindings(before):
@@ -1279,6 +1437,8 @@ class Controller:
         import_bindings.unlink(missing_ok=True)
         if fingerprint(self.current_cert()) != expected:
             raise Failure('部署接口返回成功，但 DSM 中证书指纹未更新；下次任务将重试。')
+        self.history_actions = True
+        self.history_stage('deployment', 'succeeded', 'DSM 中的证书指纹与候选一致，服务绑定保持不变。')
         self.failure_stage = 'tls_verify'
         self.verify_probes(expected, attempts=6)
         self.failure_stage = 'success_notification'
@@ -1287,11 +1447,35 @@ class Controller:
         self.log('新证书已部署；所有配置的 HTTPS 端点证书链、域名及指纹校验通过。')
 
     def run(self):
+        self.begin_history('routine')
+        self.history_stage('preflight', message='读取配置并核对原有运行状态')
+        try:
+            result = self._run_request()
+        except BaseException as error:
+            interrupted_run = isinstance(error, (KeyboardInterrupt, InterruptedError, SystemExit))
+            self.finish_history('interrupted' if interrupted_run else 'failed',
+                                '任务被中断，按既有安全规则保留恢复状态。' if interrupted_run else
+                                '任务未完成，请查看失败阶段及本轮失败记录。')
+            raise
+        else:
+            kind = self.history_recorder.record['kind'] if self.history_recorder is not None else 'routine'
+            skipped = kind == 'routine' and not self.history_actions
+            self.finish_history('skipped' if skipped else 'succeeded',
+                                '检查正常，本轮无需签发、替换或发送成功通知。' if skipped else
+                                '本轮执行完成；各阶段实际结果见时间线。')
+            return result
+
+    def _run_request(self):
         self.load()
+        self.history_context()
         self.retire_manual_target()
         request = self.manual_renewal(reconcile=True)
         force = request if request and request['state'] == 'queued' else None
         recovery = request if request and request['recovery_only'] else None
+        if force:
+            self.history_context('forced')
+        elif recovery or any((self.state / name).exists() for name in RENEWAL_PROTECTION_FILES):
+            self.history_recovery()
         if recovery and time.time() >= request.get('resume_normal_at', float('inf')):
             # 手动失败不能永久关闭正常到期续期；未来窗口恢复原策略，绝不重放 force。
             request['recovery_only'] = False
@@ -1344,6 +1528,7 @@ class Controller:
             import_bindings.unlink()
         baseline = self.state / 'run-baseline.json'
         baseline_data = self.run_baseline(before)
+        self.history_stage('preflight', 'succeeded', '配置、系统、证书目标、绑定与来源检查通过。')
         self.failure_stage = 'backup'
         self.backup(info)
         if force or recovery:
@@ -1392,17 +1577,32 @@ class Controller:
             self.prepare_acme_config()
         if recovery:
             result = 2
+            self.history_stage('issuance', 'skipped', '只恢复已消耗的申请，本轮不再次签发。')
             self.log('恢复已消耗的手动申请，仅完成现有证书部署与清理，不再次签发。')
         elif not force and 'renew_before_days' in self.config and self.candidate().exists() and not self.renewal_due():
             # 门控在包装器中执行，历史 ACME 日期或 CA 窗口不能提前触发签发。
             result = 2
+            self.history_stage('issuance', 'skipped', '尚未进入提前续期窗口，本轮不申请证书。')
             self.log('尚未进入到期前 {} 天的续期窗口，本次不申请证书。'.format(self.config['renew_before_days']))
         else:
             self.failure_stage = 'acme'
             if force:
                 self.consume_manual_renewal(force)
             self.record_issuance(before)
-            result = self.invoke_acme(args)
+            self.history_stage('issuance', message='调用 acme.sh 进行 DNS 验证及证书申请')
+            try:
+                result = self.invoke_acme(args)
+            except BaseException as error:
+                state = 'interrupted' if isinstance(error, (KeyboardInterrupt, InterruptedError, SystemExit)) else 'failed'
+                self.history_stage('issuance', state, '签发调用未完成，保留已记录的签发意图。')
+                raise
+            else:
+                self.history_stage('issuance', 'succeeded' if result == 0 else 'skipped' if result == 2 else 'failed',
+                                   '签发流程返回成功，仍需校验并部署材料。' if result == 0 else
+                                   'acme.sh 返回跳过，仍需校验现有材料。' if result == 2 else '签发流程返回失败。')
+                self.history_actions = self.history_actions or result == 0
+            finally:
+                self.history_dns()
             self.record_issuance(before, completed=True)
             if force:
                 force['issuance_result'] = result
@@ -1441,13 +1641,15 @@ class Controller:
                 raise
         baseline.unlink(missing_ok=True)
         self.failure_stage = 'dns_cleanup'
-        if not cleanup_ok or self.dns_cleanup_count():
-            raise Failure('证书及 HTTPS 已验证，但 DNS 验证记录清理失败；下次任务独立重试清理，详见 state/dns-cleanup.json 和清理日志。')
+        with self.history_step('dns_cleanup_check', '确认没有未清理的 DNS 验证记录'):
+            if not cleanup_ok or self.dns_cleanup_count():
+                raise Failure('证书及 HTTPS 已验证，但 DNS 验证记录清理失败；下次任务独立重试清理，详见 state/dns-cleanup.json 和清理日志。')
         self.failure_stage = 'success_notification'
         self.send_success_notification(expected)
         self.failure_stage = 'result_recording'
-        save_json(self.state / 'last-result.json', {'at': now(), 'success': True, 'fingerprint': expected})
-        self.log('本次检查完成，证书及 HTTPS 服务均正常。')
+        with self.history_step('result_recording', '保存本轮检查结果'):
+            save_json(self.state / 'last-result.json', {'at': now(), 'success': True, 'fingerprint': expected})
+            self.log('本次检查完成，证书及 HTTPS 服务均正常。')
 
     def status(self):
         self.load()
@@ -1501,14 +1703,30 @@ def main(argv=None):
                 finally:
                     controller.cleanup_diagnostics()
             elif args.command == 'check':
-                controller.assert_manual_idle()
-                controller.load()
-                controller.preflight()
-                controller.log('预检查通过：系统、唯一证书、域名、服务绑定与接口正常。')
+                controller.begin_history('check')
+                controller.history_stage('preflight', message='只读预检查系统、目标证书和实际 HTTPS 服务')
+                try:
+                    controller.assert_manual_idle()
+                    controller.load()
+                    controller.history_context('check')
+                    controller.preflight()
+                    controller.log('预检查通过：系统、唯一证书、域名、服务绑定与接口正常。')
+                except BaseException as error:
+                    status = 'skipped' if isinstance(error, Busy) else 'interrupted' if isinstance(
+                        error, (KeyboardInterrupt, InterruptedError, SystemExit)) else 'failed'
+                    controller.finish_history(status, '只读预检查未完成，未执行证书申请或替换。')
+                    raise
+                else:
+                    controller.history_stage('preflight', 'succeeded', '只读预检查通过。')
+                    controller.finish_history('succeeded', '只读预检查通过，未申请或替换证书。')
             else:
                 controller.status()
         return 0
     except Busy as error:
+        if args.command in ('run', 'check') and controller.history_recorder is None:
+            controller.begin_history('check' if args.command == 'check' else 'routine')
+            controller.history_stage('preflight', 'skipped', '其他任务正在执行或排队，本次未开始证书操作。')
+            controller.finish_history('skipped', '已有任务运行或排队，本次跳过。')
         print(str(error))
         return 0
     except (Failure, OSError, KeyboardInterrupt, InterruptedError) as error:

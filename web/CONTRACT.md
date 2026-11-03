@@ -59,6 +59,22 @@ Challenge = {
 
 ## 状态结构
 
+### 运行健康与执行记录接口
+
+- GET `/api/health`：返回 `server_time`、`timezone`、`runtime`、`supervisor`、`upgrade`、`events`、`monitor`。`runtime` 含 `checked_at`、`stale`、`stale_after_seconds:45`、固定 `components` 和容器安全指标；组件键为 `container/bridge/tls/access/monitor`，状态为 `ok/warning/error/unknown`。`monitor` 含独立检查时间、`stale_after_seconds:180`、任务启停、计划支持情况、最后完成时间、下次应执行时间、漏跑次数、证书剩余秒数、事件和脱敏投递状态。快照过期、来自未来或监测设置尚未应用时，不显示为健康；前端按服务器时刻加单调经过时长更新过期状态。
+- GET `/api/monitor`：返回 `{revision,enabled,missed_runs,grace_minutes,expiry_hours,notification_enabled,recipient,interval_seconds:60}`。`recipient` 脱敏，发送开关和收件人来自原任务失败通知设置。
+- PUT `/api/monitor`：只接受 `{revision,enabled,missed_runs,grace_minutes,expiry_hours}`；`revision` 为 64 位十六进制摘要，整数范围分别为 `1..6/5..120/1..168`。有独立配置锁、原子写入和冲突校验，不修改续期计划或证书。成功表示已保存，监测将在下一次检查应用；结果未知时必须重新读取确认。
+- GET `/api/runs?offset=0&limit=20`：返回 `{items,total,offset,limit,warning}`；只允许这两个查询参数，不接受重复参数，`offset:0..500`、`limit:1..50`。列表为摘要，阶段详情由详情接口读取；保存记录故障时 `warning` 为固定中文提示，否则为 null。
+- GET `/api/runs/{id}`：ID 格式为 `run-YYYYMMDDTHHMMSSZ-32位小写hex`；返回 `{id,kind,status,started_at,finished_at,duration_seconds,domains,certificate_id,summary,stages}`。`kind` 为 `routine/forced/recovery/check`，状态为 `running/succeeded/skipped/failed/interrupted`；`stages` 项包含 `stage,label,status,started_at,finished_at,duration_seconds,message`，额外允许 `unknown` 状态。同一阶段可能多次出现，时间未知字段为 null，不能把 null 显示成 0 秒。
+
+预警默认 `{enabled:true,missed_runs:2,grace_minutes:15,expiry_hours:24}`。漏跑次数按受支持计划中超过宽限且未出现新完成记录的执行时刻计算；成功、失败结果均计为执行过。任务暂停取消漏跑判断，不取消证书临期判断；关闭原任务失败通知则不发送监测邮件。仅已发送告警且确认恢复的事件发送恢复邮件，不因暂停任务或状态不可读发送恢复邮件。预警配置不修改原续期窗口或任务计划。
+
+运行记录在新一轮开始和最终结果写入时清理，限制 500 条、30 天；只读查询不触发删除，因此停止执行期间仍可能读到超期记录。进程或工作线程身份已失效且未保存终态的记录投影为 `interrupted`，未知结束时刻和耗时为 null，不将其推断为证书操作失败。
+
+以上接口均需完整登录，写操作额外要求同源 JSON、CSRF 与审计。新观测 GET 请求不延长闲置会话。匿名 `/healthz` 仍只返回存活结果，不包含上述业务信息。新的固定 RPC 方法为 `health`、`monitor.get`、`monitor.update`、`runs.list`、`runs.get`，不接受任意路径、命令或 Docker 参数。
+
+### 原续期状态
+
 ```
 {
  certificate:{id,description,domains:[...],not_after:"ISO8601",fingerprint,remaining_seconds,renew_at:"ISO8601"},
@@ -135,7 +151,7 @@ PUT 只接收 revision,certificate_id,email,renew_before_days,probes,schedule,no
 
 位置由 `CERTWEB_BRIDGE_SOCKET` 配置。每个连接一条 UTF-8 JSON + 换行，请求最大64KiB，响应上限2MiB，超时60秒。请求 `{"method":"settings.get","params":{}}`。响应 `{"ok":true,"data":...}` 或 `{"ok":false,"error":{"code":"...","message":"..."}}`。
 
-固定方法：status、settings.get、settings.update（params直接为PUT对象）、security.update（params为`{access_mode,revision}`）、run、renew、check、failures.list、failures.get（params:{id}）、auth.code.send（params为`{code,policy_version}`）。除明确列出参数的方法外只接受空对象。`security.update` 仅写入访问策略，不修改证书配置、任务计划或立即执行任意防火墙命令。`renew` 提交上述一次性请求，不接收客户端强制参数。不得接收任意命令、任意路径或shell字符串。
+固定方法：status、settings.get、settings.update（params直接为PUT对象）、security.update（params为`{access_mode,revision}`）、run、renew、check、failures.list、failures.get（params:{id}）、auth.code.send（params为`{code,policy_version}`）、health、monitor.get、monitor.update（params为对应PUT对象）、runs.list（params为`{offset?,limit?}`）、runs.get（params为`{id}`）。除明确列出参数的方法外只接受空对象。`security.update` 仅写入访问策略，不修改证书配置、任务计划或立即执行任意防火墙命令。`renew` 提交上述一次性请求，不接收客户端强制参数。不得接收任意命令、任意路径或shell字符串。
 
 `auth.code.send` 仅在密码验证通过或有效挑战重发时由后端调用。主机严格核验六位ASCII数字、策略版本和固定参数集合，收件人只能从root私有策略读取，主题和正文使用固定模板；复用DSM通知邮件配置，成功仅返回 `{accepted:true}`，不回显验证码、邮箱或邮件配置。策略不一致或邮件失败只返回固定错误。主机邮件配置读取超时10秒、SMTP发送超时25秒，输出和错误输出丢弃并回收超时进程；后端将发信等待限制在最多50秒并为请求总超时留出余量，不把登录邮件写入证书续期的待发通知状态。
 

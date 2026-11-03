@@ -13,6 +13,8 @@ import FailuresView from './views/FailuresView.vue'
 import AuditView from './views/AuditView.vue'
 import SecurityView from './views/SecurityView.vue'
 import AccountView from './views/AccountView.vue'
+import HealthView from './views/HealthView.vue'
+import RunsView from './views/RunsView.vue'
 const nonce = document.querySelector<HTMLMetaElement>('meta[name="csp-nonce"]')?.content || ''
 const theme = {
   token: {
@@ -24,6 +26,8 @@ const theme = {
 const { session, challenge, recoveryRequired, expiresIn, resendAfter, ready, busy, error, accept, login, verify, resend, cancel, logout, restore } = useSession()
 const pages: Page[] = [
   'overview',
+  'health',
+  'runs',
   'certificate',
   'renewal',
   'notifications',
@@ -95,7 +99,7 @@ watch(
   [page, session],
   ([value, currentSession]) => {
     window.scrollTo(0, 0)
-    document.title = currentSession ? `${{ overview: '运行概览', certificate: '证书管理', renewal: '续期计划', notifications: '邮件通知', failures: '失败记录', audit: '操作审计', security: '访问安全', account: '账户设置' }[value]} · 证书管家` : '登录 · 证书管家'
+    document.title = currentSession ? `${{ overview: '运行概览', health: '运行健康', runs: '执行记录', certificate: '证书管理', renewal: '续期计划', notifications: '邮件通知', failures: '失败记录', audit: '操作审计', security: '访问安全', account: '账户设置' }[value]} · 证书管家` : '登录 · 证书管家'
   },
   { immediate: true },
 )
@@ -125,7 +129,9 @@ onUnmounted(() => {
   >
     <NoticeBar v-if="error" type="error">{{ error }}</NoticeBar>
     <NoticeBar v-if="notice" type="warning">{{ notice }}</NoticeBar>
-    <OverviewView v-if="page === 'overview'" />
+    <OverviewView v-if="page === 'overview'" @navigate="navigate" />
+    <HealthView v-else-if="page === 'health'" @dirty="dirty = $event" @busy="working = $event" />
+    <RunsView v-else-if="page === 'runs'" />
     <SettingsView
       v-else-if="settingsSection"
       :key="settingsSection"

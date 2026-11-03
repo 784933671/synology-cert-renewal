@@ -23,6 +23,7 @@ from web.backend.config import Config
 ORIGIN = "https://ttxli.cn:18443"
 INITIAL_PASSWORD = "fixture-initial-password-42"
 NEW_PASSWORD = "fixture-changed-password-51"
+RUN_ID = 'run-20261103T040000Z-' + 'a' * 32
 
 
 def settings_payload():
@@ -95,7 +96,7 @@ class WebApiTests(unittest.IsolatedAsyncioTestCase):
         return {"Origin": ORIGIN, "X-CSRF-Token": self.csrf}
 
     async def test_business_requires_authentication(self):
-        for route in ("status", "settings", "failures", "failures/id", "security", "audit", "session"):
+        for route in ("status", "settings", "failures", "failures/id", "security", "audit", "session", "health", "monitor", "runs", "runs/id"):
             with self.subTest(route=route):
                 response = await self.client.get("/api/" + route)
                 self.assertEqual(response.status_code, 401)
@@ -134,7 +135,7 @@ class WebApiTests(unittest.IsolatedAsyncioTestCase):
         await self.ready()
         for method, path, body in (("POST", "/api/logout", {}), ("POST", "/api/password", {}),
                                    ("POST", "/api/actions/run", {}), ("POST", "/api/actions/renew", {}), ("POST", "/api/actions/check", {}),
-                                   ("PUT", "/api/settings", settings_payload())):
+                                   ("PUT", "/api/settings", settings_payload()), ("PUT", "/api/monitor", {})):
             with self.subTest(path=path):
                 response = await self.client.request(method, path, json=body, headers={"Origin": ORIGIN})
                 self.assertEqual(response.status_code, 403)
@@ -199,6 +200,50 @@ class WebApiTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual((await self.client.get("/api/security")).status_code, 200)
         self.now[0] += 300
         self.assertEqual((await self.client.get("/api/security")).status_code, 401)
+
+    async def test_observation_reads_do_not_keep_an_idle_session_alive(self):
+        await self.ready()
+        for path in ('health', 'monitor', 'runs', 'runs/' + RUN_ID, 'health'):
+            self.now[0] += 300
+            self.assertEqual((await self.client.get('/api/' + path)).status_code, 200)
+        self.now[0] += 300
+        self.assertEqual((await self.client.get('/api/health')).status_code, 401)
+
+    async def test_monitor_settings_have_strict_bounds_and_no_extra_commands(self):
+        headers = await self.ready()
+        value = {'revision': 'a' * 64, 'enabled': True, 'missed_runs': 2, 'grace_minutes': 15, 'expiry_hours': 24}
+        for key, invalid in [('enabled', 1), ('missed_runs', True), ('missed_runs', 7), ('grace_minutes', 0),
+                             ('expiry_hours', 169), ('revision', 'a'), ('command', 'anything')]:
+            with self.subTest(key=key, invalid=invalid):
+                result = await self.client.put('/api/monitor', json={**value, key: invalid}, headers=headers)
+                self.assertEqual(result.status_code, 400)
+        self.assertEqual(self.bridge.calls, [])
+        result = await self.client.put('/api/monitor', json=value, headers=headers)
+        self.assertEqual(result.status_code, 200)
+        self.assertEqual(self.bridge.calls[-1], ('monitor.update', value))
+        audit = (await self.client.get('/api/audit')).json()
+        self.assertIn('monitor.update', [item['action'] for item in audit['items']])
+
+    async def test_run_history_pagination_and_identifier_cannot_expand_rpc(self):
+        await self.ready()
+        for query in ('offset=-1', 'offset=501', 'limit=0', 'limit=51', 'offset=1&offset=2',
+                      'limit=1.5', 'path=/etc/passwd', 'limit=true'):
+            self.assertEqual((await self.client.get('/api/runs?' + query)).status_code, 400, query)
+        for identifier in ('bad.txt', 'x' * 97):
+            self.assertEqual((await self.client.get('/api/runs/' + identifier)).status_code, 400)
+        self.assertEqual(self.bridge.calls, [])
+        self.assertEqual((await self.client.get('/api/runs?offset=20&limit=10')).status_code, 200)
+        self.assertEqual(self.bridge.calls[-1], ('runs.list', {'offset': 20, 'limit': 10}))
+        self.assertEqual((await self.client.get('/api/runs/' + RUN_ID)).status_code, 200)
+        self.assertEqual(self.bridge.calls[-1], ('runs.get', {'id': RUN_ID}))
+
+    async def test_observability_cannot_bypass_first_password_gate(self):
+        await self.login()
+        for route in ('health', 'monitor', 'runs', 'runs/run-fixture'):
+            result = await self.client.get('/api/' + route)
+            self.assertEqual(result.status_code, 403)
+            self.assertEqual(result.json()['error']['code'], 'password_change_required')
+        self.assertEqual(self.bridge.calls, [])
 
     async def test_user_navigation_extends_idle_but_not_absolute_expiry(self):
         await self.ready()
@@ -326,7 +371,7 @@ class WebApiTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(response.json()["error"]["code"], "timeout")
 
     async def test_static_spa_fallback_and_path_traversal(self):
-        for path in ("/", "/login", "/overview", "/renewal"):
+        for path in ("/", "/login", "/overview", "/renewal", "/health", "/runs"):
             response = await self.client.get(path)
             self.assertEqual(response.status_code, 200)
             self.assertIn("证书管家", response.text)

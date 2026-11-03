@@ -39,6 +39,8 @@ class PackageTests(unittest.TestCase):
             self.assertEqual(count, len(names))
             self.assertIn('synology-cert-manager/setup.sh', names)
             self.assertIn('synology-cert-manager/web/setup.py', names)
+            for path in ('run_history.py', 'web/monitor.py', 'web/observability.py'):
+                self.assertIn('synology-cert-manager/' + path, names)
             self.assertFalse(any('auth.sqlite3' in x or 'login-email.json' in x or x.endswith('/config.json') for x in names))
             manifest = archive.read('synology-cert-manager/SHA256SUMS').decode()
             for line in manifest.splitlines():

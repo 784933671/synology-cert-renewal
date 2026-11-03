@@ -319,6 +319,90 @@ class DeploymentRecoveryTests(unittest.TestCase):
         self.service.stop_container.assert_called_once()
         self.service.log.assert_not_called()
 
+    def test_monitor_is_separate_child_with_fixed_task_and_no_wait_on_start(self):
+        (self.home / 'code').mkdir(); (self.home / 'code/monitor.py').write_text('')
+        child = Mock(); child.poll.return_value = None
+        self.service.config['task_id'] = 31
+        with patch('web.deployment.subprocess.Popen', return_value=child) as spawn:
+            self.service.start_monitor(); self.service.start_monitor()
+        spawn.assert_called_once()
+        command = spawn.call_args.args[0]
+        self.assertEqual(command[command.index('--task-id') + 1], '31')
+        self.assertEqual(command[command.index('--parent-pid') + 1], str(os.getpid()))
+        self.assertTrue(spawn.call_args.kwargs['start_new_session'])
+        child.wait.assert_not_called(); child.communicate.assert_not_called()
+
+    def test_failed_monitor_spawn_is_bounded_and_does_not_stop_service(self):
+        (self.home / 'code').mkdir(); (self.home / 'code/monitor.py').write_text('')
+        current = [0]; self.service.clock = lambda: current[0]
+        self.service.stop_container = Mock()
+        with patch('web.deployment.subprocess.Popen', side_effect=OSError('private detail')) as spawn:
+            self.service.start_monitor(); self.service.start_monitor()
+            current[0] = 59; self.service.start_monitor()
+            self.assertEqual(spawn.call_count, 1)
+            current[0] = 60; self.service.start_monitor()
+            self.assertEqual(spawn.call_count, 2)
+        self.service.stop_container.assert_not_called()
+
+    def test_shutdown_stops_container_before_waiting_on_monitor(self):
+        self.service.stopping = True
+        events = []
+        self.service.stop_container = Mock(side_effect=lambda: events.append('container'))
+        self.service.stop_monitor = Mock(side_effect=lambda: events.append('monitor'))
+        with patch('web.deployment.signal.signal'), patch('builtins.print'):
+            self.service.serve()
+        self.assertEqual(events, ['container', 'monitor'])
+
+    def test_monitor_shutdown_kills_child_after_bounded_timeout(self):
+        child = Mock(); child.poll.return_value = None
+        child.wait.side_effect = [subprocess.TimeoutExpired('monitor', 15), 0]
+        self.service.monitor = child; self.service.stop_monitor()
+        child.terminate.assert_called_once(); child.kill.assert_called_once()
+        self.assertEqual([call.kwargs['timeout'] for call in child.wait.call_args_list], [15, 5])
+
+    def test_deployment_events_are_bounded_deduplicated_and_latest_first(self):
+        self.service.phase = 'docker'
+        with patch('builtins.print'):
+            for index in range(110):
+                self.service.log('waiting', '固定状态 {}'.format(index))
+            self.service.log('waiting', '固定状态 109')
+        data = json.loads((self.home / 'deployment-events.json').read_text())
+        self.assertEqual(len(data['items']), 100)
+        self.assertEqual(data['items'][0]['message'], '固定状态 109')
+        self.assertEqual(data['items'][0]['category'], 'fault')
+        self.assertEqual(set(data['items'][0]), {'at', 'category', 'status', 'stage', 'message'})
+
+    def test_upgrade_maintenance_requires_live_lock_not_stale_journal_or_exit_zero(self):
+        self.service.phase = 'shutdown'
+        deployment.health_monitor.write_json(self.home / 'upgrade-state.json',
+                                            {'version': 1, 'phase': 'prepared', 'work': 'upgrade-' + 'a' * 32}, os.geteuid())
+        self.service.record_event('stopped', '固定停止摘要')
+        data = json.loads((self.home / 'deployment-events.json').read_text())
+        self.assertEqual(data['items'][0]['category'], 'info')
+        with deployment.health_monitor.locked(self.home / 'upgrade.lock', os.geteuid()):
+            self.service.record_event('stopping', '固定维护摘要')
+        data = json.loads((self.home / 'deployment-events.json').read_text())
+        self.assertEqual(data['items'][0]['category'], 'maintenance')
+        with deployment.health_monitor.locked(self.home / 'upgrade.lock', os.geteuid()):
+            self.service.record_event('stopped', '维护停服已确认')
+        data = json.loads((self.home / 'deployment-events.json').read_text())
+        self.assertEqual(data['items'][0]['category'], 'maintenance')
+        with deployment.health_monitor.locked(self.home / 'upgrade.lock', os.geteuid()):
+            self.service.record_event('blocked', '维护停服无法确认')
+        data = json.loads((self.home / 'deployment-events.json').read_text())
+        self.assertEqual(data['items'][0]['category'], 'fault')
+        with deployment.health_monitor.locked(self.home / 'upgrade.lock', os.geteuid()):
+            self.service.phase = 'docker'
+            self.service.record_event('waiting', '固定非维护摘要')
+        data = json.loads((self.home / 'deployment-events.json').read_text())
+        self.assertEqual(data['items'][0]['category'], 'fault')
+
+    def test_corrupt_events_do_not_break_reporting_or_stop_safety(self):
+        deployment.health_monitor.write_json(self.home / 'deployment-events.json', {'version': 1, 'items': [None]}, os.geteuid())
+        self.service.phase = 'policy'
+        with patch('builtins.print'):
+            self.assertTrue(self.service.report('stopping', '固定安全摘要'))
+
 
 class StartupStabilityTests(unittest.TestCase):
     def setUp(self):
@@ -424,6 +508,27 @@ class StartupStabilityTests(unittest.TestCase):
         self.service.stop_container.assert_not_called();self.service.compose.assert_not_called()
         self.assertTrue(self.service.started)
         self.assertIsNone(self.service.ready_since)
+
+    def test_health_snapshot_has_only_safe_container_fields(self):
+        self.service.container.side_effect = None
+        self.service.container.return_value = {'RestartCount': 3, 'Config': {'Env': ['SECRET=value']},
+            'State': {'Running': True, 'Restarting': False, 'OOMKilled': True,
+                      'StartedAt': '2026-11-01T00:00:00.123456789Z', 'Health': {'Status': 'healthy', 'Log': ['PRIVATE_LOG']},
+                      'Error': 'PRIVATE_ERROR'}}
+        self.tick(0)
+        data = json.loads((self.home / 'runtime-health.json').read_text())
+        self.assertEqual(data['container']['restart_count'], 3)
+        self.assertTrue(data['container']['oom_killed'])
+        self.assertEqual(data['container']['health'], 'healthy')
+        self.assertEqual({item['key'] for item in data['components']}, {'container', 'bridge', 'tls', 'access', 'monitor'})
+        self.assertNotIn('PRIVATE', json.dumps(data)); self.assertNotIn('SECRET', json.dumps(data))
+
+    def test_health_snapshot_failure_cannot_interrupt_firewall_protection(self):
+        self.running = True; self.service.guard.valid.return_value = False
+        with patch('web.deployment.health_monitor.write_json', side_effect=OSError('disk full')):
+            self.tick(0)
+        self.service.stop_container.assert_called_once()
+        self.assertFalse(self.running)
 
     def test_start_failure_consumes_window_and_errors_are_fixed_safe_text(self):
         self.tick(0)

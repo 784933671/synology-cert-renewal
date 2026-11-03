@@ -27,7 +27,7 @@ if not __package__:
 from web.deployment import load_config, MANAGED_LABEL
 from web.login_mail import email_valid
 from web.network_guard import validate_network
-from web.setup_upgrade import Upgrade, UpgradeError, atomic_bytes, regular, directory, ACME_STAMP, copy_payload
+from web.setup_upgrade import Upgrade, UpgradeError, atomic_bytes, regular, directory, ACME_STAMP, copy_payload, fsync_directory
 from web.tls_sync import validate_material
 
 SOURCE = Path(__file__).resolve().parents[1]
@@ -125,7 +125,7 @@ class Wizard:
             for path in sorted(payload.rglob('*')):
                 if path.is_file():
                     digest.update(str(path.relative_to(payload)).encode() + b'\0' + path.read_bytes() + b'\0')
-        for name in ('setup.sh', 'install.sh', 'certctl.py', 'failure_diagnostics.py', 'dns_cleanup.py',
+        for name in ('setup.sh', 'install.sh', 'certctl.py', 'run_history.py', 'failure_diagnostics.py', 'dns_cleanup.py',
                      'dns_cleanup_retry.sh', 'dns_tencent_tracked.sh'):
             regular(self.source / name)
             digest.update(name.encode() + b'\0' + (self.source / name).read_bytes() + b'\0')
@@ -152,7 +152,7 @@ class Wizard:
         version = re.search(r'^productversion="(7\.[0-9.]+)"', version_path.read_text(), re.M)
         if not version:
             raise SetupError('一键入口需要 DSM 7；旧版脚本部署仍按原说明操作')
-        for name in ('install.sh', 'certctl.py', 'failure_diagnostics.py', 'dns_cleanup.py',
+        for name in ('install.sh', 'certctl.py', 'run_history.py', 'failure_diagnostics.py', 'dns_cleanup.py',
                      'dns_cleanup_retry.sh', 'dns_tencent_tracked.sh', 'web/install-web.py'):
             regular(self.source / name)
         for command in ('/usr/syno/bin/synowebapi', '/usr/bin/iptables', '/usr/bin/ip6tables', '/bin/ssmtp', DOCKER):
@@ -240,10 +240,26 @@ class Wizard:
 
     def update_native_code(self):
         """脚本用户加装看板时只更新程序，事务备份留在安装目录。"""
-        files = {'certctl.py': 'certctl.py', 'failure_diagnostics.py': 'failure_diagnostics.py',
+        files = {'certctl.py': 'certctl.py', 'run_history.py': 'run_history.py', 'failure_diagnostics.py': 'failure_diagnostics.py',
                  'dns_cleanup.py': 'dns_cleanup.py', 'dns_cleanup_retry.sh': 'dns_cleanup_retry.sh',
                  'acme/dnsapi/dns_tencent.sh': 'dns_tencent_tracked.sh'}
         journal_path = self.state / 'native-update.json'
+        def restore_native(snapshot, backup):
+            for target, name in snapshot.items():
+                destination = self.native / target
+                directory(destination.parent, self.uid, private=True)
+                if name is None and target == 'run_history.py':
+                    if os.path.lexists(destination):
+                        regular(destination, self.uid, private=True)
+                        destination.unlink()
+                        fsync_directory(destination.parent)
+                elif name == files[target]:
+                    regular(backup / name, self.uid, private=True)
+                    if os.path.lexists(destination):
+                        regular(destination, self.uid, private=True)
+                    atomic_bytes(destination, (backup / name).read_bytes())
+                else:
+                    raise SetupError('原执行器备份路径无效')
         with contextlib.ExitStack() as stack:
             descriptor = os.open(str(self.native / 'state/run.lock'), os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW, 0o600)
             handle = stack.enter_context(os.fdopen(descriptor, 'a'))
@@ -258,33 +274,34 @@ class Wizard:
                 if not re.fullmatch('native-backup-[0-9a-f]{16}', previous.get('backup', '')) or set(previous.get('files', {})) != set(files):
                     raise SetupError('原执行器升级恢复记录无效')
                 directory(backup, self.uid, private=True)
-                for target, name in previous['files'].items():
-                    if name != files[target]:
-                        raise SetupError('原执行器备份路径无效')
-                    regular(backup / name, self.uid, private=True)
-                    atomic_bytes(self.native / target, (backup / name).read_bytes())
+                restore_native(previous['files'], backup)
                 journal_path.unlink()
             changes = {}
             for target, source in files.items():
                 regular(self.source / source)
-                regular(self.native / target, self.uid, private=True)
+                exists = os.path.lexists(self.native / target)
+                if exists or target != 'run_history.py':
+                    regular(self.native / target, self.uid, private=True)
                 directory((self.native / target).parent, self.uid, private=True)
                 content = (self.source / source).read_bytes()
-                if content != (self.native / target).read_bytes():
+                if not exists or content != (self.native / target).read_bytes():
                     changes[target] = content
             if not changes:
                 return
             backup = self.state / ('native-backup-' + secrets.token_hex(8))
             backup.mkdir(mode=0o700)
+            originals = {}
             for target, name in files.items():
-                atomic_bytes(backup / name, (self.native / target).read_bytes())
-            atomic_bytes(journal_path, json.dumps({'backup': backup.name, 'files': files}).encode())
+                exists = os.path.lexists(self.native / target)
+                originals[target] = name if exists else None
+                if exists:
+                    atomic_bytes(backup / name, (self.native / target).read_bytes())
+            atomic_bytes(journal_path, json.dumps({'backup': backup.name, 'files': originals}).encode())
             try:
                 for target, content in changes.items():
                     atomic_bytes(self.native / target, content)
             except BaseException:
-                for target, name in files.items():
-                    atomic_bytes(self.native / target, (backup / name).read_bytes())
+                restore_native(originals, backup)
                 raise
             journal_path.unlink()
 

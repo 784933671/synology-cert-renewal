@@ -112,6 +112,109 @@ class BridgeTests(unittest.TestCase):
     def read_config(self):
         return executor.read_json(self.home / 'config.json')
 
+    def monitor_params(self):
+        value = self.bridge.monitor_get()
+        return {key: value[key] for key in ('revision', 'enabled', 'missed_runs', 'grace_minutes', 'expiry_hours')}
+
+    def test_monitor_config_changes_without_mutating_renewal_or_credentials(self):
+        before = (self.home / 'config.json').read_bytes()
+        task_before = self.scheduler.get()
+        params = self.monitor_params()
+        params['expiry_hours'] = 12
+        value = self.request('monitor.update', params)
+        self.assertTrue(value['ok'], value)
+        self.assertEqual(value['data']['expiry_hours'], 12)
+        self.assertNotEqual(value['data']['revision'], params['revision'])
+        self.assertEqual(value['data']['recipient'], 'f***@example.com')
+        self.assertTrue(value['data']['notification_enabled'])
+        self.assertEqual((self.home / 'config.json').read_bytes(), before)
+        self.assertEqual(self.scheduler.get(), task_before)
+        self.assertEqual(self.scheduler.writes, [])
+        self.assertEqual(stat.S_IMODE((self.home / 'state/monitor-config.json').stat().st_mode), 0o600)
+        self.assertNotIn(config()['secret_key'], json.dumps(value))
+
+    def test_monitor_config_stale_revision_and_invalid_bounds_are_rejected(self):
+        params = self.monitor_params()
+        params['grace_minutes'] = 30
+        self.assertTrue(self.request('monitor.update', params)['ok'])
+        self.assertEqual(self.request('monitor.update', params)['error']['code'], 'stale_revision')
+        for key, value in [('enabled', 1), ('missed_runs', 0), ('expiry_hours', 169), ('grace_minutes', 4)]:
+            invalid = {**self.monitor_params(), key: value}
+            self.assertEqual(self.request('monitor.update', invalid)['error']['code'], 'validation')
+
+    def test_monitor_config_does_not_override_disabled_mail_or_accept_paths(self):
+        self.scheduler.task['extra']['notify_enable'] = False
+        self.assertFalse(self.bridge.monitor_get()['notification_enabled'])
+        params = {**self.monitor_params(), 'path': '/etc/private'}
+        self.assertEqual(self.request('monitor.update', params)['error']['code'], 'validation')
+        self.assertFalse((self.home / 'state/monitor-config.json').exists())
+
+    def test_monitor_config_refuses_symlink_without_overwriting_target(self):
+        outside = self.home.parent / 'outside.json'
+        outside.write_text('untouched')
+        params = self.monitor_params()
+        (self.home / 'state/monitor-config.json').symlink_to(outside)
+        self.assertFalse(self.request('monitor.update', params)['ok'])
+        self.assertEqual(outside.read_text(), 'untouched')
+
+    def test_health_is_unknown_without_snapshots_not_implicitly_healthy(self):
+        value = self.request('health')
+        self.assertTrue(value['ok'], value)
+        self.assertTrue(value['data']['runtime']['stale'])
+        self.assertTrue(value['data']['monitor']['stale'])
+        self.assertTrue(all(item['status'] == 'unknown' for item in value['data']['runtime']['components']))
+
+    def test_unreadable_health_snapshot_does_not_expose_private_contents(self):
+        web_home = self.home.parent / 'management'
+        web_home.mkdir(mode=0o700)
+        self.bridge.management_home = web_home
+        source = self.home.parent / 'private-secret.json'
+        source.write_text(json.dumps({'message': config()['secret_key']}))
+        (web_home / 'runtime-health.json').symlink_to(source)
+        value = self.request('health')
+        self.assertTrue(value['ok'], value)
+        self.assertTrue(value['data']['runtime']['stale'])
+        self.assertNotIn(config()['secret_key'], json.dumps(value))
+
+    def test_history_rpc_rejects_arbitrary_path_and_unbounded_pagination(self):
+        for params in ({'id': '../../config.json'}, {'id': 'bad.json'}, {'id': 'x' * 100}):
+            self.assertEqual(self.request('runs.get', params)['error']['code'], 'validation')
+        for params in ({'limit': 51}, {'offset': -1}, {'offset': True}, {'limit': 10, 'path': '/etc'}):
+            self.assertEqual(self.request('runs.list', params)['error']['code'], 'validation')
+
+    def test_history_rpc_reads_real_private_record_without_secrets_or_internal_process_data(self):
+        _, history = self.bridge.history_store()
+        record = history.start('check', ['ttxli.cn'], 'ABC123', secrets=(config()['secret_key'],))
+        record.begin('preflight')
+        record.finish('preflight', 'succeeded', '检查完成 ' + config()['secret_key'])
+        record.result('succeeded', '检查完成')
+        listing = self.request('runs.list', {'offset': 0, 'limit': 20})
+        self.assertTrue(listing['ok'], listing)
+        self.assertEqual(listing['data']['total'], 1)
+        detail = self.request('runs.get', {'id': listing['data']['items'][0]['id']})
+        self.assertTrue(detail['ok'], detail)
+        self.assertEqual(detail['data']['kind'], 'check')
+        self.assertEqual(detail['data']['stages'][0]['status'], 'succeeded')
+        text = json.dumps(detail)
+        self.assertNotIn(config()['secret_key'], text)
+        self.assertNotIn('_pid', text)
+        self.assertEqual(self.scheduler.runs, 0)
+        missing = self.request('runs.get', {'id': 'run-20261103T040000Z-' + '0' * 32})
+        self.assertEqual(missing['error']['code'], 'not_found')
+
+    def test_history_finalization_interrupt_cannot_leak_precheck_locks(self):
+        controller = self.bridge.controller()
+        controller.finish_history = mock.Mock(side_effect=InterruptedError('fixture history interruption'))
+        lock = mock.MagicMock()
+        self.bridge.actions.acquire()
+        self.bridge.check_state['running'] = True
+        with self.assertRaises(InterruptedError):
+            self.bridge._check_worker(controller, lock)
+        lock.__exit__.assert_called_once_with(None, None, None)
+        self.assertFalse(self.bridge.check_state['running'])
+        self.assertTrue(self.bridge.actions.acquire(False))
+        self.bridge.actions.release()
+
     def test_settings_only_returns_safe_fields_and_existing_domain_order(self):
         response = self.request('settings.get')
         self.assertTrue(response['ok'])

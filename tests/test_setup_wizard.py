@@ -274,7 +274,7 @@ class WizardTests(unittest.TestCase):
         (self.native / 'state').mkdir(mode=0o700)
         (self.native / 'acme/dnsapi').mkdir(mode=0o700, parents=True)
         (self.native / 'acme').chmod(0o700)
-        for target, source in {'certctl.py': 'certctl.py', 'failure_diagnostics.py': 'failure_diagnostics.py',
+        for target, source in {'certctl.py': 'certctl.py', 'run_history.py': 'run_history.py', 'failure_diagnostics.py': 'failure_diagnostics.py',
                                'dns_cleanup.py': 'dns_cleanup.py', 'dns_cleanup_retry.sh': 'dns_cleanup_retry.sh',
                                'acme/dnsapi/dns_tencent.sh': 'dns_tencent_tracked.sh'}.items():
             (self.source / source).write_bytes(b'new code')
@@ -307,6 +307,29 @@ class WizardTests(unittest.TestCase):
             with self.assertRaisesRegex(setup.SetupError, '正在运行'):
                 self.wizard.update_native_code()
         self.assertEqual((self.native / 'certctl.py').read_bytes(), b'old code')
+
+    def test_existing_script_install_adds_history_module_and_preserves_missing_file_on_rollback(self):
+        self.native_fixture()
+        history = self.native / 'run_history.py'
+        history.unlink()
+        real_write = setup.atomic_bytes
+        failed = [False]
+        def fail_after_new_module(path, content, *args, **kwargs):
+            if Path(path) == self.native / 'dns_cleanup.py' and not failed[0]:
+                failed[0] = True
+                self.assertTrue(history.exists())
+                raise OSError('fixture interrupted installation')
+            return real_write(path, content, *args, **kwargs)
+        with patch.object(setup, 'atomic_bytes', side_effect=fail_after_new_module):
+            with self.assertRaises(OSError):
+                self.wizard.update_native_code()
+        self.assertFalse(history.exists())
+        self.assertEqual((self.native / 'certctl.py').read_bytes(), b'old code')
+        self.assertTrue((self.state / 'native-update.json').exists())
+        self.wizard.update_native_code()
+        self.assertEqual(history.read_bytes(), b'new code')
+        self.assertEqual((self.native / 'config.json').read_bytes(), b'unchanged credentials')
+        self.assertFalse((self.state / 'native-update.json').exists())
 
     def test_check_mode_never_creates_state_or_invokes_install(self):
         with patch('web.setup.Wizard') as cls, patch('web.setup.HOME', self.home):

@@ -17,11 +17,13 @@ if __package__:
     from .access_policy import read_policy, initialize_policy, write_policy, write_applied
     from .network_guard import NetworkGuard, GuardError, validate_network
     from .tls_sync import sync_tls, TLSBusy
+    from . import monitor as health_monitor
 else:
     sys.path.insert(0, str(Path(__file__).resolve().parent))
     from access_policy import read_policy, initialize_policy, write_policy, write_applied
     from network_guard import NetworkGuard, GuardError, validate_network
     from tls_sync import sync_tls, TLSBusy
+    import monitor as health_monitor
 
 CONTAINER = 'synology-cert-web'
 MANAGED_LABEL = 'io.github.784933671.certweb.managed'
@@ -90,6 +92,8 @@ class Deployment:
         self.access_path = self.home / 'access/access.json'
         self.guard = NetworkGuard(config['bind'], config['networks'], config['denied'], config['port'])
         self.bridge = None
+        self.monitor = None
+        self.monitor_started_at = None
         self.stopping = False
         self.last_message = None
         self.started = False
@@ -98,6 +102,8 @@ class Deployment:
         self.ready_since = None
         self.last_policy = None
         self.phase = 'initializing'
+        self.health = {}
+        self.observed_container = None
         self.env = dict(os.environ, PATH='/usr/syno/sbin:/usr/syno/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin')
 
     def command(self, args, timeout=40):
@@ -165,6 +171,110 @@ class Deployment:
             print(time.strftime('%Y-%m-%d %H:%M:%S') + ' ' + message, flush=True)
             self.last_message = message
         private_json(self.home / 'deployment-state.json', {'status': status, 'stage': self.phase, 'message': message, 'at': time.time(), 'pid': os.getpid()})
+        self.record_event(status, message)
+
+    def record_event(self, status, message):
+        """仅保存监督程序固定文案；真实升级锁与事务共同证明维护原因。"""
+        uid = os.geteuid()
+        try:
+            with health_monitor.locked(self.home / 'deployment-events.lock', uid):
+                path = self.home / 'deployment-events.json'
+                previous = health_monitor.read_json(path, {'version': 1, 'items': []}, uid)
+                if (not isinstance(previous, dict) or previous.get('version') != 1
+                        or not isinstance(previous.get('items'), list) or len(previous['items']) > 100):
+                    return
+                items = previous['items']
+                if any(not isinstance(item, dict) or set(item) != {'at', 'category', 'status', 'stage', 'message'}
+                       or any(not isinstance(value, str) or len(value) > 1000 for value in item.values()) for item in items):
+                    return
+                if items and (items[0].get('status'), items[0].get('stage'), items[0].get('message')) == (status, self.phase, message):
+                    return
+                category = ('fault' if status == 'blocked' or (self.phase in ('docker', 'bridge', 'policy') and status in ('waiting', 'stopping'))
+                            else 'recovery' if status == 'running' and items and any(item.get('category') == 'fault' for item in items[:5])
+                            else 'info')
+                try:
+                    journal = health_monitor.read_json(self.home / 'upgrade-state.json', {}, uid)
+                except (OSError, ValueError):
+                    journal = {}
+                if (self.phase == 'shutdown' and status in ('stopping', 'stopped') and isinstance(journal, dict)
+                        and journal.get('version') == 1 and isinstance(journal.get('work'), str)
+                        and re.fullmatch(r'upgrade-[0-9a-f]{32}', journal['work'])
+                        and journal.get('phase') in ('prepared', 'switching', 'starting')
+                        and os.path.lexists(self.home / 'upgrade.lock')
+                        and health_monitor.lock_busy(self.home / 'upgrade.lock', uid)):
+                    category = 'maintenance'
+                event = {'at': health_monitor.utc(), 'category': category, 'status': status,
+                         'stage': self.phase, 'message': message}
+                health_monitor.write_json(path, {'version': 1, 'items': [event] + items[:99]}, uid)
+        except (OSError, ValueError, TypeError, KeyError):
+            pass
+
+    def start_monitor(self):
+        if self.stopping or (self.monitor is not None and self.monitor.poll() is None):
+            return
+        script = self.code / 'monitor.py'
+        if script.is_symlink() or not script.is_file():
+            return
+        current = self.clock()
+        if self.monitor_started_at is not None and 0 <= current - self.monitor_started_at < 60:
+            return
+        self.monitor_started_at = current
+        try:
+            self.monitor = subprocess.Popen([sys.executable, '-I', str(script),
+                '--native-home', self.config['native_home'], '--web-home', str(self.home),
+                '--task-id', str(self.config.get('task_id', 7)), '--parent-pid', str(os.getpid())],
+                env=self.env, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL, start_new_session=True)
+        except OSError:
+            self.monitor = None
+
+    def stop_monitor(self):
+        if self.monitor is not None and self.monitor.poll() is None:
+            self.monitor.terminate()
+            try:
+                self.monitor.wait(timeout=15)
+            except subprocess.TimeoutExpired:
+                self.monitor.kill()
+                self.monitor.wait(timeout=5)
+
+    def publish_health(self):
+        item = self.observed_container
+        state = item.get('State', {}) if isinstance(item, dict) else {}
+        running = state.get('Running') if type(state.get('Running')) is bool else None
+        raw_health = state.get('Health', {}).get('Status') if isinstance(state.get('Health', {}), dict) else None
+        health = raw_health if raw_health in ('healthy', 'unhealthy', 'starting') else 'unknown'
+        restart_count = item.get('RestartCount') if isinstance(item, dict) else None
+        restart_count = restart_count if type(restart_count) is int and restart_count >= 0 else None
+        started_at, uptime = None, None
+        try:
+            began = health_monitor.timestamp(state.get('StartedAt'))
+            if 0 < began <= time.time():
+                started_at = health_monitor.utc(began)
+                uptime = max(0, int(time.time() - began)) if running else None
+        except (ValueError, TypeError, OverflowError):
+            pass
+        container_status = ('error' if running is False or health == 'unhealthy' else
+                            'ok' if running and health == 'healthy' else 'warning' if running else 'unknown')
+        components = [{'key': 'container', 'label': '管理容器', 'status': container_status,
+                       'message': {'ok': '容器及 HTTPS 健康检查正常', 'error': '容器未运行或健康检查失败',
+                                   'warning': '容器运行中，健康检查结果尚未确认', 'unknown': '容器状态暂未确认'}[container_status]}]
+        labels = {'bridge': '群晖桥接', 'tls': '管理页 HTTPS 证书', 'access': '访问策略与防火墙'}
+        for key, label in labels.items():
+            status = self.health.get(key, 'unknown')
+            components.append({'key': key, 'label': label, 'status': status,
+                               'message': {'ok': '检查正常', 'warning': '正在等待任务或服务就绪',
+                                           'error': '检查失败，管理入口已进入保护流程', 'unknown': '本轮尚未确认'}[status]})
+        alive = self.monitor is not None and self.monitor.poll() is None
+        components.append({'key': 'monitor', 'label': '独立证书监测', 'status': 'ok' if alive else 'warning',
+                           'message': '主机监测进程运行中' if alive else '监测进程暂未运行，等待监督程序重建'})
+        snapshot = {'version': 1, 'checked_at': health_monitor.utc(), 'components': components,
+                    'container': {'running': running, 'health': health, 'restart_count': restart_count,
+                                  'oom_killed': state.get('OOMKilled') if type(state.get('OOMKilled')) is bool else None,
+                                  'started_at': started_at, 'uptime_seconds': uptime}}
+        try:
+            health_monitor.write_json(self.home / 'runtime-health.json', snapshot, os.geteuid())
+        except (OSError, ValueError):
+            pass
 
     def report(self, status, message):
         try:
@@ -221,8 +331,11 @@ class Deployment:
         """单次检查；仅停止状态的容器需要完整稳定窗口。"""
         if self.stopping:
             return
+        self.health = {}
+        self.observed_container = None
         try:
             policy = self.apply_access_policy()
+            self.health['access'] = 'ok'
             self.phase = 'tls'
             tls_ready = True
             try:
@@ -234,12 +347,15 @@ class Deployment:
                 tls_ready = False
                 if not (self.home / 'tls/current.cert').exists():
                     raise RuntimeError('HTTPS 材料尚未就绪')
+            self.health['tls'] = 'ok' if tls_ready else 'warning'
             self.phase = 'bridge'
             self.start_bridge()
             bridge_ready = self.bridge_ready()
+            self.health['bridge'] = 'ok' if bridge_ready else 'warning'
             credentials_ready = (self.home / 'data/auth.sqlite3').exists()
             self.phase = 'docker'
             item = self.container()
+            self.observed_container = item
             running = bool(item and item.get('State', {}).get('Running') and not item['State'].get('Restarting'))
             if running:
                 self.started = True
@@ -247,7 +363,9 @@ class Deployment:
             elif self.started:
                 self.started = False
                 self.ready_since = None
-                self.report('waiting', '检测到管理容器已退出，等待环境连续稳定后重新启动。')
+                self.report('waiting', '检测到管理容器因内存不足退出，等待环境连续稳定后重新启动。'
+                            if item and item.get('State', {}).get('OOMKilled') is True
+                            else '检测到管理容器已退出，等待环境连续稳定后重新启动。')
             if not tls_ready:
                 self.phase = 'tls'
                 self.ready_since = None
@@ -280,6 +398,7 @@ class Deployment:
                     return
                 self.compose('up', '-d', '--no-build')
                 item = self.container()
+                self.observed_container = item
                 if not item or not item.get('State', {}).get('Running') or item['State'].get('Restarting'):
                     raise RuntimeError('管理容器启动后未保持运行')
                 self.started = True
@@ -287,6 +406,10 @@ class Deployment:
             self.report('running', '管理服务运行中，访问模式：{}。'.format('仅内网' if policy['mode'] == 'lan' else '允许外网'))
         except (OSError, ValueError, TypeError, KeyError, RuntimeError, GuardError, subprocess.TimeoutExpired):
             self.ready_since = None
+            key = {'policy': 'access', 'tls': 'tls', 'bridge': 'bridge'}.get(self.phase)
+            if key:
+                self.health[key] = 'error'
+            self.observed_container = None
             labels = {'policy': '访问策略或防火墙检查失败', 'tls': 'HTTPS 材料检查失败',
                       'bridge': '群晖桥接检查失败', 'docker': 'Docker 状态检查失败',
                       'start': '管理容器启动失败'}
@@ -299,6 +422,8 @@ class Deployment:
                 stopped = False
             self.report('blocked', reason + '，管理服务保持关闭，等待环境恢复稳定。' if stopped
                      else reason + '，且无法确认管理容器已关闭；请通过 NAS 检查。')
+        finally:
+            self.publish_health()
 
     def serve(self):
         fd = os.open(str(self.home / 'supervisor.lock'), os.O_WRONLY | os.O_CREAT | os.O_NOFOLLOW, 0o600)
@@ -313,6 +438,7 @@ class Deployment:
             try:
                 while not self.stopping:
                     self.reconcile()
+                    self.start_monitor()
                     for _ in range(10):
                         if self.stopping:
                             break
@@ -325,6 +451,10 @@ class Deployment:
                     self.stop_container()
                 except (OSError, RuntimeError, subprocess.TimeoutExpired):
                     stopped = False
+                try:
+                    self.stop_monitor()
+                except (OSError, subprocess.TimeoutExpired):
+                    pass
                 if self.bridge is not None and self.bridge.poll() is None:
                     self.bridge.terminate()
                     try:

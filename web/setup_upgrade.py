@@ -20,7 +20,7 @@ ACME_STAMP = '3.1.6\n807da6498377ee5e0cf43a78091f46f12dc59a89\nddbe1bcbd1a44a262
 WEB_FILES = (
     '.dockerignore', '__init__.py', 'Dockerfile', 'compose.yaml', 'requirements.txt',
     'access_policy.py', 'container_entry.py', 'deployment.py', 'healthcheck.py',
-    'host_bridge.py', 'install-web.py', 'login_mail.py', 'network_guard.py', 'tls_sync.py',
+    'host_bridge.py', 'install-web.py', 'login_mail.py', 'monitor.py', 'observability.py', 'network_guard.py', 'tls_sync.py',
     'frontend/index.html', 'frontend/package.json', 'frontend/package-lock.json',
     'frontend/tsconfig.json', 'frontend/vite.config.ts', 'frontend/vitest.config.ts',
 )
@@ -28,10 +28,11 @@ OPTIONAL_WEB_FILES = ('README.md', 'CONTRACT.md', 'DEPLOYMENT.md', 'deployment.e
                       'setup.py', 'setup_tasks.py', 'setup_upgrade.py', 'setup_settings.py')
 CODE_TREES = {'backend': {'.py'}, 'frontend/src': {'.vue', '.ts', '.css', '.svg'},
               'frontend/build': {'.ts'}, 'frontend/tests': {'.ts'}}
-NATIVE_FILES = {'certctl.py': 'certctl.py', 'failure_diagnostics.py': 'failure_diagnostics.py',
+NATIVE_FILES = {'certctl.py': 'certctl.py', 'run_history.py': 'run_history.py', 'failure_diagnostics.py': 'failure_diagnostics.py',
                 'dns_cleanup.py': 'dns_cleanup.py', 'dns_cleanup_retry.sh': 'dns_cleanup_retry.sh',
                 'web/host_bridge.py': 'web/host_bridge.py', 'web/access_policy.py': 'web/access_policy.py',
-                'web/login_mail.py': 'web/login_mail.py',
+                'web/login_mail.py': 'web/login_mail.py', 'web/monitor.py': 'web/monitor.py',
+                'web/observability.py': 'web/observability.py',
                 'acme/dnsapi/dns_tencent.sh': 'dns_tencent_tracked.sh'}
 
 

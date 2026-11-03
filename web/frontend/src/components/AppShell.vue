@@ -15,13 +15,13 @@ const props = defineProps<{
 const emit = defineEmits<{ navigate: [page: Page]; logout: [] }>()
 const open = shallowRef(false)
 const labels: Record<Page, string> = {
-  overview: '运行概览', certificate: '证书管理', renewal: '续期计划',
+  overview: '运行概览', health: '运行健康', runs: '执行记录', certificate: '证书管理', renewal: '续期计划',
   notifications: '邮件通知', failures: '失败记录', audit: '操作审计',
   security: '访问安全', account: '账户设置',
 }
 const groups: { key: string; label: string; pages: Page[] }[] = [
   { key: 'certificate-group', label: '证书与续期', pages: ['overview', 'certificate', 'renewal', 'notifications'] },
-  { key: 'activity-group', label: '运行维护', pages: ['failures', 'audit'] },
+  { key: 'activity-group', label: '运行维护', pages: ['health', 'runs', 'failures', 'audit'] },
   { key: 'system-group', label: '系统设置', pages: ['security', 'account'] },
 ]
 const items = computed<MenuProps['items']>(() => groups.map((group) => ({

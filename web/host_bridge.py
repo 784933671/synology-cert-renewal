@@ -34,6 +34,9 @@ _policy_spec.loader.exec_module(access_policy)
 _mail_spec = importlib.util.spec_from_file_location('certweb_login_mail', Path(__file__).resolve().parent / 'login_mail.py')
 login_mail = importlib.util.module_from_spec(_mail_spec)
 _mail_spec.loader.exec_module(login_mail)
+_observe_spec = importlib.util.spec_from_file_location('certweb_observability', Path(__file__).resolve().parent / 'observability.py')
+observability = importlib.util.module_from_spec(_observe_spec)
+_observe_spec.loader.exec_module(observability)
 
 MAX_REQUEST = 64 * 1024
 MAX_RESPONSE = 2 * 1024 * 1024
@@ -229,6 +232,7 @@ class Bridge:
         self.uid = uid
         self.management_host = management_host
         self.access_policy_path = Path(access_policy_path) if access_policy_path is not None else None
+        self.management_home = self.access_policy_path.parent.parent if self.access_policy_path is not None else None
         self.policy_gid = policy_gid
         self.controller_factory = controller_factory or (lambda: executor.Controller(self.home))
         self.scheduler = scheduler or Scheduler(self.home)
@@ -815,16 +819,24 @@ class Bridge:
     def _check_worker(self, controller, lock_context):
         result = {'at': utc(), 'success': False, 'message': '预检查失败，请核对本机环境及 HTTPS 服务。'}
         try:
+            controller.begin_history('check')
+            controller.history_stage('preflight')
             controller.preflight()
+            controller.history_stage('preflight', 'succeeded')
             result.update(success=True, message='预检查通过：系统、证书、域名、服务绑定与接口正常。')
         except Exception as error:
             if isinstance(error, executor.Failure):
                 result['message'] = self.sanitize(str(error), controller, 600)
         finally:
-            lock_context.__exit__(None, None, None)
-            with self.check_lock:
-                self.check_state.update(running=False, last_result=result)
-            self.actions.release()
+            try:
+                controller.finish_history('succeeded' if result['success'] else 'failed', result['message'])
+            finally:
+                try:
+                    lock_context.__exit__(None, None, None)
+                finally:
+                    with self.check_lock:
+                        self.check_state.update(running=False, last_result=result)
+                    self.actions.release()
 
     def archive(self, identifier):
         if not isinstance(identifier, str) or not FAILURE_ID.fullmatch(identifier):
@@ -893,6 +905,95 @@ class Bridge:
         except (OSError, ValueError):
             reject('访问策略无法保存，请检查策略文件和目录权限。', 'unavailable')
 
+    @staticmethod
+    def monitoring_module():
+        spec = importlib.util.spec_from_file_location('certweb_monitor_settings', Path(__file__).resolve().parent / 'monitor.py')
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        return module
+
+    def monitoring_settings(self):
+        private_directory(self.home, self.uid)
+        private_directory(self.home / 'state', self.uid)
+        return self.monitoring_module().load_settings(self.home, uid=self.uid)
+
+    def monitor_get(self):
+        settings = self.monitoring_settings()
+        task = self.scheduler.get()
+        recipient = task['extra'].get('notify_mail', '')
+        valid = isinstance(recipient, str) and bool(EMAIL.fullmatch(recipient)) and not recipient.startswith('-')
+        masked = recipient[:1] + '***@' + recipient.split('@', 1)[1] if valid else ''
+        return {**{key: value for key, value in settings.items() if key != 'version'},
+                'revision': hashlib.sha256(canonical(settings)).hexdigest(),
+                'notification_enabled': task['extra'].get('notify_enable') is True and valid,
+                'recipient': masked, 'interval_seconds': 60}
+
+    def monitor_update(self, params):
+        if not isinstance(params, dict) or set(params) != {'revision', 'enabled', 'missed_runs', 'grace_minutes', 'expiry_hours'}:
+            reject('预警设置字段不完整或包含未知字段。')
+        if not isinstance(params['revision'], str) or not re.fullmatch(r'[0-9a-f]{64}', params['revision']):
+            reject('预警设置版本无效。')
+        proposed = {'version': 1, **{key: value for key, value in params.items() if key != 'revision'}}
+        try:
+            self.monitoring_module().validate_settings(proposed)
+        except (ValueError, TypeError):
+            reject('预警设置超出允许范围。')
+        self.monitoring_settings()
+        # 与续期锁分离；仅写预警配置，不修改原任务或证书。
+        with daemon_lock(self.home / 'state/monitor-config.lock', self.uid):
+            existing = self.monitoring_settings()
+            if hashlib.sha256(canonical(existing)).hexdigest() != params['revision']:
+                reject('预警设置已被其他操作修改，请重新读取。', 'stale_revision')
+            atomic_bytes(self.home / 'state/monitor-config.json', canonical(proposed))
+        return self.monitor_get()
+
+    def health(self):
+        controller = self.controller_factory()
+        try:
+            controller.load()
+        except (executor.Failure, OSError, ValueError):
+            pass
+        if self.management_home is not None:
+            private_directory(self.management_home, self.uid)
+        def read(path, default):
+            try:
+                return self.read(path, default)
+            except BridgeError:
+                raise ValueError('快照不可读') from None
+        settings = self.monitoring_settings()
+        return observability.snapshot(self.management_home, read,
+                                      lambda value, limit: self.sanitize(value, controller, limit), settings)
+
+    def history_store(self):
+        private_directory(self.home, self.uid)
+        private_directory(self.home / 'state', self.uid)
+        spec = importlib.util.spec_from_file_location('certweb_run_history', Path(__file__).resolve().parents[1] / 'run_history.py')
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        return module, module.RunHistory(self.home / 'state', uid=self.uid)
+
+    def runs_list(self, params):
+        if (set(params) - {'offset', 'limit'} or type(params.get('offset', 0)) is not int
+                or not 0 <= params.get('offset', 0) <= 500 or type(params.get('limit', 20)) is not int
+                or not 1 <= params.get('limit', 20) <= 50):
+            reject('执行记录分页参数无效。')
+        module, history = self.history_store()
+        try:
+            return history.list(offset=params.get('offset', 0), limit=params.get('limit', 20))
+        except module.HistoryError:
+            reject('执行记录暂不可读，请检查记录目录。', 'unavailable')
+
+    def runs_get(self, params):
+        if set(params) != {'id'} or not isinstance(params['id'], str) or not re.fullmatch(r'run-[0-9]{8}T[0-9]{6}Z-[0-9a-f]{32}', params['id']):
+            reject('执行记录编号无效。')
+        module, history = self.history_store()
+        try:
+            return history.get(params['id'])
+        except module.HistoryNotFound:
+            reject('执行记录不存在或已过保留期限。', 'not_found')
+        except module.HistoryError:
+            reject('执行记录暂不可读，请检查记录文件。', 'unavailable')
+
     def dispatch(self, request):
         try:
             if not isinstance(request, dict) or set(request) != {'method', 'params'} or not isinstance(request['params'], dict):
@@ -902,7 +1003,9 @@ class Bridge:
                 reject('RPC 方法无效。', 'invalid_request')
             methods = {'status': self.status, 'settings.get': self.settings_get, 'settings.update': self.settings_update,
                        'run': self.run, 'renew': self.renew, 'check': self.check, 'failures.list': self.failure_list,
-                       'security.update': self.security_update}
+                       'security.update': self.security_update, 'health': self.health,
+                       'monitor.get': self.monitor_get, 'monitor.update': self.monitor_update,
+                       'runs.list': self.runs_list, 'runs.get': self.runs_get}
             if method == 'auth.code.send':
                 try:
                     data = self.login_mail.send(params)
@@ -913,9 +1016,10 @@ class Bridge:
                     reject('失败记录请求字段无效。', 'invalid_request')
                 data = self.failure_get(params['id'])
             elif method in methods:
-                if method not in ('settings.update', 'security.update') and params:
+                parameter_methods = ('settings.update', 'security.update', 'monitor.update', 'runs.list', 'runs.get')
+                if method not in parameter_methods and params:
                     reject('该操作不接受额外参数。', 'invalid_request')
-                data = methods[method](params) if method in ('settings.update', 'security.update') else methods[method]()
+                data = methods[method](params) if method in parameter_methods else methods[method]()
             else:
                 reject('不支持该 RPC 操作。', 'invalid_request')
             return {'ok': True, 'data': data}

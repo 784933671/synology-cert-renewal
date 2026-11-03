@@ -31,7 +31,7 @@ SECURITY_HEADERS = {
     "Permissions-Policy": "camera=(), microphone=(), geolocation=(), payment=()",
     "Cache-Control": "no-store",
 }
-SAFE_ROUTES = frozenset({"", "login", "overview", "certificate", "renewal", "notifications", "logs", "security", "audit"})
+SAFE_ROUTES = frozenset({"", "login", "overview", "certificate", "renewal", "notifications", "logs", "security", "audit", "health", "runs"})
 ALLOWED_ASSETS = frozenset({".js", ".css", ".svg", ".png", ".jpg", ".jpeg", ".webp", ".ico", ".woff", ".woff2"})
 
 
@@ -131,7 +131,8 @@ class SecurityBoundary:
             raw_path = decoded
         if "%" in raw_path:
             raise ApiError(400, "invalid_path", "请求路径不正确")
-        if scope.get("query_string"):
+        query = scope.get("query_string", b"")
+        if query and (path != "/api/runs" or scope.get("method") != "GET" or len(query) > 64):
             raise ApiError(400, "invalid_request", "此接口不接受查询参数")
         request_headers = {}
         for key, value in headers:
@@ -217,7 +218,8 @@ def create_app(config=None, store=None, bridge=None):
 
     async def session(request, write=False, allow_change=False):
         token = request.cookies.get(COOKIE, "")
-        polling = request.method == "GET" and request.url.path in ("/api/status", "/api/security")
+        polling = request.method == "GET" and (request.url.path in ("/api/status", "/api/security", "/api/health", "/api/monitor", "/api/runs")
+                                                or request.url.path.startswith("/api/runs/"))
         current = await run_in_threadpool(store.session, token, not polling)
         if not current:
             raise ApiError(401, "unauthorized", "登录已失效，请重新登录")
@@ -379,6 +381,47 @@ def create_app(config=None, store=None, bridge=None):
     async def get_settings(request: Request):
         await session(request)
         return await call_bridge("settings.get")
+
+    @app.get("/api/health")
+    async def runtime_health(request: Request):
+        await session(request)
+        return await call_bridge("health")
+
+    @app.get("/api/monitor")
+    async def monitor_settings(request: Request):
+        await session(request)
+        return await call_bridge("monitor.get")
+
+    @app.put("/api/monitor")
+    async def save_monitor(request: Request):
+        await session(request, write=True)
+        data = await json_body(request)
+        try:
+            validation.monitor(data)
+        except ValueError:
+            raise ApiError(400, "validation", "预警设置不符合要求，请检查填写项") from None
+        return await call_bridge("monitor.update", data, "monitor.update")
+
+    @app.get("/api/runs")
+    async def runs(request: Request):
+        await session(request)
+        pairs = request.query_params.multi_items()
+        if len(pairs) != len(dict(pairs)) or set(request.query_params) - {"offset", "limit"}:
+            raise ApiError(400, "invalid_request", "执行记录分页参数无效")
+        values = {}
+        for key, default, minimum, maximum in (("offset", "0", 0, 500), ("limit", "20", 1, 50)):
+            value = request.query_params.get(key, default)
+            if not re.fullmatch(r"[0-9]{1,3}", value) or not minimum <= int(value) <= maximum:
+                raise ApiError(400, "invalid_request", "执行记录分页参数无效")
+            values[key] = int(value)
+        return await call_bridge("runs.list", values)
+
+    @app.get("/api/runs/{run_id}")
+    async def run_detail(request: Request, run_id: str):
+        await session(request)
+        if not re.fullmatch(r"run-[0-9]{8}T[0-9]{6}Z-[0-9a-f]{32}", run_id):
+            raise ApiError(400, "invalid_request", "执行记录编号无效")
+        return await call_bridge("runs.get", {"id": run_id})
 
     @app.put("/api/settings")
     async def put_settings(request: Request):
