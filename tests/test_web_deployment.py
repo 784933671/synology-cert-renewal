@@ -348,10 +348,11 @@ class DeploymentRecoveryTests(unittest.TestCase):
         self.service.stopping = True
         events = []
         self.service.stop_container = Mock(side_effect=lambda: events.append('container'))
+        self.service.stop_startup_check = Mock(side_effect=lambda: events.append('startup'))
         self.service.stop_monitor = Mock(side_effect=lambda: events.append('monitor'))
         with patch('web.deployment.signal.signal'), patch('builtins.print'):
             self.service.serve()
-        self.assertEqual(events, ['container', 'monitor'])
+        self.assertEqual(events, ['container', 'startup', 'monitor'])
 
     def test_monitor_shutdown_kills_child_after_bounded_timeout(self):
         child = Mock(); child.poll.return_value = None
@@ -624,6 +625,160 @@ class StartupStabilityTests(unittest.TestCase):
             self.assertEqual(self.service.serve(), 0)
         self.assertEqual(len(calls), 2)
         self.assertEqual(sleep.call_count, 10)
+
+    def test_startup_renewal_is_dispatched_before_expired_tls_blocks_container(self):
+        (self.home / 'code').mkdir(); (self.home / 'code/startup_check.py').write_text('')
+        self.sync.side_effect = ValueError('expired certificate')
+        child = Mock(); child.poll.return_value = None
+        original = self.service.reconcile
+        def reconcile_once():
+            self.assertIs(self.service.startup_check, child)
+            original()
+            self.service.stopping = True
+        self.service.reconcile = reconcile_once
+        with patch('web.deployment.subprocess.Popen', return_value=child) as spawn, patch('web.deployment.signal.signal'):
+            self.assertEqual(self.service.serve(), 0)
+        spawn.assert_called_once()
+        self.service.compose.assert_not_called()
+        self.assertTrue(any(stage == 'tls' and status == 'blocked' for stage, status, _ in self.events))
+
+
+class StartupRenewalTests(unittest.TestCase):
+    def setUp(self):
+        temporary = tempfile.TemporaryDirectory(); self.addCleanup(temporary.cleanup)
+        self.home = Path(temporary.name).resolve()
+        self.code = self.home / 'code'; self.code.mkdir()
+        self.script = self.code / 'startup_check.py'; self.script.write_text('')
+        self.now = 0
+        config = {'home': str(self.home), 'native_home': str(self.home / 'native'), 'task_id': 31,
+                  'bind': '10.10.10.37', 'networks': ['10.10.10.0/24'], 'denied': ['10.10.10.1'], 'port': 18443}
+        self.service = deployment.Deployment(config, self.home / 'deployment.json', clock=lambda: self.now)
+        self.service.phase = 'running'
+        self.service.health = dict.fromkeys(('bridge', 'tls', 'access'), 'ok')
+        self.initial = ('c' * 64, '2026-11-03T07:16:58.108106+00:00')
+        self.service.startup_requested_generation = self.initial
+        self.item = {'Id': 'a' * 64, 'State': {'Running': True, 'Restarting': False,
+                     'StartedAt': '2026-11-03T07:17:58.108106777Z', 'Health': {'Status': 'healthy'}}}
+        self.service.observed_container = self.item
+        self.child = Mock(); self.child.poll.return_value = None
+        patcher = patch('web.deployment.subprocess.Popen', return_value=self.child)
+        self.spawn = patcher.start(); self.addCleanup(patcher.stop)
+        patcher = patch('builtins.print'); patcher.start(); self.addCleanup(patcher.stop)
+
+    def tick(self, when):
+        self.now = when; self.service.start_startup_check()
+
+    def test_one_child_for_supervisor_generation_and_first_container_baseline(self):
+        self.tick(0); self.tick(10)
+        self.spawn.assert_called_once()
+        command = self.spawn.call_args.args[0]
+        self.assertEqual(command, [deployment.sys.executable, '-I', str(self.script),
+            '--native-home', str(self.home / 'native'), '--web-home', str(self.home),
+            '--task-id', '31', '--generation-id', self.initial[0], '--started-at', self.initial[1]])
+        self.assertTrue(self.spawn.call_args.kwargs['start_new_session'])
+        self.child.wait.assert_not_called(); self.child.communicate.assert_not_called()
+        self.child.poll.return_value = 0
+        self.tick(20); self.tick(100)
+        self.spawn.assert_called_once()
+
+    def test_initial_check_does_not_depend_on_https_or_container_health(self):
+        self.service.phase = 'tls'
+        self.service.health = {'tls': 'error'}
+        self.service.observed_container = None
+        self.tick(0)
+        self.spawn.assert_called_once()
+        self.child.poll.return_value = 0; self.tick(10)
+        self.service.observed_container = self.item
+        self.item['State']['Health']['Status'] = 'starting'; self.tick(20)
+        self.item['State']['Health']['Status'] = 'healthy'; self.tick(30)
+        self.spawn.assert_called_once()
+
+    def test_invalid_container_generations_do_not_override_initial_startup(self):
+        for item in (None, {}, {'State': None}, {'Id': '../secret', 'State': self.item['State']},
+                     {'Id': 'a' * 64, 'State': dict(self.item['State'], StartedAt=None)}):
+            self.service.observed_container = item; self.tick(0)
+        self.assertIsNone(self.service.startup_container_generation)
+        self.assertEqual(self.service.startup_generation, self.initial)
+        self.spawn.assert_called_once()
+
+    def test_before_supervisor_lock_and_during_shutdown_never_spawn(self):
+        self.service.startup_requested_generation = None
+        self.tick(0)
+        with deployment.health_monitor.locked(self.home / 'supervisor.lock', os.geteuid()):
+            self.assertEqual(self.service.serve(), 0)
+        self.assertIsNone(self.service.startup_requested_generation)
+        self.service.startup_requested_generation = self.initial
+        self.service.observed_container = self.item
+        self.service.stopping = True; self.tick(0)
+        self.spawn.assert_not_called()
+
+    def test_tls_worker_reload_and_supervisor_poll_never_duplicate_completed_generation(self):
+        self.tick(0); self.child.poll.return_value = 0; self.tick(10)
+        self.item['State']['Pid'] = 12345
+        self.service.health['tls'] = 'warning'; self.tick(20)
+        self.service.health['tls'] = 'ok'
+        self.item['State']['Pid'] = 23456; self.tick(100)
+        self.spawn.assert_called_once()
+
+    def test_container_restart_or_recreate_dispatches_each_new_generation(self):
+        self.tick(0); self.child.poll.return_value = 0; self.tick(10)
+        self.item['State']['StartedAt'] = '2026-11-03T08:17:58.108106778Z'
+        self.tick(20); self.tick(30)
+        self.item['Id'] = 'b' * 64; self.tick(40)
+        self.assertEqual(self.spawn.call_count, 3)
+
+    def test_retryable_paused_or_busy_result_waits_sixty_seconds(self):
+        self.tick(0); self.child.poll.return_value = 75
+        self.tick(10); self.tick(59); self.spawn.assert_called_once()
+        self.tick(60); self.assertEqual(self.spawn.call_count, 2)
+        self.tick(61); self.tick(119); self.assertEqual(self.spawn.call_count, 2)
+        self.tick(120); self.assertEqual(self.spawn.call_count, 3)
+
+    def test_terminal_or_ambiguous_exit_is_never_replayed_in_same_generation(self):
+        for result in (1, 2, -15):
+            with self.subTest(result=result):
+                self.item['Id'] = ('%064x' % (result + 100))
+                self.child.poll.return_value = None; self.tick(0)
+                calls = self.spawn.call_count
+                self.child.poll.return_value = result; self.tick(10); self.tick(300)
+                self.assertEqual(self.spawn.call_count, calls)
+
+    def test_spawn_failure_or_missing_script_retries_without_stopping_container(self):
+        self.service.stop_container = Mock()
+        self.spawn.side_effect = OSError('PRIVATE_ERROR')
+        self.tick(0); self.tick(59); self.spawn.assert_called_once()
+        self.tick(60); self.assertEqual(self.spawn.call_count, 2)
+        self.spawn.side_effect = None
+        self.script.unlink(); self.tick(120)
+        self.assertEqual(self.spawn.call_count, 2)
+        self.script.write_text(''); self.tick(179)
+        self.assertEqual(self.spawn.call_count, 2)
+        self.tick(180); self.assertEqual(self.spawn.call_count, 3)
+        self.service.stop_container.assert_not_called()
+        self.assertFalse((self.home / 'deployment-state.json').exists())
+
+    def test_unsafe_script_never_executes_as_root(self):
+        self.script.chmod(0o666); self.tick(0)
+        self.script.unlink(); self.script.symlink_to('/dev/null'); self.tick(60)
+        self.spawn.assert_not_called()
+
+    def test_new_generation_cancels_old_child_without_blocking_safety_loop(self):
+        self.tick(0)
+        self.item['State']['StartedAt'] = '2026-11-03T08:17:58.108106777Z'
+        self.tick(10); self.child.terminate.assert_called_once()
+        self.tick(14); self.child.kill.assert_not_called()
+        self.tick(15); self.child.kill.assert_called_once()
+        self.tick(20); self.child.kill.assert_called_once()
+        self.child.wait.assert_not_called(); self.spawn.assert_called_once()
+        self.child.poll.return_value = -15; self.tick(30)
+        self.assertEqual(self.spawn.call_count, 2)
+
+    def test_shutdown_terminates_then_kills_child_with_bounded_wait(self):
+        self.tick(0)
+        self.child.wait.side_effect = [subprocess.TimeoutExpired('startup', 5), 0]
+        self.service.stop_startup_check()
+        self.child.terminate.assert_called_once(); self.child.kill.assert_called_once()
+        self.assertEqual([call.kwargs['timeout'] for call in self.child.wait.call_args_list], [5, 5])
 
 
 class ContainerTLSReloadTests(unittest.TestCase):

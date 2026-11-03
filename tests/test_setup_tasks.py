@@ -9,7 +9,7 @@ import unittest
 from unittest import mock
 
 from web.setup_tasks import TaskSetup
-from web.host_bridge import BridgeError
+from web.host_bridge import BridgeError, read_schedule
 
 
 class TaskApi:
@@ -67,8 +67,10 @@ class TaskSetupTests(unittest.TestCase):
         task = self.setup.ensure('admin@example.com')
         self.assertEqual(task['id'], 31)
         self.assertFalse(task['enable'])
-        self.assertEqual(task['schedule']['minute'], 17)
-        self.assertEqual(task['schedule']['repeat_hour'], 1)
+        self.assertEqual(read_schedule(task), {'enabled': False, 'mode': 'daily', 'interval_hours': 1,
+                                              'hour': 3, 'minute': 18, 'editable': True})
+        self.assertEqual(task['schedule']['repeat_hour'], 0)
+        self.assertEqual(task['schedule']['last_work_hour'], 3)
         self.assertEqual(task['schedule']['date'], self.api.defaults['schedule']['date'])
         self.assertEqual(task['extra']['notify_mail'], 'admin@example.com')
         self.assertTrue(task['extra']['notify_if_error'])
@@ -81,8 +83,9 @@ class TaskSetupTests(unittest.TestCase):
         task = self.setup.ensure('admin@example.com')
         self.setup.activate(task['id'])
         self.api.tasks[task['id']]['enable'] = False
-        self.api.tasks[task['id']]['schedule']['minute'] = 18
+        self.api.tasks[task['id']]['schedule'].update(hour=0, last_work_hour=23, repeat_hour=4, minute=42)
         before = copy.deepcopy(self.api.tasks[task['id']])
+        self.assertEqual(self.setup.ensure('new@example.com'), before)
         self.assertEqual(self.setup.activate(task['id']), before)
         self.assertEqual(sum(call[1] == 'set' for call in self.api.calls), 1)
 
@@ -90,6 +93,26 @@ class TaskSetupTests(unittest.TestCase):
         before = copy.deepcopy(self.api.existing(enabled=False))
         self.assertEqual(self.setup.ensure('new@example.com'), before)
         self.assertEqual(self.setup.activate(7), before)
+        self.assertFalse(any(call[1] in ('create', 'set') for call in self.api.calls))
+
+    def test_existing_hourly_schedule_is_preserved_during_adoption_and_reentry(self):
+        task = self.api.existing()
+        task['schedule'].update(hour=0, last_work_hour=23, repeat_hour=1, minute=18)
+        before = copy.deepcopy(task)
+        for _ in range(2):
+            self.assertEqual(self.setup.ensure('new@example.com'), before)
+            self.assertEqual(self.setup.activate(7), before)
+        self.assertEqual(read_schedule(task)['mode'], 'hourly')
+        self.assertFalse(any(call[1] in ('create', 'set') for call in self.api.calls))
+
+    def test_existing_custom_schedule_is_preserved_during_adoption_and_reentry(self):
+        task = self.api.existing(enabled=False)
+        task['schedule'].update(date_type=2, monthly_week=[1, 3], week_day='1,3,5', hour=11, minute=47)
+        before = copy.deepcopy(task)
+        for _ in range(2):
+            self.assertEqual(self.setup.ensure('new@example.com'), before)
+            self.assertEqual(self.setup.activate(7), before)
+        self.assertEqual(read_schedule(task)['mode'], 'unsupported')
         self.assertFalse(any(call[1] in ('create', 'set') for call in self.api.calls))
 
     def test_other_tasks_are_not_adopted_or_modified(self):
@@ -166,7 +189,7 @@ class PreparationTests(unittest.TestCase):
         self.native = self.root / 'native';self.native.mkdir(mode=0o700)
         for name in ('config.json', 'certctl.py'):(self.native / name).write_text('{}')
         self.source = self.root / 'source';self.source.mkdir(mode=0o700)
-        self.sources = ['Dockerfile', 'compose.yaml', 'deployment.py', 'host_bridge.py', 'login_mail.py', 'monitor.py', 'observability.py',
+        self.sources = ['Dockerfile', 'compose.yaml', 'deployment.py', 'host_bridge.py', 'login_mail.py', 'monitor.py', 'observability.py', 'startup_check.py',
                         'access_policy.py', 'backend/app.py', 'frontend/package.json']
         for name in self.sources:
             path = self.source / name;path.parent.mkdir(parents=True, exist_ok=True)
@@ -221,6 +244,17 @@ class PreparationTests(unittest.TestCase):
         installer.prepare(self.args)
         installed = [str(path.relative_to(self.args.home / 'code')) for path in (self.args.home / 'code').rglob('*') if path.is_file()]
         self.assertEqual(set(installed), set(self.sources))
+
+    def test_startup_helper_is_required_and_only_installed_in_management_code(self):
+        helper = self.source / 'startup_check.py'
+        helper.unlink()
+        with self.assertRaises(ValueError):installer.prepare(self.args)
+        self.assertFalse(self.args.home.exists())
+        self.assertFalse((self.native / 'web').exists())
+        helper.write_text('{}')
+        installer.prepare(self.args)
+        self.assertEqual((self.args.home / 'code/startup_check.py').read_text(), '{}')
+        self.assertFalse((self.native / 'web/startup_check.py').exists())
 
 
 if __name__ == '__main__':

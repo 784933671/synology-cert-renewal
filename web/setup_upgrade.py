@@ -20,7 +20,7 @@ ACME_STAMP = '3.1.6\n807da6498377ee5e0cf43a78091f46f12dc59a89\nddbe1bcbd1a44a262
 WEB_FILES = (
     '.dockerignore', '__init__.py', 'Dockerfile', 'compose.yaml', 'requirements.txt',
     'access_policy.py', 'container_entry.py', 'deployment.py', 'healthcheck.py',
-    'host_bridge.py', 'install-web.py', 'login_mail.py', 'monitor.py', 'observability.py', 'network_guard.py', 'tls_sync.py',
+    'host_bridge.py', 'install-web.py', 'login_mail.py', 'monitor.py', 'observability.py', 'startup_check.py', 'network_guard.py', 'tls_sync.py',
     'frontend/index.html', 'frontend/package.json', 'frontend/package-lock.json',
     'frontend/tsconfig.json', 'frontend/vite.config.ts', 'frontend/vitest.config.ts',
 )

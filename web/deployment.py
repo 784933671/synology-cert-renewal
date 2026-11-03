@@ -1,11 +1,13 @@
 """群晖原生监督进程：先应用访问策略，再启动 Docker 管理服务。"""
 import argparse
+import datetime as dt
 import fcntl
 import ipaddress
 import json
 import os
 from pathlib import Path
 import re
+import secrets
 import signal
 import stat
 import subprocess
@@ -29,6 +31,7 @@ CONTAINER = 'synology-cert-web'
 MANAGED_LABEL = 'io.github.784933671.certweb.managed'
 DEFAULT_CONFIG = Path('/usr/local/share/synology-cert-web/deployment.json')
 START_STABLE_SECONDS = 60
+STARTUP_CHECK_RETRY_SECONDS = 60
 
 
 def private_json(path, value):
@@ -94,6 +97,15 @@ class Deployment:
         self.bridge = None
         self.monitor = None
         self.monitor_started_at = None
+        self.startup_check = None
+        self.startup_requested_generation = None
+        self.startup_container_generation = None
+        self.startup_generation = None
+        self.startup_attempted_at = None
+        self.startup_done = False
+        self.startup_terminating_at = None
+        self.startup_killed = False
+        self.startup_message = None
         self.stopping = False
         self.last_message = None
         self.started = False
@@ -236,6 +248,85 @@ class Deployment:
             except subprocess.TimeoutExpired:
                 self.monitor.kill()
                 self.monitor.wait(timeout=5)
+
+    def startup_notice(self, message):
+        if message != self.startup_message:
+            try:
+                print(time.strftime('%Y-%m-%d %H:%M:%S') + ' ' + message, flush=True)
+                self.startup_message = message
+            except OSError:
+                pass
+
+    def start_startup_check(self):
+        """启动补检独立于 HTTPS；首个容器只建基线，后续真正重启才再检查。"""
+        if self.stopping or self.startup_requested_generation is None:
+            return
+        item = self.observed_container
+        state = item.get('State', {}) if isinstance(item, dict) else {}
+        identifier = item.get('Id') if isinstance(item, dict) else None
+        began = state.get('StartedAt') if isinstance(state, dict) else None
+        container_generation = ((identifier, began) if isinstance(identifier, str)
+                                and re.fullmatch(r'[a-f0-9]{64}', identifier)
+                                and isinstance(began, str) and len(began) <= 64
+                                and state.get('Running') is True and not state.get('Restarting') else None)
+        if container_generation is not None:
+            if self.startup_container_generation is not None and container_generation != self.startup_container_generation:
+                self.startup_requested_generation = container_generation
+            self.startup_container_generation = container_generation
+        generation = self.startup_requested_generation
+        current = self.clock()
+        try:
+            if self.startup_check is not None:
+                result = self.startup_check.poll()
+                if result is None:
+                    if generation != self.startup_generation:
+                        if self.startup_terminating_at is None:
+                            self.startup_check.terminate()
+                            self.startup_terminating_at = current
+                        elif not self.startup_killed and current - self.startup_terminating_at >= 5:
+                            self.startup_check.kill()
+                            self.startup_killed = True
+                    return
+                self.startup_check = None
+                if self.startup_terminating_at is None:
+                    self.startup_done = result != 75
+                    self.startup_notice('本次启动检查已处理，本启动代不再重复触发。' if result == 0 else
+                                        '启动检查等待原任务启用或当前执行完成。' if result == 75 else
+                                        '启动检查未完成，请检查私有启动检查记录；每日续期任务保持原计划。')
+            if generation != self.startup_generation:
+                self.startup_generation = generation
+                self.startup_attempted_at = None
+                self.startup_done = False
+                self.startup_terminating_at = None
+                self.startup_killed = False
+            if self.startup_done:
+                return
+            if (self.startup_attempted_at is not None
+                    and 0 <= current - self.startup_attempted_at < STARTUP_CHECK_RETRY_SECONDS):
+                return
+            self.startup_attempted_at = current
+            script = self.code / 'startup_check.py'
+            info = script.lstat()
+            if (not stat.S_ISREG(info.st_mode) or info.st_uid != os.geteuid()
+                    or info.st_nlink != 1 or info.st_mode & 0o022):
+                raise ValueError('启动检查程序权限无效')
+            self.startup_check = subprocess.Popen([sys.executable, '-I', str(script),
+                '--native-home', self.config['native_home'], '--web-home', str(self.home),
+                '--task-id', str(self.config.get('task_id', 7)),
+                '--generation-id', generation[0], '--started-at', generation[1]],
+                env=self.env, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL, start_new_session=True)
+        except (OSError, ValueError, subprocess.SubprocessError):
+            self.startup_notice('启动检查暂未启动，稍后重试；每日续期任务保持原计划。')
+
+    def stop_startup_check(self):
+        if self.startup_check is not None and self.startup_check.poll() is None:
+            self.startup_check.terminate()
+            try:
+                self.startup_check.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                self.startup_check.kill()
+                self.startup_check.wait(timeout=5)
 
     def publish_health(self):
         item = self.observed_container
@@ -436,9 +527,12 @@ class Deployment:
             for sig in (signal.SIGTERM, signal.SIGINT):
                 signal.signal(sig, lambda *_: setattr(self, 'stopping', True))
             try:
+                self.startup_requested_generation = (secrets.token_hex(32), dt.datetime.now(dt.timezone.utc).isoformat())
+                self.start_startup_check()
                 while not self.stopping:
                     self.reconcile()
                     self.start_monitor()
+                    self.start_startup_check()
                     for _ in range(10):
                         if self.stopping:
                             break
@@ -451,6 +545,10 @@ class Deployment:
                     self.stop_container()
                 except (OSError, RuntimeError, subprocess.TimeoutExpired):
                     stopped = False
+                try:
+                    self.stop_startup_check()
+                except (OSError, subprocess.TimeoutExpired):
+                    pass
                 try:
                     self.stop_monitor()
                 except (OSError, subprocess.TimeoutExpired):

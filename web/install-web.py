@@ -25,7 +25,7 @@ def source_files(source):
     top = {'.dockerignore', 'Dockerfile', 'compose.yaml', '__init__.py', 'README.md', 'CONTRACT.md',
            'DEPLOYMENT.md', 'requirements.txt', 'requirements.in', 'requirements-test.txt',
            'requirements-test.in', 'deployment.env.example', 'access_policy.py', 'container_entry.py',
-           'deployment.py', 'healthcheck.py', 'host_bridge.py', 'install-web.py', 'login_mail.py', 'monitor.py', 'observability.py',
+           'deployment.py', 'healthcheck.py', 'host_bridge.py', 'install-web.py', 'login_mail.py', 'monitor.py', 'observability.py', 'startup_check.py',
            'network_guard.py', 'tls_sync.py', 'setup.py', 'setup_tasks.py', 'setup_upgrade.py'}
     frontend = {'package.json', 'package-lock.json', 'tsconfig.json', 'vite.config.ts', 'vitest.config.ts',
                 'index.html', '.gitignore'}
@@ -52,7 +52,7 @@ def source_files(source):
             raise ValueError('构建源不能包含符号链接')
         if path.is_file():
             result[str(relative)] = hashlib.sha256(path.read_bytes()).hexdigest()
-    for required in ('Dockerfile', 'compose.yaml', 'deployment.py', 'host_bridge.py', 'login_mail.py', 'monitor.py', 'observability.py',
+    for required in ('Dockerfile', 'compose.yaml', 'deployment.py', 'host_bridge.py', 'login_mail.py', 'monitor.py', 'observability.py', 'startup_check.py',
                      'access_policy.py', 'backend/app.py', 'frontend/package.json'):
         if required not in result:
             raise ValueError('管理源码缺少必要文件')

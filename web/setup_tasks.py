@@ -114,9 +114,9 @@ class TaskSetup:
                 or not isinstance(defaults.get('schedule'), dict) or not isinstance(defaults.get('extra'), dict)):
             raise ValueError('群晖未提供可识别的脚本任务默认模板')
         schedule = copy.deepcopy(defaults['schedule'])
-        # 使用 DSM 默认日期与版本字段，仅设置已支持的每小时检查计划。
-        schedule.update(date_type=0, hour=0, last_work_hour=23, minute=17, monthly_week=[],
-                        repeat_date=1001, repeat_hour=1, repeat_hour_store_config=None,
+        # 沿用 DSM 日期字段；仅新建任务默认每天 03:18 检查。
+        schedule.update(date_type=0, hour=3, last_work_hour=3, minute=18, monthly_week=[],
+                        repeat_date=1001, repeat_hour=0, repeat_hour_store_config=None,
                         repeat_min=0, repeat_min_store_config=None, version=4, week_day='0,1,2,3,4,5,6')
         extra = copy.deepcopy(defaults['extra'])
         extra.update(script='/bin/sh ' + shlex.quote(str(self.home / 'run-task.sh')),

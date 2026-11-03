@@ -73,13 +73,17 @@ Challenge = {
 
 以上接口均需完整登录，写操作额外要求同源 JSON、CSRF 与审计。新观测 GET 请求不延长闲置会话。匿名 `/healthz` 仍只返回存活结果，不包含上述业务信息。新的固定 RPC 方法为 `health`、`monitor.get`、`monitor.update`、`runs.list`、`runs.get`，不接受任意路径、命令或 Docker 参数。
 
+### 启动检查
+
+主机监督程序取得独占锁后，以本次启动标识及开始时间异步调用固定 `startup_check.py`，不依赖管理页 HTTPS 健康。首个运行容器建立基线，不重复投递；后续容器 ID 或 `StartedAt` 变化触发新的启动检查。每次启动复用原 DSM 普通任务，不传强制续期参数、不创建第二套周期计划；暂停时延后，续期锁占用时延后，启动后已完成的普通执行覆盖该次检查。投递前将启动标识与状态写入 root 私有 `startup-check.json`，未知投递结果不重放。网页刷新、监督轮询、HTTPS 工作进程重载不构成容器新启动。新安装任务默认每天 NAS 本地时间 03:18，已有任务升级时保留自定义计划。
+
 ### 原续期状态
 
 ```
 {
  certificate:{id,description,domains:[...],not_after:"ISO8601",fingerprint,remaining_seconds,renew_at:"ISO8601"},
  renew_before_days:2,
- task:{enabled:true,running:false,schedule_text:"每小时第17分钟",last_run:null},
+ task:{enabled:true,running:false,schedule_text:"每天03:18",last_run:null},
  last_result:null,
  pending:{deployment:false,dns_cleanup:false,notification:false,interrupted:false},
  check:{running:false,last_result:null},
@@ -114,7 +118,7 @@ Challenge = {
  renew_before_days:2,
  secret_id_configured:true,secret_key_configured:true,
  probes:[{host:"127.0.0.1",port:5001,server_name:"ttxli.cn"}],
- schedule:{enabled:true,mode:"hourly",interval_hours:1,hour:0,minute:17},
+ schedule:{enabled:true,mode:"daily",interval_hours:1,hour:3,minute:18},
  notifications:{success_enabled:true,success_email:"...",failure_enabled:true,failure_email:"..."},
  deployment_method:"local_api",timezone:"Asia/Shanghai"
 }
