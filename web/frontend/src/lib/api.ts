@@ -64,6 +64,7 @@ export async function api<T>(
         'invalid_response',
       )
     }
+    if (controller.signal.aborted) throw new DOMException('请求已取消', 'AbortError')
     if (!response.ok) {
       if (
         response.status === 401 &&

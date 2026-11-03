@@ -182,7 +182,7 @@ describe('邮箱登录二步验证', () => {
     expect(wrapper!.find('input[name="password"]').exists()).toBe(false)
   })
   it('账户区说明登录邮箱独立于通知邮箱且无绑定修改入口', () => {
-    wrapper = mount(AccountView, { props: { session } })
+    wrapper = mount(AccountView, { props: { session, restoreSession: async () => session } })
     expect(wrapper.text()).toContain(challenge.email_masked)
     expect(wrapper.text()).toContain('修改通知邮箱不会更改登录验证邮箱')
     expect(wrapper.find('input[type="email"]').exists()).toBe(false)

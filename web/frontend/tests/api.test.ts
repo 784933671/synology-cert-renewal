@@ -92,4 +92,16 @@ describe('同源会话请求', () => {
       { status: 409, code: 'conflict' },
     )
   })
+  it('已取消请求的晚到401不撤销当前会话', async () => {
+    const notify = vi.fn(), controller = new AbortController()
+    let respond!: (value: Response) => void
+    onAuthFailure(notify)
+    vi.stubGlobal('fetch', vi.fn(() => new Promise<Response>((resolve) => { respond = resolve })))
+    const request = api('/api/password', { method: 'POST', signal: controller.signal })
+    const rejected = expect(request).rejects.toMatchObject({ name: 'AbortError' })
+    controller.abort()
+    respond(new Response('{"error":{"code":"unauthorized","message":"请登录"}}', { status: 401 }))
+    await rejected
+    expect(notify).not.toHaveBeenCalled()
+  })
 })

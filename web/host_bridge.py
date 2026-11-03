@@ -436,7 +436,17 @@ class Bridge:
         domains = sorted(selected['domains'], key=lambda value: value.startswith('*.'))
         if identifier == config['certificate_id'] and set(domains) == set(config['domains']):
             domains = config['domains']
-        config.update(certificate_id=identifier, certificate_description=selected['description'], domains=domains,
+        # 展示字段可能已脱敏；持久配置必须继续使用 DSM 中的原始身份。
+        info = executor.read_json(controller.archive / 'INFO')
+        entry = info.get(identifier) if isinstance(info, dict) else None
+        description = entry.get('desc') if isinstance(entry, dict) else None
+        try:
+            executor.validate_description(description, controller.deployment_method())
+        except executor.Failure:
+            reject('所选证书描述已改变，请刷新证书列表后重试。', 'conflict')
+        if sum(isinstance(item, dict) and item.get('desc') == description for item in info.values()) != 1:
+            reject('所选证书描述不唯一，请先核对 DSM 证书列表。', 'conflict')
+        config.update(certificate_id=identifier, certificate_description=description, domains=domains,
                       email=params['email'], renew_before_days=params['renew_before_days'], probes=params['probes'])
         secrets = [params.get(key, '') for key in ('secret_id', 'secret_key')]
         if any(not isinstance(value, str) or len(value) > 512 for value in secrets) or bool(secrets[0]) != bool(secrets[1]):
@@ -492,11 +502,71 @@ class Bridge:
         snapshot = {'version': 1, 'task': task, 'files': files, 'at': utc(),
                     'result_digest': self.file_digest(controller.state / 'last-result.json')}
         atomic_bytes(directory / 'snapshot.json', canonical(snapshot))
-        atomic_bytes(self.transaction, canonical({'version': 1, 'backup': name, 'phase': 'prepared'}))
+        atomic_bytes(self.transaction, canonical({'version': 1, 'backup': name, 'phase': 'prepared',
+                                                  'task_expected': task}))
         return snapshot
+
+    @staticmethod
+    def task_configuration(task):
+        keys = ('id', 'name', 'owner', 'enable', 'schedule', 'extra')
+        if (not isinstance(task, dict) or any(key not in task for key in keys)
+                or type(task['id']) is not int or type(task['enable']) is not bool
+                or not isinstance(task['schedule'], dict) or not isinstance(task['extra'], dict)):
+            reject('事务任务状态无法核验，请管理员检查恢复记录。', 'unavailable')
+        result = {key: task[key] for key in keys}
+        result['real_owner'] = task.get('real_owner') or task['owner']
+        return result
+
+    def checked_task(self, journal, rollback_task=None):
+        expected = journal.get('task_expected')
+        legacy = expected is None
+        if legacy:
+            expected = rollback_task if rollback_task is not None else journal.get('desired_task')
+        current = self.scheduler.get()
+        current_config = self.task_configuration(current)
+        pending = journal.get('task_pending')
+        acknowledge = legacy
+        if pending is not None:
+            if current_config == self.task_configuration(pending):
+                acknowledge = True
+            elif rollback_task is not None:
+                paused = copy.deepcopy(rollback_task)
+                paused['enable'] = False
+                # 首次暂停未生效时只撤销这次暂停意图；不能据此重试启用任务。
+                if (current_config != self.task_configuration(rollback_task)
+                        or current_config != self.task_configuration(expected)
+                        or self.task_configuration(pending) != self.task_configuration(paused)):
+                    reject('任务写入结果不明确或 DSM 计划已变化，保留事务，请管理员核对。', 'conflict')
+                acknowledge = True
+            else:
+                reject('任务写入结果不明确或 DSM 计划已变化，保留事务，请管理员核对。', 'conflict')
+        elif current_config != self.task_configuration(expected):
+            reject('DSM 任务已被其他操作修改，保留事务并拒绝覆盖当前计划。', 'conflict')
+        if acknowledge:
+            journal['task_expected'] = current
+            journal.pop('task_pending', None)
+            atomic_bytes(self.transaction, canonical(journal))
+        return current
+
+    def write_task(self, task):
+        journal = self.read(self.transaction)
+        current = self.checked_task(journal)
+        if self.task_configuration(current) == self.task_configuration(task):
+            return current
+        # 先保留写入意图；响应丢失后只能接受已实际应用的目标状态。
+        journal['task_pending'] = task
+        atomic_bytes(self.transaction, canonical(journal))
+        observed = self.scheduler.put(task)
+        if self.task_configuration(observed) != self.task_configuration(task):
+            reject('任务保存后的状态无法确认，请保留事务并核对 DSM。', 'unavailable')
+        journal['task_expected'] = observed
+        journal.pop('task_pending', None)
+        atomic_bytes(self.transaction, canonical(journal))
+        return observed
 
     def commit_decision(self, config, task):
         journal = self.read(self.transaction)
+        self.checked_task(journal)
         journal.update(phase='committed', config_digest=hashlib.sha256(canonical(config)).hexdigest(), desired_task=task)
         atomic_bytes(self.transaction, canonical(journal))
 
@@ -513,11 +583,13 @@ class Bridge:
                 or hashlib.sha256(canonical(current)).hexdigest() != expected):
             reject('已提交事务的配置已发生变化，请管理员核对后恢复。', 'unavailable')
         executor.validate_config(current)
+        self.checked_task(journal)
         controller = self.controller_factory()
         controller.load()
         controller.retire_manual_target()
         task = journal.get('desired_task')
-        self.scheduler.put(task)
+        self.write_task(task)
+        self.checked_task(self.read(self.transaction))
         self.transaction.unlink()
 
     def restore(self, snapshot):
@@ -525,9 +597,10 @@ class Bridge:
                 or not isinstance(snapshot.get('files'), dict) or set(snapshot['files']) != set(SNAPSHOT_FILES)):
             reject('配置备份结构无效，需管理员检查。', 'unavailable')
         task = snapshot['task']
+        self.checked_task(self.read(self.transaction), rollback_task=task)
         paused = copy.deepcopy(task)
         paused['enable'] = False
-        self.scheduler.put(paused)
+        self.write_task(paused)
         for relative in SNAPSHOT_FILES:
             path = self.home / relative
             contents = snapshot['files'][relative]
@@ -537,7 +610,8 @@ class Bridge:
                     path.unlink()
             else:
                 atomic_bytes(path, base64.b64decode(contents, validate=True))
-        self.scheduler.put(task)
+        self.write_task(task)
+        self.checked_task(self.read(self.transaction))
         self.transaction.unlink()
 
     def recover(self):
@@ -626,7 +700,7 @@ class Bridge:
                 try:
                     paused = copy.deepcopy(previous_task)
                     paused['enable'] = False
-                    self.scheduler.put(paused)
+                    self.write_task(paused)
                     controller.config = config
                     info = controller.preflight()
                     if self.management_host is not None:
@@ -644,14 +718,16 @@ class Bridge:
                     if controller.target_bindings(controller.binding_state(controller.metadata())) != controller.target_bindings(bindings):
                         reject('配置过程中证书服务绑定发生变化，已停止保存。', 'conflict')
                     self.protection(controller)
+                    self.checked_task(self.read(self.transaction))
                     self.stage_notification(config)
                     atomic_bytes(controller.config_file, canonical(config))
                     atomic_bytes(controller.state / 'web-preferences.json', canonical(preferences))
                     self.commit_decision(config, task)
                     committed = True
                     controller.retire_manual_target()
-                    self.scheduler.put(task)
+                    self.write_task(task)
                     result = self.settings_data(controller, self.scheduler.get())
+                    self.checked_task(self.read(self.transaction))
                     self.transaction.unlink()
                     return result
                 except Exception as error:

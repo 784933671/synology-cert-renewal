@@ -313,11 +313,15 @@ class Wizard:
             validate_material(source, options['hostname'])
 
     def auth_cli(self, args, password=None):
-        return self.runner([DOCKER, 'run', '--rm', '--network', 'none', '--user', '10100:10100',
-                            '--read-only', '--cap-drop', 'ALL', '--security-opt', 'no-new-privileges',
-                            '--env', 'CERTWEB_DATA_DIR=/data', '--mount',
-                            'type=bind,source=' + str(self.home / 'data') + ',target=/data',
-                            '--entrypoint', 'python', 'synology-cert-web:local', '-m', 'web.backend'] + args,
+        command = [DOCKER, 'run', '--rm']
+        if password is not None:
+            command.append('--interactive')
+        command += ['--network', 'none', '--user', '10100:10100',
+                    '--read-only', '--cap-drop', 'ALL', '--security-opt', 'no-new-privileges',
+                    '--env', 'CERTWEB_DATA_DIR=/data', '--mount',
+                    'type=bind,source=' + str(self.home / 'data') + ',target=/data',
+                    '--entrypoint', 'python', 'synology-cert-web:local', '-m', 'web.backend']
+        return self.runner(command + args,
                            timeout=90, input_text=password + '\n' if password is not None else None)
 
     def credentials_ready(self, options):

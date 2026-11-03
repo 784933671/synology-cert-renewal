@@ -69,7 +69,7 @@ describe('管理员会话与密码', () => {
     await menuItems.find((item) => item.text() === '证书管理')!.trigger('click')
     expect(wrapper.text()).toContain('设置专用登录密码')
     expect(api).toHaveBeenCalledOnce()
-    expect(api).toHaveBeenCalledWith('/api/session')
+    expect(api).toHaveBeenCalledWith('/api/session', { signal: expect.any(AbortSignal) })
   })
   it('Ant菜单保留导航事件，锁定时账户和退出仍可用', async () => {
     wrapper = mount(AppShell, { props: { page: 'overview', username: 'manager', locked: false, busy: false } })
@@ -88,7 +88,7 @@ describe('管理员会话与密码', () => {
     vi.mocked(api)
       .mockRejectedValueOnce(new ApiError('当前密码不正确', 400))
       .mockResolvedValueOnce({ ...session, csrf_token: 'rotated', must_change_password: false })
-    wrapper = mount(AccountView, { props: { session } })
+    wrapper = mount(AccountView, { props: { session, restoreSession: async () => session } })
     await fillPasswords()
     await wrapper.get('form').trigger('submit')
     await vi.waitFor(() => expect(wrapper!.text()).toContain('当前密码不正确'))
@@ -100,7 +100,7 @@ describe('管理员会话与密码', () => {
     ]))
   })
   it('保留当前密码必填、新密码长度和一致性校验', async () => {
-    wrapper = mount(AccountView, { props: { session } })
+    wrapper = mount(AccountView, { props: { session, restoreSession: async () => session } })
     await fillPasswords('', 'different-long-password')
     await wrapper.get('form').trigger('submit')
     await vi.waitFor(() => expect(wrapper!.text()).toContain('请输入当前密码'))
@@ -119,7 +119,7 @@ describe('管理员会话与密码', () => {
   it('改密请求期间禁用输入与提交，阻止重复请求', async () => {
     let resolveRequest!: (session: Session) => void
     vi.mocked(api).mockImplementation(() => new Promise<Session>((resolve) => { resolveRequest = resolve }))
-    wrapper = mount(AccountView, { props: { session } })
+    wrapper = mount(AccountView, { props: { session, restoreSession: async () => session } })
     await fillPasswords()
     await wrapper.get('form').trigger('submit')
     await vi.waitFor(() => expect(api).toHaveBeenCalledOnce())

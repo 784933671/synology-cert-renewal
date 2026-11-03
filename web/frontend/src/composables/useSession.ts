@@ -1,5 +1,5 @@
 import { computed, onMounted, onUnmounted, shallowRef } from 'vue'
-import { api, ApiError, errorText, onAuthFailure, setCsrf } from '../lib/api'
+import { api, ApiError, errorText, isAborted, onAuthFailure, setCsrf } from '../lib/api'
 import type { LoginChallenge, Session } from '../types'
 
 type ChallengeResponse = LoginChallenge | { verification_required: false }
@@ -14,6 +14,7 @@ export function useSession() {
     expiresAt = shallowRef(0),
     resendAt = shallowRef(0)
   let timer: ReturnType<typeof setInterval> | undefined
+  let disposed = false, restoring: AbortController | undefined
   const expiresIn = computed(() => Math.max(0, Math.ceil((expiresAt.value - now.value) / 1000)))
   const resendAfter = computed(() => Math.max(0, Math.ceil((resendAt.value - now.value) / 1000)))
   function accept(value: Session | null) {
@@ -50,19 +51,35 @@ export function useSession() {
       error.value = '登录已失效，请重新登录。'
     }
   })
-  async function restore() {
-    if (busy.value) return
+  async function restore(signal?: AbortSignal): Promise<Session | null | undefined> {
+    if (busy.value || disposed || signal?.aborted) return
     busy.value = true
     error.value = ''
+    const controller = new AbortController()
+    restoring = controller
+    const abort = () => controller.abort()
+    signal?.addEventListener('abort', abort, { once: true })
+    const hadSession = !!session.value
     try {
-      accept(await api<Session>('/api/session'))
+      const current = await api<Session>('/api/session', { signal: controller.signal })
+      if (disposed || controller.signal.aborted) return
+      accept(current)
+      return current
     } catch (cause) {
-      if (cause instanceof ApiError && cause.status === 401) await recoverChallenge()
-      else {
+      if (disposed || controller.signal.aborted || isAborted(cause)) return
+      if (cause instanceof ApiError && cause.status === 401) {
+        if (hadSession) {
+          setChallenge({ verification_required: false })
+          error.value = '登录已失效，请重新登录。若密码已更新，请使用新密码。'
+        } else await recoverChallenge()
+        return null
+      } else {
         recoveryRequired.value = true
         error.value = errorText(cause)
       }
     } finally {
+      signal?.removeEventListener('abort', abort)
+      if (restoring === controller) restoring = undefined
       ready.value = true
       busy.value = false
     }
@@ -160,6 +177,8 @@ export function useSession() {
     timer = setInterval(() => { now.value = Date.now() }, 1000)
   })
   onUnmounted(() => {
+    disposed = true
+    restoring?.abort()
     clearInterval(timer)
     onAuthFailure(undefined)
   })

@@ -203,6 +203,8 @@ class WizardTests(unittest.TestCase):
             self.calls.append((args, kwargs))
             with sqlite3.connect(self.db) as conn:
                 if 'init' in args:
+                    self.assertIn('--interactive', args[:args.index('synology-cert-web:local')])
+                    self.assertTrue(kwargs.get('input_text'))
                     conn.executescript('CREATE TABLE IF NOT EXISTS users(username TEXT, email_login_required INTEGER);'
                                        'CREATE TABLE IF NOT EXISTS login_security(username TEXT,email TEXT,policy_version TEXT,enabled INTEGER);')
                     conn.execute('INSERT INTO users VALUES(?,0)', ('admin',))
@@ -235,6 +237,22 @@ class WizardTests(unittest.TestCase):
             self.assertNotIn('unique-test-password', ' '.join(args))
         self.assertEqual(self.calls[0][1]['input_text'], 'unique-test-password\n')
         self.assertNotIn('unique-test-password', (self.native / 'web/login-email.json').read_text())
+
+    def test_password_cli_attaches_container_stdin_without_exposing_password(self):
+        password = 'isolated-cli-test-password'
+        self.wizard.auth_cli(['init', '--username', 'admin', '--password-stdin'], password)
+        args, options = self.calls[0]
+        self.assertIn('--interactive', args[:args.index('synology-cert-web:local')])
+        self.assertEqual(options['input_text'], password + '\n')
+        self.assertFalse(any(password in argument for argument in args))
+        self.assertNotIn('--tty', args)
+
+    def test_mail_configuration_does_not_open_unused_container_stdin(self):
+        self.wizard.auth_cli(['enable-email-login', '--username', 'admin', '--email', OPTIONS['email'],
+                              '--policy-version', 'a' * 32])
+        args, options = self.calls[0]
+        self.assertNotIn('--interactive', args)
+        self.assertIsNone(options['input_text'])
 
     def test_existing_different_mail_policy_is_not_overwritten(self):
         self.credentials_fixture()

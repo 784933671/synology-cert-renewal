@@ -55,6 +55,7 @@ class AcmeIntegrationTests(unittest.TestCase):
 
     def damaged_pending(self):
         self.fixture.prepare_candidate('new')
+        self.fixture.record_owned_candidate()
         conf = self.controller.candidate_dir() / 'ttxli.cn.conf'
         with conf.open('a') as handle:
             handle.write("Le_NextRenewTime='{}'\nLe_NextRenewTimeStr='future'\n"

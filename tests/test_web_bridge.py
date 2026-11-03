@@ -233,6 +233,35 @@ class BridgeTests(unittest.TestCase):
         self.assertEqual(self.read_config()['certificate_description'], 'Other certificate')
         self.assertEqual(executor.read_json(self.home / 'state/success-notification.json')['certificate_id'], 'DEF456')
 
+    def test_description_redaction_does_not_change_persisted_certificate_identity(self):
+        description = 'nas-production-letsencrypt-wildcard-certificate'
+        original = self.read_config()
+        original['certificate_description'] = description
+        executor.save_json(self.home / 'config.json', original)
+        info = executor.read_json(self.archive / 'INFO')
+        info['ABC123']['desc'] = description
+        executor.save_json(self.archive / 'INFO', info)
+        params = self.params()
+        params['renew_before_days'] = 3
+        response = self.request('settings.update', params)
+        self.assertTrue(response['ok'], response)
+        self.assertEqual(self.read_config()['certificate_description'], description)
+        self.assertEqual(self.read_config()['renew_before_days'], 3)
+        self.assertNotIn(description, json.dumps(response))
+        self.assertEqual(response['data']['description'], '[REDACTED]')
+
+    def test_switch_target_uses_raw_description_and_keeps_credentials_out_of_response(self):
+        description = '备用证书 ' + config()['secret_key']
+        info = executor.read_json(self.archive / 'INFO')
+        info['DEF456']['desc'] = description
+        executor.save_json(self.archive / 'INFO', info)
+        params = self.params()
+        params['certificate_id'] = 'DEF456'
+        response = self.request('settings.update', params)
+        self.assertTrue(response['ok'], response)
+        self.assertEqual(self.read_config()['certificate_description'], description)
+        self.assertNotIn(config()['secret_key'], json.dumps(response))
+
     def test_management_host_blocks_uncovered_target_before_task_pause(self):
         self.bridge.management_host = 'ttxli.cn'
         with mock.patch.object(executor, 'certificate_domains', side_effect=lambda path:
@@ -323,6 +352,134 @@ class BridgeTests(unittest.TestCase):
         self.assertEqual(self.read_config(), altered)
         self.assertEqual(len(self.scheduler.writes), writes)
         self.assertTrue(self.bridge.transaction.exists())
+
+    def assert_external_task_changes_preserved(self, original):
+        changes = [
+            lambda task: task.update(enable=not original['enable']),
+            lambda task: task['schedule'].update(minute=42),
+            lambda task: task['extra'].update(notify_mail='changed@example.com'),
+            lambda task: task['extra'].update(notify_enable=False),
+            lambda task: task['extra'].update(script='/bin/sh /different/task.sh'),
+            lambda task: task.update(name='DSM 用户重新命名', real_owner='other-admin'),
+        ]
+        state = {path: path.read_bytes() for path in (
+            self.bridge.transaction, self.home / 'config.json', self.home / 'state/success-notification.json')}
+        writes = len(self.scheduler.writes)
+        for index, change in enumerate(changes):
+            with self.subTest(change=index):
+                self.scheduler.task = copy.deepcopy(original)
+                change(self.scheduler.task)
+                expected = self.scheduler.get()
+                with self.assertRaises(bridge_module.BridgeError):
+                    self.bridge.recover()
+                self.assertEqual(self.scheduler.task, expected)
+                self.assertEqual(len(self.scheduler.writes), writes)
+                self.assertEqual({path: path.read_bytes() for path in state}, state)
+
+    def test_committed_recovery_refuses_external_task_changes_after_confirmed_apply(self):
+        self.interrupted_committed_update()
+        self.assert_external_task_changes_preserved(self.scheduler.get())
+
+    def test_prepared_recovery_refuses_external_task_changes_after_confirmed_pause(self):
+        self.bridge.snapshot(self.bridge.controller(), self.scheduler.get())
+        paused = self.scheduler.get()
+        paused['enable'] = False
+        self.bridge.write_task(paused)
+        self.assert_external_task_changes_preserved(self.scheduler.get())
+
+    def test_failed_preflight_does_not_roll_back_external_task_changes(self):
+        params = self.params()
+        before_config = (self.home / 'config.json').read_bytes()
+        def changed_then_failed():
+            self.scheduler.task['schedule']['minute'] = 42
+            self.scheduler.task['extra']['notify_mail'] = 'changed@example.com'
+            raise executor.Failure('preflight failed')
+        self.preflight.side_effect = changed_then_failed
+        response = self.request('settings.update', params)
+        self.assertFalse(response['ok'])
+        self.assertTrue(self.bridge.transaction.exists())
+        self.assertEqual(self.scheduler.task['schedule']['minute'], 42)
+        self.assertEqual(self.scheduler.task['extra']['notify_mail'], 'changed@example.com')
+        self.assertEqual(len(self.scheduler.writes), 1)
+        self.assertEqual((self.home / 'config.json').read_bytes(), before_config)
+
+    def test_task_change_during_preflight_is_detected_before_native_config_write(self):
+        params = self.params()
+        params['renew_before_days'] = 8
+        self.preflight.side_effect = lambda: self.scheduler.task['schedule'].update(minute=42)
+        response = self.request('settings.update', params)
+        self.assertFalse(response['ok'])
+        self.assertEqual(self.read_config(), config())
+        self.assertEqual(self.scheduler.task['schedule']['minute'], 42)
+        self.assertEqual(len(self.scheduler.writes), 1)
+        self.assertTrue(self.bridge.transaction.exists())
+
+    def test_lost_pause_response_recovers_without_overwriting_task_configuration(self):
+        before = self.scheduler.get()
+        original_put = self.scheduler.put
+        def applied_then_crashed(task):
+            original_put(task)
+            raise SystemExit('lost pause response')
+        with mock.patch.object(self.scheduler, 'put', side_effect=applied_then_crashed):
+            with self.assertRaises(SystemExit):
+                self.bridge.settings_update(self.params())
+        self.assertFalse(self.scheduler.task['enable'])
+        self.assertIn('task_pending', executor.read_json(self.bridge.transaction))
+        self.bridge.recover()
+        self.assertEqual(self.scheduler.task, before)
+        self.assertFalse(self.bridge.transaction.exists())
+
+    def test_lost_apply_response_followed_by_external_disable_is_not_reenabled(self):
+        params = self.params()
+        self.scheduler.fail_write = lambda count: (_ for _ in ()).throw(OSError('lost apply response')) if count == 2 else None
+        self.assertFalse(self.request('settings.update', params)['ok'])
+        self.scheduler.fail_write = None
+        self.scheduler.task['enable'] = False
+        before = self.scheduler.get()
+        journal = self.bridge.transaction.read_bytes()
+        writes = len(self.scheduler.writes)
+        with self.assertRaises(bridge_module.BridgeError):
+            self.bridge.recover()
+        self.assertEqual(self.scheduler.task, before)
+        self.assertEqual(len(self.scheduler.writes), writes)
+        self.assertEqual(self.bridge.transaction.read_bytes(), journal)
+
+    def test_prepared_recovery_after_completed_rollback_preserves_external_disable(self):
+        self.preflight.side_effect = executor.Failure('rollback requested')
+        real_unlink = Path.unlink
+        def interrupt(path, *args, **kwargs):
+            if path == self.bridge.transaction:
+                raise SystemExit('crash after rollback')
+            return real_unlink(path, *args, **kwargs)
+        with mock.patch.object(Path, 'unlink', new=interrupt), self.assertRaises(SystemExit):
+            self.bridge.settings_update(self.params())
+        self.assertTrue(self.scheduler.task['enable'])
+        self.scheduler.task['enable'] = False
+        writes = len(self.scheduler.writes)
+        with self.assertRaises(bridge_module.BridgeError):
+            self.bridge.recover()
+        self.assertFalse(self.scheduler.task['enable'])
+        self.assertEqual(len(self.scheduler.writes), writes)
+        self.assertTrue(self.bridge.transaction.exists())
+
+    def test_legacy_committed_journal_never_reenables_externally_disabled_task(self):
+        self.interrupted_committed_update()
+        journal = executor.read_json(self.bridge.transaction)
+        journal.pop('task_expected')
+        executor.save_json(self.bridge.transaction, journal)
+        self.scheduler.task['enable'] = False
+        writes = len(self.scheduler.writes)
+        with self.assertRaises(bridge_module.BridgeError):
+            self.bridge.recover()
+        self.assertFalse(self.scheduler.task['enable'])
+        self.assertEqual(len(self.scheduler.writes), writes)
+        self.assertTrue(self.bridge.transaction.exists())
+
+    def test_real_owner_default_normalization_does_not_create_false_conflict(self):
+        self.interrupted_committed_update()
+        self.scheduler.task['real_owner'] = 'root'
+        self.bridge.recover()
+        self.assertFalse(self.bridge.transaction.exists())
 
     def test_atomic_commit_write_reported_failure_still_finishes_forward(self):
         params = self.params()

@@ -724,6 +724,95 @@ class Controller:
     def candidate(self):
         return self.candidate_dir() / (self.config['domains'][0] + '.cer')
 
+    def candidate_identity(self):
+        if not self.candidate().exists():
+            return None
+        try:
+            return fingerprint(self.candidate())
+        except Failure:
+            return 'unreadable'
+
+    def save_run_baseline(self, value):
+        save_json(self.state / 'run-baseline.json', value)
+        descriptor = os.open(str(self.state), os.O_RDONLY)
+        try:
+            os.fsync(descriptor)
+        finally:
+            os.close(descriptor)
+
+    def run_baseline(self, before):
+        path = self.state / 'run-baseline.json'
+        current, candidate = fingerprint(self.current_cert()), self.candidate_identity()
+        previous = None
+        if path.exists():
+            private(path)
+            previous = read_json(path)
+            if (not isinstance(previous, dict) or previous.get('certificate_id') != self.config['certificate_id']
+                    or self.target_bindings(previous.get('bindings')) != self.target_bindings(before)):
+                raise Failure('前次操作后服务绑定发生变化，请先按备份核查恢复，或确认当前绑定后重新 configure。')
+        valid_fingerprint = lambda value: isinstance(value, str) and re.fullmatch(r'[0-9a-f]{64}', value)
+        if previous is not None and 'provenance_version' in previous:
+            if (previous.get('provenance_version') != 1
+                    or not valid_fingerprint(previous.get('certificate_fingerprint'))
+                    or previous.get('candidate_before') not in (None, 'unreadable')
+                       and not valid_fingerprint(previous.get('candidate_before'))
+                    or type(previous.get('issuance_started')) is not bool
+                    or previous.get('issued_fingerprint') is not None
+                       and not valid_fingerprint(previous.get('issued_fingerprint'))):
+                raise Failure('证书签发来源记录无效，保留候选材料，请核查 state/run-baseline.json。')
+            baseline = previous
+        else:
+            baseline = {'certificate_id': self.config['certificate_id'], 'bindings': before,
+                        'provenance_version': 1, 'certificate_fingerprint': current,
+                        'candidate_before': candidate, 'issuance_started': False,
+                        'issued_fingerprint': None}
+            if previous and 'manual_request_id' in previous:
+                baseline['manual_request_id'] = previous['manual_request_id']
+            if valid_fingerprint(candidate) and candidate != current:
+                pending_path, result_path = self.state / 'pending.json', self.state / 'last-result.json'
+                pending, result = {}, {}
+                for state_path, value in ((pending_path, pending), (result_path, result)):
+                    if state_path.exists():
+                        private(state_path)
+                        loaded = read_json(state_path)
+                        if isinstance(loaded, dict):
+                            value.update(loaded)
+                recorded = pending.get('baseline_fingerprint')
+                if recorded is None and result.get('success') is True:
+                    recorded = result.get('fingerprint')
+                if pending.get('fingerprint') != candidate or recorded != current:
+                    raise Failure('当前群晖证书与历史候选不同，且缺少可核实的签发来源；拒绝用旧候选覆盖，请核对外部换证及待部署记录。')
+                baseline.update(candidate_before=current, issuance_started=True, issued_fingerprint=candidate)
+        owned = (valid_fingerprint(candidate) and baseline['issuance_started']
+                 and candidate != baseline['candidate_before']
+                 and baseline['issued_fingerprint'] in (None, candidate))
+        if current != baseline['certificate_fingerprint']:
+            if not (owned and current == candidate):
+                raise Failure('签发开始后群晖证书被外部替换，停止自动覆盖；请核查当前证书和运行基线。')
+            # 先固化已确认导入的自家候选，随后隔离坏私钥时仍能证明当前证书归属。
+            baseline = dict(baseline, certificate_fingerprint=current, issued_fingerprint=candidate)
+        if valid_fingerprint(candidate) and candidate != current and not owned:
+            raise Failure('候选证书不是本次已记录签发的结果，拒绝覆盖当前群晖证书。')
+        return baseline
+
+    def record_issuance(self, before, completed=False):
+        # 调用 CA 前保存意图；响应丢失后只能恢复基于该基线生成的材料。
+        baseline = self.run_baseline(before)
+        if completed:
+            candidate = self.candidate_identity()
+            baseline['issued_fingerprint'] = candidate if candidate not in (None, 'unreadable') else None
+        else:
+            baseline.update(issuance_started=True, issued_fingerprint=None,
+                            certificate_fingerprint=fingerprint(self.current_cert()),
+                            candidate_before=self.candidate_identity())
+        self.save_run_baseline(baseline)
+
+    def save_pending(self, expected, before):
+        baseline = self.run_baseline(before)
+        self.save_run_baseline(baseline)
+        save_json(self.state / 'pending.json', {'fingerprint': expected, 'at': now(),
+                                              'baseline_fingerprint': baseline['certificate_fingerprint']})
+
     def renewal_time(self):
         days = self.config.get('renew_before_days')
         return certificate_expiry(self.candidate()) - days * 86400 if days is not None else None
@@ -749,7 +838,10 @@ class Controller:
         ca = self.candidate_dir() / 'ca.cer'
         if pem_chain(chain) != pem_chain(cert) + pem_chain(ca):
             raise Failure('新证书链不完整，拒绝部署。')
-        capture(['openssl', 'verify', '-partial_chain', '-trusted', str(ca), str(cert)])
+        names = sorted({probe['server_name'] for probe in self.config['probes']})
+        for name in names:
+            capture(['openssl', 'verify', '-purpose', 'sslserver', '-verify_hostname', name,
+                     '-untrusted', str(ca), str(cert)])
 
     def backup(self, info):
         signature = fingerprint(self.current_cert()) + hashlib.sha256(
@@ -1049,6 +1141,7 @@ class Controller:
             save_json(self.marker, {'at': now(), 'pid': os.getpid(),
                                     'deployment_method': 'local_api', 'operation': 'import'})
             try:
+                self.run_baseline(before)
                 data = self.call_local_api('SYNO.Core.Certificate', 'import', params, timeout=120)
                 if 'id' in data and data['id'] != self.config['certificate_id']:
                     raise Failure('DSM 导入返回了不同的证书 ID，请核对备份及服务绑定。')
@@ -1171,7 +1264,7 @@ class Controller:
             raise Failure('导入前目标证书绑定已改变，停止导入证书。')
         before = current
         expected = fingerprint(self.candidate())
-        save_json(self.state / 'pending.json', {'fingerprint': expected, 'at': now()})
+        self.save_pending(expected, before)
         import_bindings = self.state / 'import-bindings.json'
         save_json(import_bindings, before)
         if self.deployment_method() == 'local_api':
@@ -1250,17 +1343,12 @@ class Controller:
                 raise Failure('前次导入后服务绑定发生变化，请先按备份核查恢复。')
             import_bindings.unlink()
         baseline = self.state / 'run-baseline.json'
-        if baseline.exists():
-            previous = read_json(baseline)
-            if (previous.get('certificate_id') != self.config['certificate_id']
-                    or self.target_bindings(previous.get('bindings')) != self.target_bindings(before)):
-                raise Failure('前次操作后服务绑定发生变化，请先按备份核查恢复，或确认当前绑定后重新 configure。')
+        baseline_data = self.run_baseline(before)
         self.failure_stage = 'backup'
         self.backup(info)
-        baseline_data = {'certificate_id': self.config['certificate_id'], 'bindings': before}
         if force or recovery:
             baseline_data['manual_request_id'] = (force or recovery)['request_id']
-        save_json(baseline, baseline_data)
+        self.save_run_baseline(baseline_data)
         self.failure_stage = 'preflight'
         pending = self.state / 'pending.json'
         primary = self.config['domains'][0]
@@ -1313,12 +1401,14 @@ class Controller:
             self.failure_stage = 'acme'
             if force:
                 self.consume_manual_renewal(force)
+            self.record_issuance(before)
             result = self.invoke_acme(args)
+            self.record_issuance(before, completed=True)
             if force:
                 force['issuance_result'] = result
                 self.save_manual_renewal(force)
         if self.candidate().exists() and fingerprint(self.candidate()) != fingerprint(self.current_cert()):
-            save_json(pending, {'fingerprint': fingerprint(self.candidate()), 'at': now()})
+            self.save_pending(fingerprint(self.candidate()), before)
         if result not in (0, 2):
             self.failure_stage = 'acme'
             raise Failure('签发或续期失败；部署前备份已保留。详见 state/acme-last.log。')
@@ -1347,7 +1437,7 @@ class Controller:
             try:
                 self.verify_probes(expected, attempts=3)
             except Failure:
-                save_json(pending, {'fingerprint': expected, 'at': now()})
+                self.save_pending(expected, before)
                 raise
         baseline.unlink(missing_ok=True)
         self.failure_stage = 'dns_cleanup'

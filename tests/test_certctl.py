@@ -186,6 +186,9 @@ class CertificateTests(unittest.TestCase):
         self.sleep_patch = mock.patch.object(certctl.time, 'sleep')
         self.sleep_patch.start()
         self.addCleanup(self.sleep_patch.stop)
+        trust = mock.patch.dict(os.environ, {'SSL_CERT_FILE': str(self.fixtures / 'ca.pem')})
+        trust.start()
+        self.addCleanup(trust.stop)
 
     def install_current(self, fixture):
         target = self.archive / 'ABC123'
@@ -206,6 +209,16 @@ class CertificateTests(unittest.TestCase):
         (target / 'ttxli.cn.conf').write_text(
             "Le_Domain='ttxli.cn'\nLe_Alt='*.ttxli.cn'\nLe_Webroot='dns_tencent'\n"
             + "Le_API='" + certctl.CA + "'\n")
+
+    def record_owned_candidate(self):
+        current = certctl.fingerprint(self.controller.current_cert())
+        self.controller.save_run_baseline({
+            'certificate_id': self.controller.config['certificate_id'],
+            'bindings': self.controller.binding_state(self.controller.metadata()),
+            'provenance_version': 1, 'certificate_fingerprint': current,
+            'candidate_before': None, 'issuance_started': True,
+            'issued_fingerprint': self.controller.candidate_identity()
+                if self.controller.candidate_identity() not in (None, 'unreadable') else None})
 
     def configure_runtime_mocks(self):
         self.controller.load = mock.Mock()
@@ -312,6 +325,7 @@ class CertificateTests(unittest.TestCase):
 
     def test_deploy_false_success_retains_pending(self):
         self.prepare_candidate()
+        self.record_owned_candidate()
         before = self.controller.binding_state(self.info)
         self.controller.invoke_acme = mock.Mock(return_value=0)
         with self.assertRaises(certctl.Failure):
@@ -321,6 +335,7 @@ class CertificateTests(unittest.TestCase):
 
     def test_deploy_rejects_stale_live_tls(self):
         self.prepare_candidate()
+        self.record_owned_candidate()
         before = self.controller.binding_state(self.info)
         self.controller.invoke_acme = mock.Mock(side_effect=lambda args: (self.install_current('new'), 0)[1])
         self.controller.probe_fingerprint = mock.Mock(return_value=self.old_fingerprint)
@@ -330,6 +345,7 @@ class CertificateTests(unittest.TestCase):
 
     def test_deploy_rejects_changed_service_bindings(self):
         self.prepare_candidate()
+        self.record_owned_candidate()
         before = self.controller.binding_state(self.info)
         def deployment(args):
             self.install_current('new')
@@ -381,6 +397,7 @@ class CertificateTests(unittest.TestCase):
     def test_near_expiry_pending_certificate_is_reissued_before_deployment(self):
         self.configure_runtime_mocks()
         self.prepare_candidate('short')
+        self.record_owned_candidate()
         certctl.save_json(self.controller.state / 'pending.json', {
             'fingerprint': certctl.fingerprint(self.controller.candidate()), 'at': certctl.now()})
         calls = []
@@ -406,6 +423,7 @@ class CertificateTests(unittest.TestCase):
             with self.subTest(filename=filename):
                 self.install_current('old')
                 self.prepare_candidate()
+                self.record_owned_candidate()
                 directory = self.controller.candidate_dir()
                 conf = directory / 'ttxli.cn.conf'
                 with conf.open('a') as handle:
@@ -443,6 +461,7 @@ class CertificateTests(unittest.TestCase):
     def test_failed_recovery_is_rate_limited_and_stops_after_three_attempts(self):
         self.configure_runtime_mocks()
         self.prepare_candidate()
+        self.record_owned_candidate()
         (self.controller.candidate_dir() / 'fullchain.cer').write_text('TRUNCATED')
         pending = self.controller.state / 'pending.json'
         certctl.save_json(pending, {'at': certctl.now()})
@@ -500,6 +519,7 @@ class CertificateTests(unittest.TestCase):
     def test_valid_candidate_clears_interrupted_recovery_before_retrying_deployment(self):
         self.configure_runtime_mocks()
         self.prepare_candidate()
+        self.record_owned_candidate()
         certctl.save_json(self.controller.state / 'pending.json', {'at': certctl.now()})
         recovery = self.controller.state / 'recovery.json'
         certctl.save_json(recovery, {'domains': self.controller.config['domains'],
@@ -515,6 +535,7 @@ class CertificateTests(unittest.TestCase):
     def test_recovery_validates_saved_config_before_quarantine_or_issuance(self):
         self.configure_runtime_mocks()
         self.prepare_candidate()
+        self.record_owned_candidate()
         directory = self.controller.candidate_dir()
         (directory / 'fullchain.cer').write_text('TRUNCATED')
         with (directory / 'ttxli.cn.conf').open('a') as handle:
@@ -530,6 +551,7 @@ class CertificateTests(unittest.TestCase):
     def test_recovered_valid_candidate_retries_deployment_without_another_issuance(self):
         self.configure_runtime_mocks()
         self.prepare_candidate()
+        self.record_owned_candidate()
         (self.controller.candidate_dir() / 'fullchain.cer').write_text('TRUNCATED')
         pending = self.controller.state / 'pending.json'
         certctl.save_json(pending, {'at': certctl.now()})

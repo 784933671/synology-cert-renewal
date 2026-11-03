@@ -227,6 +227,8 @@ class FailureReportingTests(unittest.TestCase):
         self.assertEqual(len(self.archived_reports()), 2)
         self.fixture.install_current('old')
         self.fixture.prepare_candidate('old')
+        # 模拟管理员核对外部证书并重新配置，历史失败归档不应被清除。
+        (self.controller.state / 'run-baseline.json').unlink()
         self.controller.invoke_acme = mock.Mock(side_effect=AssertionError('窗口外不得签发'))
         status, output = self.run_main()
         self.assertEqual(status, 0, output)

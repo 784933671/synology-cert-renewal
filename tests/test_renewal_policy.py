@@ -150,6 +150,7 @@ class RenewalPolicyTests(unittest.TestCase):
 
     def test_pending_fresh_certificate_is_deployed_even_outside_renewal_window(self):
         self.fixture.prepare_candidate('new')
+        self.fixture.record_owned_candidate()
         certctl.save_json(self.controller.state / 'pending.json', {'at': certctl.now()})
         def acme(arguments):
             self.assertEqual(arguments[0], '--deploy')

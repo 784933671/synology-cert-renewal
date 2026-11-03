@@ -187,6 +187,7 @@ class LocalApiTests(unittest.TestCase):
                 self.fixture.install_current('old')
                 (self.fixture.archive / 'DEFAULT').write_text('ABC123' if is_default else 'OTHER')
                 before = self.before()
+                self.fixture.record_owned_candidate()
                 directories = []
 
                 def consume(params):
@@ -214,6 +215,7 @@ class LocalApiTests(unittest.TestCase):
 
     def test_failed_or_wrong_id_import_cleans_temporary_files_and_retains_pending(self):
         self.fixture.prepare_candidate()
+        self.fixture.record_owned_candidate()
         for failure in ('api-error', 'wrong-id'):
             with self.subTest(failure=failure):
                 directories = []
@@ -242,6 +244,7 @@ class LocalApiTests(unittest.TestCase):
                 certctl.save_json(self.fixture.archive / 'INFO', original)
                 (self.fixture.archive / 'DEFAULT').write_text('ABC123')
                 before = self.before()
+                self.fixture.record_owned_candidate()
                 self.controller.probe_fingerprint = mock.Mock(side_effect=lambda probe, **kwargs:
                     self.fixture.old_fingerprint if failure == 'tls'
                     else certctl.fingerprint(self.controller.current_cert()))
@@ -273,6 +276,23 @@ class LocalApiTests(unittest.TestCase):
              self.assertRaises(certctl.Failure):
             self.controller.deploy_and_verify(before)
         calls.assert_not_called()
+
+    def test_external_replacement_during_import_preparation_blocks_native_import(self):
+        self.fixture.prepare_candidate()
+        self.fixture.record_owned_candidate()
+        original = self.target()
+        def target(before):
+            self.fixture.install_current('short')
+            return original
+        with mock.patch.object(self.controller, 'system_check'), \
+             mock.patch.object(self.controller, 'local_api_target', side_effect=target), \
+             mock.patch.object(self.controller, 'call_local_api') as call:
+            with self.assertRaisesRegex(certctl.Failure, '被外部替换'):
+                self.controller.deploy_and_verify(self.before())
+        call.assert_not_called()
+        self.assertEqual(certctl.fingerprint(self.controller.current_cert()),
+                         certctl.fingerprint(self.fixture.fixtures / 'short.pem'))
+        self.assertFalse(self.controller.marker.exists())
 
     def test_native_acme_has_no_admin_environment_or_account_cleanup(self):
         self.fixture.prepare_candidate()

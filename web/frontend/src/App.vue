@@ -50,7 +50,7 @@ const settingsSection = computed(() =>
 )
 function canLeave() {
   if (working.value) {
-    notice.value = '正在保存，请等待操作完成。'
+    notice.value = '当前操作尚未完成，请先确认操作结果。'
     return false
   }
   return (
@@ -143,8 +143,11 @@ onUnmounted(() => {
     <AccountView
       v-else
       :session="session"
+      :restore-session="restore"
+      :session-busy="busy"
       @changed="accept"
       @busy="working = $event"
+      @relogin="logout"
     />
   </AppShell>
   </AConfigProvider>

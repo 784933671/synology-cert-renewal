@@ -1,5 +1,6 @@
 import contextlib
 import importlib.util
+import os
 from pathlib import Path
 import shutil
 import socket
@@ -98,7 +99,8 @@ class TLSVerificationTests(unittest.TestCase):
         root = Path(self.temporary.name)
         self.controller = certctl.Controller(root / 'home', root / 'archive')
         self.controller.config = {'certificate_id': 'ABC', 'certificate_description': 'TLS test',
-                                  'domains': ['audit.example.test'], 'deployment_method': 'local_api'}
+                                  'domains': ['audit.example.test'], 'deployment_method': 'local_api',
+                                  'probes': [{'server_name': 'audit.example.test', 'host': '127.0.0.1', 'port': 443}]}
         self.controller.state.mkdir(parents=True, mode=0o700)
         self.controller.candidate_dir().mkdir(parents=True, mode=0o700)
         (self.controller.archive / 'ABC').mkdir(parents=True, mode=0o700)
@@ -113,6 +115,17 @@ class TLSVerificationTests(unittest.TestCase):
             shutil.copyfile(self.files / source, destination)
         shutil.copyfile(self.files / 'expired.pem', self.controller.archive / 'ABC' / 'cert.pem')
         self.expected = certctl.fingerprint(self.controller.candidate())
+        self.controller.save_run_baseline({'certificate_id': 'ABC', 'bindings': self.controller.binding_state(self.info),
+            'provenance_version': 1, 'certificate_fingerprint': certctl.fingerprint(self.controller.current_cert()),
+            'candidate_before': None, 'issuance_started': True, 'issued_fingerprint': self.expected})
+        trust = mock.patch.dict(os.environ, {'SSL_CERT_FILE': str(self.files / 'root.pem')})
+        trust.start()
+        self.addCleanup(trust.stop)
+        original_private = certctl.private
+        permissions = mock.patch.object(certctl, 'private', side_effect=lambda path, directory=False, uid=0:
+            original_private(path, directory, os.getuid()))
+        permissions.start()
+        self.addCleanup(permissions.stop)
         self.controller.log = mock.Mock()
         self.controller.system_check = mock.Mock()
         self.controller.local_api_target = mock.Mock()
@@ -181,6 +194,34 @@ class TLSVerificationTests(unittest.TestCase):
             self.controller.deploy_and_verify(before)
         self.assertFalse(pending.exists())
         self.assertEqual(self.controller.deploy_local_api.call_count, 2)
+
+    def test_untrusted_candidate_is_rejected_before_import(self):
+        previous = self.controller.current_cert().read_bytes()
+        with tempfile.TemporaryDirectory() as empty_roots, mock.patch.dict(os.environ, {
+                'SSL_CERT_FILE': '/dev/null', 'SSL_CERT_DIR': empty_roots}):
+            with self.assertRaises(certctl.Failure):
+                self.controller.deploy_and_verify(self.controller.binding_state(self.info))
+        self.controller.deploy_local_api.assert_not_called()
+        self.assertEqual(self.controller.current_cert().read_bytes(), previous)
+        self.assertFalse((self.controller.state / 'pending.json').exists())
+
+    def test_candidate_must_cover_every_configured_sni_before_import(self):
+        self.controller.config['probes'].append({'server_name': 'other.example.test', 'host': '127.0.0.1', 'port': 443})
+        with self.assertRaises(certctl.Failure):
+            self.controller.deploy_and_verify(self.controller.binding_state(self.info))
+        self.controller.deploy_local_api.assert_not_called()
+
+    def test_client_only_certificate_is_rejected_before_import(self):
+        extension = self.controller.state / 'client.ext'
+        extension.write_text((self.files / 'leaf.ext').read_text().replace('serverAuth', 'clientAuth'))
+        openssl('x509', '-req', '-in', self.files / 'leaf.csr', '-CA', self.files / 'intermediate.pem',
+                '-CAkey', self.files / 'intermediate.key', '-CAcreateserial', '-days', '90',
+                '-extfile', extension, '-out', self.controller.candidate())
+        (self.controller.candidate_dir() / 'fullchain.cer').write_bytes(
+            self.controller.candidate().read_bytes() + (self.files / 'intermediate.pem').read_bytes())
+        with self.assertRaises(certctl.Failure):
+            self.controller.deploy_and_verify(self.controller.binding_state(self.info))
+        self.controller.deploy_local_api.assert_not_called()
 
 
 if __name__ == '__main__':
