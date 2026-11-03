@@ -1,7 +1,11 @@
 <script setup lang="ts">
-import { shallowRef, watch } from 'vue'
+import { computed, h, shallowRef, watch } from 'vue'
+import { Avatar as AAvatar, Breadcrumb as ABreadcrumb, Button as AButton, Drawer as ADrawer, Layout, Menu as AMenu, type MenuProps } from 'ant-design-vue'
 import AppIcon from './AppIcon.vue'
 import type { Page } from '../types'
+import '../styles/shell.css'
+const { Sider: ALayoutSider, Header: ALayoutHeader, Content: ALayoutContent } = Layout
+const ABreadcrumbItem = ABreadcrumb.Item
 const props = defineProps<{
   page: Page
   username: string
@@ -10,108 +14,84 @@ const props = defineProps<{
 }>()
 const emit = defineEmits<{ navigate: [page: Page]; logout: [] }>()
 const open = shallowRef(false)
-const items: { id: Page; label: string }[] = [
-  { id: 'overview', label: '运行概览' },
-  { id: 'certificate', label: '证书管理' },
-  { id: 'renewal', label: '续期计划' },
-  { id: 'notifications', label: '邮件通知' },
-  { id: 'failures', label: '失败记录' },
-  { id: 'audit', label: '操作审计' },
-  { id: 'security', label: '访问安全' },
+const labels: Record<Page, string> = {
+  overview: '运行概览', certificate: '证书管理', renewal: '续期计划',
+  notifications: '邮件通知', failures: '失败记录', audit: '操作审计',
+  security: '访问安全', account: '账户设置',
+}
+const groups: { key: string; label: string; pages: Page[] }[] = [
+  { key: 'certificate-group', label: '证书与续期', pages: ['overview', 'certificate', 'renewal', 'notifications'] },
+  { key: 'activity-group', label: '运行维护', pages: ['failures', 'audit'] },
+  { key: 'system-group', label: '系统设置', pages: ['security', 'account'] },
 ]
-watch(
-  () => props.page,
-  () => {
-    open.value = false
-  },
-)
+const items = computed<MenuProps['items']>(() => groups.map((group) => ({
+  key: group.key,
+  type: 'group',
+  label: group.label,
+  children: group.pages.map((page) => ({
+    key: page,
+    label: labels[page],
+    icon: () => h(AppIcon, { name: page }),
+    disabled: props.locked && page !== 'account',
+  })),
+})))
+watch(() => props.page, () => { open.value = false })
 function navigate(page: Page) {
+  if (props.locked && page !== 'account') return
   emit('navigate', page)
   open.value = false
 }
+const menuClick: MenuProps['onClick'] = ({ key }) => {
+  if (typeof key === 'string' && key in labels) navigate(key as Page)
+}
 </script>
 <template>
-  <div class="shell" @keydown.esc="open = false">
-    <button
-      v-if="open"
-      class="nav-scrim"
-      aria-label="关闭导航"
-      @click="open = false"
-    />
-    <aside id="main-navigation" :class="['sidebar', { open }]">
-      <div class="brand">
-        <span class="brand-mark"><AppIcon name="shield" /></span>
-        <div>
-          <div class="brand-name">证书管家</div>
-          <span class="brand-subtitle">NAS CERTIFICATE MANAGER</span>
-        </div>
+  <Layout class="cert-shell">
+    <ALayoutSider class="cert-sidebar" theme="light" :width="232">
+      <div class="cert-brand">
+        <span class="cert-brand-mark"><AppIcon name="shield" /></span>
+        <div><strong>证书管家</strong><span>NAS 管理中心</span></div>
       </div>
-      <div class="nav-label">管理中心</div>
-      <nav aria-label="管理导航">
-        <button
-          v-for="item in items"
-          :key="item.id"
-          :class="['nav-item', { active: page === item.id }]"
-          :aria-current="page === item.id ? 'page' : undefined"
-          :disabled="locked"
-          @click="navigate(item.id)"
-        >
-          <AppIcon :name="item.id" />
-          {{ item.label }}
-        </button>
+      <nav aria-label="管理导航" class="cert-navigation">
+        <AMenu mode="inline" :selected-keys="[page]" :items="items" @click="menuClick" />
       </nav>
-      <div class="sidebar-footer">
-        <button
-          :class="['nav-item', { active: page === 'account' }]"
-          @click="navigate('account')"
-        >
-          <AppIcon name="account" />
-          账户设置
-        </button>
-        <div class="device-card">
-          <AppIcon name="server" />
-          <div>
-            群晖证书管理
-            <span>自动检查 · 按需续期</span>
-          </div>
-        </div>
+      <div class="cert-sidebar-status">
+        <AppIcon name="server" />
+        <div><strong>群晖证书管理</strong><span>自动检查 · 按需续期</span></div>
       </div>
-    </aside>
-    <div class="main">
-      <header class="topbar">
-        <button
-          class="icon-button mobile-menu"
+    </ALayoutSider>
+    <Layout class="cert-main-layout">
+      <ALayoutHeader class="cert-header">
+        <AButton
+          class="cert-mobile-menu"
+          type="text"
           aria-label="打开导航"
-          aria-controls="main-navigation"
+          aria-controls="mobile-navigation"
           :aria-expanded="open"
-          @click="open = !open"
-        >
-          <AppIcon name="menu" />
-        </button>
-        <div class="breadcrumb">
-          管理中心
-          <span>/</span>
-          <b>
-            {{ items.find((item) => item.id === page)?.label || '账户设置' }}
-          </b>
+          @click="open = true"
+        ><template #icon><AppIcon name="menu" /></template></AButton>
+        <ABreadcrumb class="cert-breadcrumb">
+          <ABreadcrumbItem>管理中心</ABreadcrumbItem>
+          <ABreadcrumbItem>{{ labels[page] }}</ABreadcrumbItem>
+        </ABreadcrumb>
+        <div class="cert-header-actions">
+          <AButton class="cert-account-trigger" aria-label="账户设置" type="text" @click="navigate('account')">
+            <AAvatar :size="28"><template #icon><AppIcon name="account" /></template></AAvatar>
+            <span class="cert-user-name">{{ username }}</span>
+          </AButton>
+          <AButton type="text" aria-label="退出登录" title="退出登录" :loading="busy" :disabled="busy" @click="emit('logout')">
+            <template #icon><AppIcon name="logout" /></template>
+          </AButton>
         </div>
-        <div class="topbar-actions">
-          <button class="user-button" @click="navigate('account')">
-            <span class="avatar"><AppIcon name="account" /></span>
-            <span class="user-name">{{ username }}</span>
-          </button>
-          <button
-            class="icon-button"
-            aria-label="退出登录"
-            title="退出登录"
-            :disabled="busy"
-            @click="emit('logout')"
-          >
-            <AppIcon name="logout" />
-          </button>
-        </div>
-      </header>
-      <main id="main-content" class="page"><slot /></main>
-    </div>
-  </div>
+      </ALayoutHeader>
+      <ALayoutContent class="cert-content">
+        <div id="main-content" class="cert-page"><slot /></div>
+      </ALayoutContent>
+    </Layout>
+    <ADrawer v-model:open="open" title="证书管家" placement="left" :width="280" root-class-name="cert-mobile-drawer">
+      <nav id="mobile-navigation" aria-label="移动管理导航">
+        <AMenu mode="inline" :selected-keys="[page]" :items="items" @click="menuClick" />
+      </nav>
+    </ADrawer>
+  </Layout>
 </template>

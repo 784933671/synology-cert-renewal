@@ -1,5 +1,7 @@
 <script setup lang="ts">
 import { computed, onMounted, onUnmounted, shallowRef, watch } from 'vue'
+import { ConfigProvider as AConfigProvider, Spin as ASpin } from 'ant-design-vue'
+import zhCN from 'ant-design-vue/es/locale/zh_CN'
 import { useSession } from './composables/useSession'
 import type { Page, SettingsPage } from './types'
 import AppShell from './components/AppShell.vue'
@@ -11,6 +13,14 @@ import FailuresView from './views/FailuresView.vue'
 import AuditView from './views/AuditView.vue'
 import SecurityView from './views/SecurityView.vue'
 import AccountView from './views/AccountView.vue'
+const nonce = document.querySelector<HTMLMetaElement>('meta[name="csp-nonce"]')?.content || ''
+const theme = {
+  token: {
+    colorPrimary: '#1677ff', colorBgLayout: '#f5f7fa', borderRadius: 8,
+    fontSize: 14, controlHeight: 36,
+    fontFamily: '-apple-system, BlinkMacSystemFont, "Segoe UI", "PingFang SC", "Microsoft YaHei", sans-serif',
+  },
+}
 const { session, ready, busy, error, accept, login, logout } = useSession()
 const pages: Page[] = [
   'overview',
@@ -82,10 +92,10 @@ watch(session, (value) => {
   }
 })
 watch(
-  page,
-  (value) => {
+  [page, session],
+  ([value, currentSession]) => {
     window.scrollTo(0, 0)
-    document.title = `${{ overview: '运行概览', certificate: '证书管理', renewal: '续期计划', notifications: '邮件通知', failures: '失败记录', audit: '操作审计', security: '访问安全', account: '账户设置' }[value]} · 证书管家`
+    document.title = currentSession ? `${{ overview: '运行概览', certificate: '证书管理', renewal: '续期计划', notifications: '邮件通知', failures: '失败记录', audit: '操作审计', security: '访问安全', account: '账户设置' }[value]} · 证书管家` : '登录 · 证书管家'
   },
   { immediate: true },
 )
@@ -101,7 +111,8 @@ onUnmounted(() => {
 })
 </script>
 <template>
-  <div v-if="!ready" class="startup" role="status">正在连接证书管理服务…</div>
+  <AConfigProvider :locale="zhCN" :theme="theme" :csp="{ nonce }" :wave="{ disabled: true }" :auto-insert-space-in-button="false">
+  <div v-if="!ready" class="startup" role="status"><ASpin size="large" /><p>正在连接证书管理服务…</p></div>
   <LoginView v-else-if="!session" :busy="busy" :error="error" @login="login" />
   <AppShell
     v-else
@@ -136,4 +147,5 @@ onUnmounted(() => {
       @busy="working = $event"
     />
   </AppShell>
+  </AConfigProvider>
 </template>

@@ -4,6 +4,7 @@ import copy
 import io
 import json
 import os
+import re
 import tempfile
 import unittest
 from dataclasses import replace
@@ -63,7 +64,7 @@ class WebApiTests(unittest.IsolatedAsyncioTestCase):
         self.root = Path(self.tmp.name)
         self.static = self.root / "static"
         (self.static / "assets").mkdir(parents=True)
-        (self.static / "index.html").write_text("<!doctype html><title>证书管家</title>", encoding="utf-8")
+        (self.static / "index.html").write_text('<!doctype html><meta name="csp-nonce" content="__CERTWEB_CSP_NONCE__"><title>证书管家</title>', encoding="utf-8")
         (self.static / "assets" / "app.js").write_text("console.log('fixture')", encoding="utf-8")
         self.now = [1700000000.0]
         self.store = AuthStore(self.root / "data", clock=lambda: self.now[0])
@@ -341,6 +342,55 @@ class WebApiTests(unittest.IsolatedAsyncioTestCase):
         response = await self.client.get("/assets/escape.js")
         self.assertEqual(response.status_code, 404)
         self.assertNotIn("private-fixture-content", response.text)
+
+    async def test_html_csp_nonce_matches_meta_is_unique_and_only_allows_styles(self):
+        nonces = []
+        for path in ("/", "/", "/renewal"):
+            response = await self.client.get(path)
+            self.assertEqual(response.status_code, 200)
+            self.assertEqual(response.headers["content-type"], "text/html; charset=utf-8")
+            match = re.search(r'<meta name="csp-nonce" content="([A-Za-z0-9_-]{43})">', response.text)
+            self.assertIsNotNone(match)
+            nonce = match.group(1)
+            nonces.append(nonce)
+            self.assertNotIn("__CERTWEB_CSP_NONCE__", response.text)
+            expected = SECURITY_HEADERS["Content-Security-Policy"].replace("style-src 'self';", f"style-src 'self' 'nonce-{nonce}';")
+            self.assertEqual(response.headers["Content-Security-Policy"], expected)
+            for name, value in SECURITY_HEADERS.items():
+                if name != "Content-Security-Policy":
+                    self.assertEqual(response.headers[name], value)
+        self.assertEqual(len(set(nonces)), len(nonces))
+
+    async def test_html_head_has_nonce_headers_and_sends_no_body(self):
+        sent_bodies = []
+
+        async def capture_app(scope, receive, send):
+            async def capture(message):
+                if message["type"] == "http.response.body":
+                    sent_bodies.append(message.get("body", b""))
+                await send(message)
+            await self.app(scope, receive, capture)
+
+        get_response = await self.client.get("/")
+        async with self.make_client(app=capture_app) as client:
+            response = await client.head("/")
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.content, b"")
+        self.assertEqual(b"".join(sent_bodies), b"")
+        self.assertEqual(response.headers["content-length"], get_response.headers["content-length"])
+        self.assertEqual(response.headers["content-type"], "text/html; charset=utf-8")
+        self.assertEqual(response.headers["cache-control"], "no-store")
+        self.assertRegex(response.headers["Content-Security-Policy"], r"style-src 'self' 'nonce-[A-Za-z0-9_-]{43}';")
+        self.assertNotEqual(response.headers["Content-Security-Policy"], get_response.headers["Content-Security-Policy"])
+
+    async def test_html_nonce_does_not_change_api_assets_or_error_security_headers(self):
+        await self.client.get("/")
+        for path in ("/assets/app.js", "/healthz", "/api/session", "/missing"):
+            with self.subTest(path=path):
+                response = await self.client.get(path)
+                for name, value in SECURITY_HEADERS.items():
+                    self.assertEqual(response.headers[name], value)
+                self.assertNotIn("nonce-", response.headers["Content-Security-Policy"])
 
     async def test_unknown_endpoints_cannot_map_to_arbitrary_bridge_actions(self):
         headers = await self.ready()

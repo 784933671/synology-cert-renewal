@@ -4,6 +4,7 @@ import asyncio
 import hmac
 import json
 import re
+import secrets
 from pathlib import Path
 from urllib.parse import unquote
 
@@ -11,7 +12,7 @@ from fastapi import FastAPI, Request
 from fastapi.exceptions import RequestValidationError
 from starlette.concurrency import run_in_threadpool
 from starlette.exceptions import HTTPException
-from starlette.responses import FileResponse, JSONResponse
+from starlette.responses import FileResponse, HTMLResponse, JSONResponse
 
 from . import validation
 from .auth import ABSOLUTE_SECONDS, AuthStore, valid_password
@@ -83,7 +84,12 @@ class SecurityBoundary:
                 started = True
                 headers = [(key, value) for key, value in message.get("headers", [])
                            if key.lower() not in {name.lower().encode() for name in SECURITY_HEADERS}]
-                headers.extend((key.lower().encode(), value.encode()) for key, value in SECURITY_HEADERS.items())
+                security_headers = SECURITY_HEADERS.copy()
+                nonce = scope.get("state", {}).get("csp_nonce")
+                if nonce and any(key.lower() == b"content-type" and value.split(b";", 1)[0] == b"text/html" for key, value in headers):
+                    security_headers["Content-Security-Policy"] = security_headers["Content-Security-Policy"].replace(
+                        "style-src 'self';", f"style-src 'self' 'nonce-{nonce}';")
+                headers.extend((key.lower().encode(), value.encode()) for key, value in security_headers.items())
                 message = {**message, "headers": headers}
             await send(message)
 
@@ -364,7 +370,7 @@ def create_app(config=None, store=None, bridge=None):
         return await run_in_threadpool(config.security_snapshot)
 
     @app.api_route("/{path:path}", methods=["GET", "HEAD"])
-    async def static(path: str):
+    async def static(request: Request, path: str):
         if path in SAFE_ROUTES:
             target = config.static_dir / "index.html"
         elif path.startswith("assets/") and Path(path).suffix.lower() in ALLOWED_ASSETS:
@@ -380,6 +386,15 @@ def create_app(config=None, store=None, bridge=None):
             raise ApiError(404, "not_found", "请求的资源不存在") from None
         if not target.is_file():
             raise ApiError(404, "not_found", "请求的页面或资源不存在")
+        if path in SAFE_ROUTES:
+            document = await run_in_threadpool(target.read_text, encoding="utf-8")
+            nonce = secrets.token_urlsafe(32)
+            request.state.csp_nonce = nonce
+            response = HTMLResponse(document.replace("__CERTWEB_CSP_NONCE__", nonce))
+            if request.method == "HEAD":
+                # 保留 GET 对应的内容长度，但 HEAD 不发送实体正文。
+                response.body = b""
+            return response
         return FileResponse(target)
 
     secured = SecurityBoundary(app, config)

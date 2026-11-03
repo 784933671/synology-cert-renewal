@@ -1,0 +1,233 @@
+.settings-page-layout {
+  display: grid;
+  grid-template-columns: minmax(0,1fr) 260px;
+  gap: 20px;
+  align-items: start;
+}
+.settings-form,.settings-section-stack,.settings-card {
+  min-width: 0;
+}
+.settings-section-stack {
+  display: flex;
+  flex-direction: column;
+  gap: 20px;
+}
+.settings-card .ant-card-head-title {
+  font-size: 16px;
+  font-weight: 600;
+}
+.settings-card .ant-card-body {
+  padding: 24px;
+}
+.settings-card .ant-form-item:last-child {
+  margin-bottom: 0;
+}
+.settings-form-grid {
+  display: grid;
+  grid-template-columns: repeat(2,minmax(0,1fr));
+  gap: 0 20px;
+}
+.settings-full-width {
+  grid-column: 1/-1;
+}
+.settings-form .ant-input-number,.settings-form .ant-input-number-group-wrapper {
+  width: 100%;
+}
+.settings-help {
+  margin: 4px 0 0;
+  color: #667085;
+  font-size: 13px;
+  line-height: 1.7;
+}
+.settings-field-label {
+  display: block;
+  margin-bottom: 8px;
+  color: #1f2937;
+  font-size: 14px;
+  font-weight: 500;
+}
+.settings-intro {
+  margin: 0 0 20px;
+}
+.settings-domain-field {
+  margin-bottom: 24px;
+}
+.settings-tags {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+.settings-tags .ant-tag {
+  margin: 0;
+  white-space: normal;
+  overflow-wrap: anywhere;
+}
+.settings-toggle-row {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  gap: 24px;
+}
+.settings-toggle-row .settings-field-label {
+  margin-bottom: 3px;
+}
+.settings-toggle-row .ant-switch {
+  flex-shrink: 0;
+}
+.settings-probe-row {
+  margin-top: 16px;
+  padding: 16px;
+  background: #fafbfc;
+  border: 1px solid #e9edf2;
+  border-radius: 8px;
+}
+.settings-probe-heading {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  margin-bottom: 14px;
+}
+.settings-probe-heading h3 {
+  margin: 0;
+  font-size: 14px;
+  font-weight: 600;
+  color: #344054;
+}
+.settings-probe-grid {
+  display: grid;
+  grid-template-columns: minmax(0,1fr) 104px minmax(0,1fr);
+  gap: 16px;
+}
+.settings-probe-grid .ant-form-item {
+  margin: 0;
+}
+.settings-save-bar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 16px;
+  margin-top: 20px;
+  padding: 16px 20px;
+  background: #fff;
+  border: 1px solid #e5e7eb;
+  border-radius: 8px;
+}
+.settings-save-bar-inline {
+  padding: 20px 0 0;
+  border: 0;
+  border-top: 1px solid #f0f0f0;
+  border-radius: 0;
+}
+.settings-save-note {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 6px;
+  color: #667085;
+  font-size: 13px;
+}
+.settings-action-buttons {
+  display: flex;
+  gap: 12px;
+  flex-shrink: 0;
+}
+.settings-side-note p {
+  margin: 0 0 16px;
+  color: #667085;
+  font-size: 13px;
+  line-height: 1.8;
+}
+.settings-side-note p:last-child {
+  margin-bottom: 0;
+}
+.settings-loading {
+  padding: 56px 20px;
+  text-align: center;
+  color: #667085;
+}
+.settings-loading p {
+  margin: 16px 0 0;
+}
+.settings-empty-card .ant-empty {
+  padding: 32px 0;
+}
+.settings-access-options {
+  display: grid;
+  grid-template-columns: repeat(2,minmax(0,1fr));
+  gap: 16px;
+  width: 100%;
+}
+.settings-access-option.ant-radio-wrapper {
+  align-items: flex-start;
+  margin: 0;
+  padding: 18px;
+  border: 1px solid #d9d9d9;
+  border-radius: 8px;
+  white-space: normal;
+}
+.settings-access-option.ant-radio-wrapper-checked {
+  background: #f0f7ff;
+  border-color: #1677ff;
+}
+.settings-access-option .ant-radio {
+  margin-top: 3px;
+}
+.settings-access-option-title {
+  display: block;
+  font-weight: 600;
+  line-height: 1.5;
+}
+.settings-access-option .settings-help {
+  display: block;
+}
+.settings-session-note {
+  margin-top: 12px;
+}
+.access-policy-status .ant-descriptions-item-label {
+  min-width: 140px;
+  color: #667085;
+}
+@media(max-width:1100px) {
+  .settings-page-layout {
+    grid-template-columns: minmax(0,1fr);
+  }
+  .settings-side-note {
+    order: -1;
+  }
+}
+@media(max-width:640px) {
+  .settings-card .ant-card-body {
+    padding: 16px;
+  }
+  .settings-card .ant-card-head {
+    padding: 0 16px;
+  }
+  .settings-form-grid,.settings-probe-grid,.settings-access-options {
+    grid-template-columns: minmax(0,1fr);
+  }
+  .settings-probe-grid .ant-form-item {
+    margin-bottom: 0;
+  }
+  .settings-save-bar {
+    align-items: stretch;
+    flex-direction: column;
+    padding: 16px;
+  }
+  .settings-save-bar-inline {
+    padding: 16px 0 0;
+  }
+  .settings-action-buttons {
+    justify-content: flex-end;
+    flex-wrap: wrap;
+  }
+  .settings-toggle-row {
+    gap: 16px;
+  }
+  .settings-probe-row {
+    padding: 12px;
+  }
+  .settings-section-stack {
+    gap: 16px;
+  }
+}

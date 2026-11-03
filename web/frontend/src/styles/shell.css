@@ -1,0 +1,62 @@
+.cert-shell.ant-layout { min-height: 100vh; }
+.cert-sidebar.ant-layout-sider { position: fixed; inset: 0 auto 0 0; z-index: 20; border-right: 1px solid #f0f0f0; background: #fff; }
+.cert-sidebar .ant-layout-sider-children { display: flex; flex-direction: column; }
+.cert-brand { display: flex; align-items: center; gap: 12px; min-height: 80px; padding: 16px 24px; }
+.cert-brand-mark { display: inline-flex; align-items: center; justify-content: center; flex: 0 0 36px; width: 36px; height: 36px; border-radius: 9px; color: #fff; background: #1677ff; }
+.cert-brand-mark .icon { width: 23px; height: 23px; font-size: 23px; }
+.cert-brand strong { display: block; color: #172b4d; font-size: 18px; font-weight: 600; letter-spacing: .5px; }
+.cert-brand > div > span { display: block; margin-top: 3px; color: #8c8c8c; font-size: 11px; }
+.cert-navigation { flex: 1; min-height: 0; overflow: auto; padding: 0 12px 20px; }
+.cert-navigation .ant-menu-inline, .cert-mobile-drawer .ant-menu-inline { border-inline-end: 0; }
+.cert-navigation .ant-menu-item-group-title { margin-top: 16px; padding-left: 16px; font-size: 12px; color: #8c8c8c; }
+.cert-navigation .ant-menu-item, .cert-mobile-drawer .ant-menu-item { margin-block: 4px; }
+.cert-sidebar-status { display: flex; align-items: center; gap: 10px; margin: 0 20px 24px; padding-top: 20px; border-top: 1px solid #f0f0f0; color: #8c8c8c; }
+.cert-sidebar-status strong { display: block; color: #595959; font-size: 12px; font-weight: 500; }
+.cert-sidebar-status > div > span { display: block; margin-top: 3px; font-size: 11px; }
+.cert-main-layout.ant-layout { min-width: 0; margin-left: 232px; }
+.cert-header.ant-layout-header { position: sticky; top: 0; z-index: 15; display: flex; align-items: center; gap: 16px; height: 64px; padding: 0 24px; background: #fff; border-bottom: 1px solid #f0f0f0; line-height: normal; }
+.cert-breadcrumb { flex: 1; min-width: 0; }
+.cert-header-actions { display: flex; align-items: center; gap: 8px; margin-left: auto; }
+.cert-account-trigger.ant-btn { display: inline-flex; align-items: center; gap: 8px; height: 38px; padding-inline: 8px; }
+.cert-account-trigger .ant-avatar { color: #1677ff; background: #e6f4ff; }
+.cert-user-name { color: #434343; font-weight: 500; }
+.cert-mobile-menu.ant-btn { display: none; }
+.cert-content.ant-layout-content { min-width: 0; background: #f5f7fa; }
+.cert-page { width: 100%; max-width: 1488px; min-width: 0; margin: 0 auto; padding: 24px; }
+.cert-mobile-drawer .ant-drawer-body { padding: 12px; }
+.cert-login-page { display: flex; min-height: 100vh; flex-direction: column; align-items: center; justify-content: center; gap: 24px; padding: 40px 20px; background: #f5f7fa; }
+.cert-login-brand { display: flex; align-items: center; gap: 12px; color: #172b4d; }
+.cert-login-brand strong { font-size: 22px; font-weight: 600; letter-spacing: 1px; }
+.cert-login-card.ant-card { width: 440px; max-width: 100%; border: 1px solid #e8edf3; box-shadow: 0 8px 32px rgba(15, 35, 64, .05); }
+.cert-login-card > .ant-card-body { padding: 32px; }
+.cert-login-heading { margin-bottom: 28px; }
+.cert-login-heading h1 { margin: 0 0 8px; color: #1f1f1f; font-size: 24px; font-weight: 600; line-height: 1.4; }
+.cert-login-heading p { margin: 0; color: #8c8c8c; font-size: 14px; }
+.cert-login-card .notice { margin-bottom: 20px; }
+.cert-login-form .ant-input-prefix { margin-right: 10px; color: #8c8c8c; }
+.cert-login-form .ant-form-item { margin-bottom: 22px; }
+.cert-login-security { display: flex; justify-content: center; align-items: center; gap: 6px; margin: 24px 0 0; color: #8c8c8c; font-size: 12px; line-height: 1.6; }
+.cert-login-security .icon { width: 14px; height: 14px; font-size: 14px; }
+.cert-login-footer { margin: 0; color: #8c8c8c; font-size: 12px; }
+.cert-account-card.ant-card { max-width: 760px; }
+.cert-account-form { max-width: 500px; }
+.cert-account-form .ant-form-item { margin-bottom: 24px; }
+.cert-account-actions { padding-top: 4px; }
+@media (max-width: 960px) {
+  .cert-sidebar.ant-layout-sider { display: none; }
+  .cert-main-layout.ant-layout { margin-left: 0; }
+  .cert-mobile-menu.ant-btn { display: inline-flex; align-items: center; justify-content: center; }
+  .cert-header.ant-layout-header { gap: 12px; padding-inline: 16px; }
+  .cert-page { padding: 24px; }
+}
+@media (max-width: 600px) {
+  .cert-header.ant-layout-header { height: 60px; gap: 8px; padding-inline: 12px; }
+  .cert-breadcrumb .ant-breadcrumb-link { font-size: 12px; }
+  .cert-header-actions { gap: 2px; }
+  .cert-user-name { display: none; }
+  .cert-account-trigger.ant-btn { padding-inline: 4px; }
+  .cert-page { padding: 20px 16px; }
+  .cert-login-page { justify-content: flex-start; gap: 24px; padding: 56px 16px 32px; }
+  .cert-login-card > .ant-card-body { padding: 24px; }
+  .cert-login-heading h1 { font-size: 22px; }
+}

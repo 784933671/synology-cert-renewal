@@ -23,7 +23,7 @@ function security(mode: AccessMode = 'lan', pending = false): Security {
   }
 }
 function button(label: string) {
-  return wrapper!.findAll('button').find((item) => item.text() === label)!
+  return wrapper!.findAll('button').find((item) => item.text().replace(/\s/g, '') === label)!
 }
 afterEach(() => {
   wrapper?.unmount()
@@ -39,7 +39,7 @@ describe('访问模式配置', () => {
     vi.mocked(api).mockResolvedValueOnce(security('public'))
     wrapper = mount(SecurityView)
     await flushPromises()
-    expect(wrapper.get<HTMLSelectElement>('#access-mode').element.value).toBe('public')
+    expect(wrapper.get<HTMLInputElement>('input[name="access_mode"]:checked').element.value).toBe('public')
     expect(wrapper.get('.access-policy-status').text()).toContain('允许外网')
     expect(wrapper.get('.access-policy-status').text()).not.toContain('仅内网')
     expect(wrapper.text()).toContain('所有 IPv4 地址')
@@ -56,7 +56,7 @@ describe('访问模式配置', () => {
       .mockResolvedValueOnce(security('public'))
     wrapper = mount(SecurityView)
     await flushPromises()
-    await wrapper.get('#access-mode').setValue('public')
+    await wrapper.get('input[name="access_mode"][value="public"]').setValue()
     expect(wrapper.emitted('dirty')?.at(-1)).toEqual([true])
     await wrapper.get('form').trigger('submit')
     await flushPromises()
@@ -66,13 +66,13 @@ describe('访问模式配置', () => {
     })
     expect(wrapper.text()).toContain('访问模式已保存，正在应用访问规则')
     expect(wrapper.text()).not.toContain('访问模式已保存并应用')
-    expect(wrapper.get('fieldset').attributes('disabled')).toBeDefined()
+    expect(wrapper.get('input[name="access_mode"]').attributes('disabled')).toBeDefined()
     expect(wrapper.emitted('dirty')?.at(-1)).toEqual([false])
     await vi.advanceTimersByTimeAsync(3000)
     await flushPromises()
     expect(wrapper.text()).toContain('访问模式已保存并应用')
     expect(wrapper.get('.access-policy-status').text()).toContain('允许外网')
-    expect(wrapper.get('fieldset').attributes('disabled')).toBeUndefined()
+    expect(wrapper.get('input[name="access_mode"]').attributes('disabled')).toBeUndefined()
     await vi.advanceTimersByTimeAsync(15000)
     expect(api).toHaveBeenCalledTimes(3)
   })
@@ -86,10 +86,10 @@ describe('访问模式配置', () => {
     vi.stubGlobal('confirm', confirm)
     wrapper = mount(SecurityView)
     await flushPromises()
-    await wrapper.get('#access-mode').setValue('public')
+    await wrapper.get('input[name="access_mode"][value="public"]').setValue()
     await wrapper.get('form').trigger('submit')
     await flushPromises()
-    expect(wrapper.get<HTMLSelectElement>('#access-mode').element.value).toBe('public')
+    expect(wrapper.get<HTMLInputElement>('input[name="access_mode"]:checked').element.value).toBe('public')
     expect(wrapper.text()).toContain('当前草稿已保留')
     expect(button('保存访问模式').attributes('disabled')).toBeDefined()
     await wrapper.get('form').trigger('submit')
@@ -109,12 +109,12 @@ describe('访问模式配置', () => {
       .mockRejectedValueOnce(new ApiError('无法连接管理服务', status))
     wrapper = mount(SecurityView)
     await flushPromises()
-    await wrapper.get('#access-mode').setValue('lan')
+    await wrapper.get('input[name="access_mode"][value="lan"]').setValue()
     await wrapper.get('form').trigger('submit')
     await flushPromises()
     expect(wrapper.text()).toContain('保存结果尚未确认')
     expect(wrapper.text()).not.toContain('访问模式已保存')
-    expect(wrapper.get<HTMLSelectElement>('#access-mode').element.value).toBe('lan')
+    expect(wrapper.get<HTMLInputElement>('input[name="access_mode"]:checked').element.value).toBe('lan')
     expect(button('保存访问模式').attributes('disabled')).toBeDefined()
   })
 
@@ -129,7 +129,7 @@ describe('访问模式配置', () => {
     await button('重试').trigger('click')
     await flushPromises()
     expect(wrapper.find('form').exists()).toBe(true)
-    expect(wrapper.get<HTMLSelectElement>('#access-mode').element.value).toBe('public')
+    expect(wrapper.get<HTMLInputElement>('input[name="access_mode"]:checked').element.value).toBe('public')
   })
 
   it('应用中的连接错误保留最近状态，不误报已应用，恢复后继续确认', async () => {
