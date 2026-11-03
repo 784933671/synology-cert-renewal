@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { computed } from 'vue'
+import { computed, shallowRef } from 'vue'
 import {
   Badge,
   Button,
@@ -10,6 +10,7 @@ import {
   DescriptionsItem,
   Divider,
   Empty,
+  Modal,
   Space,
   Spin,
   Statistic,
@@ -21,7 +22,16 @@ import NoticeBar from '../components/NoticeBar.vue'
 import { dateText, remainingText } from '../lib/format'
 import { useStatus } from '../composables/useStatus'
 
-const { status, loading, error, actionError, message, waiting, busy, refresh, execute } = useStatus()
+const { status, loading, error, actionError, message, waiting, busy, manualRunning, pendingRecovery, cooldownActive, renewDisabled, refresh, execute } = useStatus()
+const renewConfirmOpen = shallowRef(false)
+async function confirmRenewal() {
+  if (renewDisabled.value) return
+  renewConfirmOpen.value = false
+  await execute('renew')
+}
+const manualState = computed(() => status.value?.manual_renewal?.state)
+const manualLabel = computed(() => ({ queued: '等待立即换证', running: '正在申请并替换', succeeded: '申请替换成功', failed: '申请替换失败', expired: '申请请求已过期' })[manualState.value || 'queued'])
+const manualColor = computed(() => manualState.value === 'succeeded' ? 'success' : manualState.value === 'failed' || manualState.value === 'expired' ? 'error' : 'processing')
 const pending = computed(() =>
   status.value
     ? [
@@ -40,7 +50,7 @@ const taskLabel = computed(() => status.value?.task.running
   ? '续期任务运行中'
   : status.value?.check.running
     ? '正在检查'
-    : waiting.value ? '等待任务启动' : '空闲')
+    : manualRunning.value ? manualLabel.value : waiting.value ? '等待任务启动' : '空闲')
 const renewalSteps = [
   { title: '检查有效期', description: '按计划检查' },
   { title: 'DNSPod 验证', description: '进入续期窗口' },
@@ -157,6 +167,23 @@ const renewalSteps = [
             {{ busy ? '任务处理中…' : '运行一次续期任务' }}
           </Button>
           <NoticeBar>“立即检查”仅检查状态，不申请或替换证书。运行结果会自动更新。</NoticeBar>
+          <Divider />
+          <h3 class="monitoring-section-title">立即申请并替换</h3>
+          <p class="monitoring-description">无需等待证书到期，立即申请新证书并替换，随后验证服务证书。</p>
+          <Button type="primary" :disabled="renewDisabled" @click="renewConfirmOpen = true">
+            <template #icon><AppIcon name="renewal" /></template>
+            立即申请并替换证书
+          </Button>
+          <p v-if="pendingRecovery" class="monitoring-card-note">存在待完成操作，请先运行一次续期任务完成恢复。</p>
+          <p v-if="cooldownActive" class="monitoring-card-note">立即申请间隔至少一小时，下次可申请时间：{{ dateText(status.manual_renewal?.cooldown_until, status.timezone) }}。</p>
+          <div v-if="status.manual_renewal" class="manual-renewal-result" role="status">
+            <Divider />
+            <h3 class="monitoring-section-title">最近立即申请记录</h3>
+            <Tag :color="manualColor">{{ manualLabel }}</Tag>
+            <p class="monitoring-result-message">{{ status.manual_renewal.message || '正在等待服务器确认执行结果。' }}</p>
+            <p class="monitoring-muted">申请时间：{{ dateText(status.manual_renewal.requested_at, status.timezone) }}</p>
+            <p v-if="status.manual_renewal.completed_at" class="monitoring-muted">完成时间：{{ dateText(status.manual_renewal.completed_at, status.timezone) }}</p>
+          </div>
         </Card>
       </div>
       <Collapse class="certificate-fingerprint" :bordered="false">
@@ -166,5 +193,9 @@ const renewalSteps = [
       </Collapse>
       <footer class="monitoring-footer">状态时间：{{ dateText(status.server_time, status.timezone) }} · {{ status.timezone }}</footer>
     </template>
+    <Modal v-model:open="renewConfirmOpen" title="立即申请并替换证书" ok-text="确认申请并替换" cancel-text="取消" :ok-button-props="{ disabled: renewDisabled }" :destroy-on-close="true" @ok="confirmRenewal">
+      <p>会立即申请、替换并验证证书，CA 有申请频率限制。</p>
+      <p>即使当前证书尚未进入续期窗口，也会申请新证书。两次立即申请至少间隔一小时。</p>
+    </Modal>
   </div>
 </template>

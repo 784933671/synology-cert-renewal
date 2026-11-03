@@ -23,6 +23,7 @@ import subprocess
 import sys
 import tempfile
 import time
+import uuid
 
 DEFAULT_HOME = Path('/usr/local/share/synology-cert-renewal')
 ARCHIVE = Path('/usr/syno/etc/certificate/_archive')
@@ -33,6 +34,11 @@ SYSTEM_PATH = '/usr/syno/sbin:/usr/syno/bin:/usr/local/bin:/usr/bin:/bin:/usr/sb
 RECOVERY_INTERVAL = 24 * 60 * 60
 SHORT_RECOVERY_INTERVAL = 6 * 60 * 60
 RECOVERY_LIMIT = 3
+MANUAL_RENEWAL_TTL = 10 * 60
+MANUAL_RENEWAL_COOLDOWN = 60 * 60
+MANUAL_RENEWAL_STATES = ('queued', 'running', 'succeeded', 'failed', 'expired')
+RENEWAL_PROTECTION_FILES = ('deployment-active.json', 'pending.json', 'run-baseline.json',
+                            'import-bindings.json', 'recovery.json', 'web-transaction.json')
 
 # -I 模式不搜索脚本目录，按固定文件位置加载随安装包交付的诊断模块。
 _diagnostic_spec = importlib.util.spec_from_file_location(
@@ -577,6 +583,147 @@ class Controller:
     def candidate_dir(self):
         return self.acme / self.config['domains'][0]
 
+    def save_manual_renewal(self, request):
+        save_json(self.state / 'manual-renewal.json', request)
+        # 消耗意图必须连同目录项持久化，断电后也不能再次强制签发。
+        descriptor = os.open(str(self.state), os.O_RDONLY)
+        try:
+            os.fsync(descriptor)
+        finally:
+            os.close(descriptor)
+
+    def manual_renewal(self, reconcile=False):
+        path = self.state / 'manual-renewal.json'
+        if not os.path.lexists(path):
+            return None
+        private(path)
+        request = read_json(path)
+        if (not isinstance(request, dict) or request.get('version') != 1
+                or not isinstance(request.get('request_id'), str)
+                or not re.fullmatch(r'[0-9a-f]{32}', request['request_id'])
+                or request.get('state') not in MANUAL_RENEWAL_STATES
+                or not isinstance(request.get('certificate_id'), str)
+                or not isinstance(request.get('domains'), list) or not request['domains']
+                or not all(valid_domain(domain) for domain in request['domains'])
+                or not isinstance(request.get('baseline_fingerprint'), str)
+                or not re.fullmatch(r'[0-9a-f]{64}', request['baseline_fingerprint'])
+                or not isinstance(request.get('baseline_bindings'), dict)
+                or any(type(request.get(key)) is not int for key in
+                       ('requested_at', 'expires_at', 'cooldown_until'))
+                or request['expires_at'] != request['requested_at'] + MANUAL_RENEWAL_TTL
+                or type(request.get('force_consumed')) is not bool
+                or type(request.get('recovery_only')) is not bool
+                or (request['recovery_only'] and (not request['force_consumed']
+                    or type(request.get('resume_normal_at')) is not int))
+                or (request['state'] == 'queued' and request['force_consumed'])
+                or not isinstance(request.get('message'), str)):
+            raise Failure('手动申请状态无效，请核查 state/manual-renewal.json。')
+        # 仅在持有 run.lock 时协调状态；空闲锁证明 running 的原进程已退出。
+        if reconcile and request['state'] == 'queued' and time.time() >= request['expires_at']:
+            request.update(state='expired', completed_at=int(time.time()), message='申请请求已过期，未执行强制签发。')
+            self.save_manual_renewal(request)
+        elif reconcile and request['state'] == 'running':
+            request.update(state='failed', completed_at=int(time.time()),
+                           message='申请任务已中断；已消耗的签发请求不会再次执行，待办仅恢复部署与清理。')
+            self.save_manual_renewal(request)
+        return request
+
+    def assert_manual_idle(self):
+        request = self.manual_renewal(reconcile=True)
+        if request and request['state'] in ('queued', 'running'):
+            raise Busy('手动申请正在排队，请等待原任务完成。')
+        return request
+
+    def release_manual_protection(self):
+        request = self.assert_manual_idle()
+        if not request or not request['recovery_only']:
+            return
+        owned = [self.state / name for name in ('run-baseline.json', 'pending.json')]
+        if request.get('protection_released') and not any(os.path.lexists(path) for path in owned):
+            return
+        if (request['certificate_id'] != self.config['certificate_id']
+                or request['domains'] != self.config['domains']
+                or fingerprint(self.current_cert()) != request['baseline_fingerprint']
+                or self.binding_state(self.metadata()) != request['baseline_bindings']
+                or (self.candidate().exists() and fingerprint(self.candidate()) != request['baseline_fingerprint'])
+                or any(os.path.lexists(self.state / name) for name in RENEWAL_PROTECTION_FILES
+                       if name not in ('run-baseline.json', 'pending.json'))
+                or self.dns_cleanup_count()):
+            raise Failure('手动申请仍有证书、绑定或清理待办，不能解除保护。')
+        notice_path = self.state / 'success-notification.json'
+        if os.path.lexists(notice_path):
+            private(notice_path)
+            notice = read_json(notice_path)
+            if not isinstance(notice, dict) or notice.get('pending') is not None:
+                raise Failure('手动申请仍有通知待办，不能解除保护。')
+        for path in owned:
+            if os.path.lexists(path):
+                private(path)
+                marker = read_json(path)
+                if (not isinstance(marker, dict) or marker.get('manual_request_id') != request['request_id']
+                        or (path.name == 'pending.json' and marker.get('needs_recovery') is not True)
+                        or (path.name == 'run-baseline.json' and
+                            (marker.get('certificate_id') != request['certificate_id']
+                             or marker.get('bindings') != request['baseline_bindings']))):
+                    raise Failure('现有保护不属于本次未取得证书的手动申请，不能解除。')
+        # 仅释放可证明没有签发材料的本请求保护，防重放门控独立保留。
+        for path in owned:
+            path.unlink(missing_ok=True)
+        request['protection_released'] = True
+        self.save_manual_renewal(request)
+
+    def retire_manual_target(self):
+        request = self.manual_renewal()
+        if (request and request['recovery_only'] and request.get('protection_released')
+                and (request['certificate_id'] != self.config['certificate_id']
+                     or request['domains'] != self.config['domains'])):
+            request.update(recovery_only=False, message='原申请已结束，配置已切换至其他证书目标。')
+            self.save_manual_renewal(request)
+
+    def assert_manual_prerequisites(self):
+        if any(os.path.lexists(self.state / name) for name in RENEWAL_PROTECTION_FILES):
+            raise Failure('存在未完成的部署或恢复状态，不能立即申请新证书。')
+        if self.dns_cleanup_count():
+            raise Failure('仍有 DNS 验证记录待清理，不能立即申请新证书。')
+        notice_path = self.state / 'success-notification.json'
+        if os.path.lexists(notice_path):
+            private(notice_path)
+            notice = read_json(notice_path)
+            if not isinstance(notice, dict) or notice.get('pending') is not None:
+                raise Failure('存在待发送通知或通知状态异常，不能立即申请新证书。')
+        if self.candidate().exists() and fingerprint(self.candidate()) != fingerprint(self.current_cert()):
+            raise Failure('已有未部署的候选证书，不能立即申请新证书。')
+
+    def request_manual_renewal(self):
+        previous = self.assert_manual_idle()
+        timestamp = int(time.time())
+        if previous and timestamp < previous['cooldown_until']:
+            raise Busy('上次立即申请仍在一小时冷却期内，请稍后再试。')
+        self.release_manual_protection()
+        self.assert_manual_prerequisites()
+        request = {'version': 1, 'request_id': uuid.uuid4().hex, 'state': 'queued',
+                   'certificate_id': self.config['certificate_id'], 'domains': list(self.config['domains']),
+                   'baseline_fingerprint': fingerprint(self.current_cert()), 'requested_at': timestamp,
+                   'baseline_bindings': self.binding_state(self.metadata()),
+                   'expires_at': timestamp + MANUAL_RENEWAL_TTL,
+                   'cooldown_until': timestamp + MANUAL_RENEWAL_COOLDOWN,
+                   'force_consumed': False, 'recovery_only': False,
+                   'message': '已提交一次性申请，等待原 DSM 任务开始执行。'}
+        self.save_manual_renewal(request)
+        return request
+
+    def consume_manual_renewal(self, request):
+        if request['force_consumed']:
+            return
+        if time.time() >= request['expires_at']:
+            raise Failure('申请请求已过期，尚未调用签发服务。')
+        request.update(force_consumed=True, recovery_only=True,
+                       resume_normal_at=max(request['cooldown_until'],
+                           certificate_expiry(self.current_cert()) - self.config['renew_before_days'] * 86400
+                           if 'renew_before_days' in self.config else request['cooldown_until']),
+                       message='正在申请新证书，本次签发意图已消耗。')
+        self.save_manual_renewal(request)
+
     def candidate(self):
         return self.candidate_dir() / (self.config['domains'][0] + '.cer')
 
@@ -1050,11 +1197,49 @@ class Controller:
         self.log('新证书已部署；所有配置的 HTTPS 端点证书链、域名及指纹校验通过。')
 
     def run(self):
+        self.load()
+        self.retire_manual_target()
+        request = self.manual_renewal(reconcile=True)
+        force = request if request and request['state'] == 'queued' else None
+        recovery = request if request and request['recovery_only'] else None
+        if recovery and time.time() >= request.get('resume_normal_at', float('inf')):
+            # 手动失败不能永久关闭正常到期续期；未来窗口恢复原策略，绝不重放 force。
+            request['recovery_only'] = False
+            self.save_manual_renewal(request)
+            recovery = None
+        try:
+            if force:
+                force.update(state='running', message='正在检查申请条件并申请新证书。')
+                self.save_manual_renewal(force)
+                self.assert_manual_prerequisites()
+            if force or recovery:
+                if (request['certificate_id'] != self.config['certificate_id']
+                        or request['domains'] != self.config['domains']):
+                    raise Failure('手动申请的目标或域名已改变，停止执行。')
+            if force and request['baseline_fingerprint'] != fingerprint(self.current_cert()):
+                raise Failure('提交请求后当前证书已改变，本次不再申请新证书。')
+            self._run(force=force, recovery=recovery)
+        except (Exception, KeyboardInterrupt):
+            if force or recovery:
+                expired = force and not force['force_consumed'] and time.time() >= force['expires_at']
+                request.update(state='expired' if expired else 'failed', completed_at=int(time.time()),
+                               message='申请请求已过期，未执行强制签发。' if expired else
+                               '立即申请或后续验证未完成，请查看失败记录；不会重复执行本次签发请求。')
+                self.save_manual_renewal(request)
+            raise
+        if force or recovery:
+            succeeded = (request.get('issuance_result') != 2
+                         and fingerprint(self.current_cert()) != request['baseline_fingerprint'])
+            request.update(state='succeeded' if succeeded else 'failed', completed_at=int(time.time()),
+                           recovery_only=False, message='新证书已替换，HTTPS 验证、DNS 清理及通知均已完成。' if succeeded
+                           else '本次签发未确认成功，已完成现有证书验证与清理，未再次申请。')
+            self.save_manual_renewal(request)
+
+    def _run(self, force=None, recovery=None):
         self.cleanup_diagnostics()
         self.failure_stage = 'preflight'
         self.diagnostic_logs = {}
         self.acme_evidence, self.acme_events, self.cleanup_events = '', [], []
-        self.load()
         cleanup_ok = self.retry_dns_cleanup()
         self.failure_stage = 'preflight'
         info = self.preflight(check_endpoints=False)
@@ -1075,7 +1260,10 @@ class Controller:
                 raise Failure('前次操作后服务绑定发生变化，请先按备份核查恢复，或确认当前绑定后重新 configure。')
         self.failure_stage = 'backup'
         self.backup(info)
-        save_json(baseline, {'certificate_id': self.config['certificate_id'], 'bindings': before})
+        baseline_data = {'certificate_id': self.config['certificate_id'], 'bindings': before}
+        if force or recovery:
+            baseline_data['manual_request_id'] = (force or recovery)['request_id']
+        save_json(baseline, baseline_data)
         self.failure_stage = 'preflight'
         pending = self.state / 'pending.json'
         primary = self.config['domains'][0]
@@ -1089,18 +1277,27 @@ class Controller:
             try:
                 self.candidate_valid()
             except Failure:
-                save_json(pending, {'at': now(), 'needs_recovery': True})
+                recovery_state = {'at': now(), 'needs_recovery': True}
+                if force or recovery:
+                    recovery_state['manual_request_id'] = (force or recovery)['request_id']
+                save_json(pending, recovery_state)
+                if recovery:
+                    raise Failure('手动申请的候选证书无效，已停止；不会通过恢复流程再次签发。')
+                if force:
+                    self.consume_manual_renewal(force)
                 self.failure_stage = 'recovery'
                 self.recover_candidate()
             else:
                 (self.state / 'recovery.json').unlink(missing_ok=True)
-                if pending.exists() and not self.renewal_due():
+                if pending.exists() and (recovery or not self.renewal_due()):
                     self.deploy_and_verify(before)
         else:
             self.failure_stage = 'tls_verify'
             self.verify_probes(fingerprint(self.current_cert()), verify_chain=False)
         if self.candidate().exists():
             args = ['--renew', '-d', primary]
+            if force:
+                args.append('--force')
         else:
             args = ['--issue', '--dns', 'dns_tencent', '--keylength', '2048', '--accountemail', self.config['email']]
             for domain in self.config['domains']:
@@ -1108,24 +1305,38 @@ class Controller:
         if 'renew_before_days' in self.config and self.candidate().exists():
             self.failure_stage = 'preflight'
             self.prepare_acme_config()
-        if 'renew_before_days' in self.config and self.candidate().exists() and not self.renewal_due():
+        if recovery:
+            result = 2
+            self.log('恢复已消耗的手动申请，仅完成现有证书部署与清理，不再次签发。')
+        elif not force and 'renew_before_days' in self.config and self.candidate().exists() and not self.renewal_due():
             # 门控在包装器中执行，历史 ACME 日期或 CA 窗口不能提前触发签发。
             result = 2
             self.log('尚未进入到期前 {} 天的续期窗口，本次不申请证书。'.format(self.config['renew_before_days']))
         else:
             self.failure_stage = 'acme'
+            if force:
+                self.consume_manual_renewal(force)
             result = self.invoke_acme(args)
+            if force:
+                force['issuance_result'] = result
+                self.save_manual_renewal(force)
         if self.candidate().exists() and fingerprint(self.candidate()) != fingerprint(self.current_cert()):
             save_json(pending, {'fingerprint': fingerprint(self.candidate()), 'at': now()})
         if result not in (0, 2):
             self.failure_stage = 'acme'
             raise Failure('签发或续期失败；部署前备份已保留。详见 state/acme-last.log。')
+        if force and (result == 2 or not self.candidate().is_file()
+                      or fingerprint(self.candidate()) == force['baseline_fingerprint']):
+            raise Failure('立即申请未生成不同指纹的新证书，不能将跳过或旧证书当作成功。')
         self.failure_stage = 'certificate_validation'
         if not self.candidate().is_file():
-            save_json(pending, {'at': now(), 'needs_recovery': True})
+            recovery_state = {'at': now(), 'needs_recovery': True}
+            if force or recovery:
+                recovery_state['manual_request_id'] = (force or recovery)['request_id']
+            save_json(pending, recovery_state)
             raise Failure('ACME 未生成预期证书，不能将跳过状态当作签发成功。')
         self.candidate_valid()
-        if self.renewal_due():
+        if not recovery and self.renewal_due():
             raise Failure('已进入续期窗口，但尚未获得有效的新证书；下次任务重试。')
         (self.state / 'recovery.json').unlink(missing_ok=True)
         self.failure_stage = 'dsm_deploy'
@@ -1188,7 +1399,12 @@ def main(argv=None):
     try:
         with controller.locked():
             if args.command == 'configure':
+                controller.assert_manual_idle()
+                if controller.config_file.exists():
+                    controller.load()
+                    controller.release_manual_protection()
                 controller.configure()
+                controller.retire_manual_target()
             elif args.command == 'run':
                 try:
                     controller.run()
@@ -1198,6 +1414,7 @@ def main(argv=None):
                 finally:
                     controller.cleanup_diagnostics()
             elif args.command == 'check':
+                controller.assert_manual_idle()
                 controller.load()
                 controller.preflight()
                 controller.log('预检查通过：系统、唯一证书、域名、服务绑定与接口正常。')

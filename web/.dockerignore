@@ -14,6 +14,8 @@ access
 *.db
 *.db-*
 .bootstrap-test.json
+login-email.json
+login-mail-rate.json
 deployment.env
 deployment.json
 deployment-state.json

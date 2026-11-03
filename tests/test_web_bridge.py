@@ -380,6 +380,118 @@ class BridgeTests(unittest.TestCase):
         self.assertEqual(self.scheduler.writes, [])
         self.preflight.assert_not_called()
 
+    def test_renew_persists_request_and_preserves_original_disabled_schedule(self):
+        self.scheduler.task['enable'] = False
+        before = self.scheduler.get()
+        response = self.request('renew')
+        self.assertTrue(response['ok'], response)
+        state = executor.read_json(self.home / 'state/manual-renewal.json')
+        self.assertEqual(response['data']['request_id'], state['request_id'])
+        self.assertEqual(state['state'], 'queued')
+        self.assertEqual(state['certificate_id'], 'ABC123')
+        self.assertEqual(state['domains'], config()['domains'])
+        self.assertEqual(state['baseline_fingerprint'], 'a' * 64)
+        self.assertEqual(self.scheduler.runs, 1)
+        self.assertEqual(self.scheduler.writes, [])
+        self.assertEqual(self.scheduler.task, before)
+        self.assertFalse(self.request('renew')['ok'])
+        payload = self.request('status')['data']['manual_renewal']
+        self.assertEqual(payload['state'], 'queued')
+        self.assertNotIn('baseline_fingerprint', payload)
+        self.assertNotIn(config()['secret_key'], json.dumps(payload))
+
+    def test_renew_queue_survives_bridge_restart_and_blocks_save_check_and_run(self):
+        params = self.params()
+        self.scheduler.run = mock.Mock(side_effect=executor.Failure('unknown scheduler outcome'))
+        response = self.request('renew')
+        self.assertTrue(response['ok'], response)
+        self.assertIn('无法确认', response['data']['message'])
+        restarted = bridge_module.Bridge(self.home, self.bridge.controller_factory, self.scheduler, uid=os.getuid())
+        for method, values in (('renew', {}), ('run', {}), ('check', {}), ('settings.update', params)):
+            with self.subTest(method=method):
+                result = restarted.dispatch({'method': method, 'params': values})
+                self.assertEqual(result['error']['code'], 'busy')
+        self.scheduler.run.assert_called_once()
+        state = executor.read_json(self.home / 'state/manual-renewal.json')
+        with mock.patch.object(executor.time, 'time', return_value=state['expires_at']):
+            response = restarted.dispatch({'method': 'status', 'params': {}})
+            self.assertEqual(response['data']['manual_renewal']['state'], 'expired')
+            result = restarted.dispatch({'method': 'settings.update', 'params': params})
+            self.assertTrue(result['ok'], result)
+            result = restarted.dispatch({'method': 'renew', 'params': {}})
+            self.assertEqual(result['error']['code'], 'busy')
+
+    def test_renew_refuses_protected_state_and_extra_arguments(self):
+        for name in bridge_module.PROTECTION_FILES:
+            with self.subTest(name=name):
+                path = self.home / 'state' / name
+                executor.save_json(path, {'protected': True})
+                result = self.request('renew')
+                self.assertEqual(result['error']['code'], 'conflict')
+                self.assertFalse((self.home / 'state/manual-renewal.json').exists())
+                path.unlink()
+        for arguments in ({'force': True}, {'task_id': 8}, {'domains': ['attacker.test']}):
+            self.assertEqual(self.request('renew', arguments)['error']['code'], 'invalid_request')
+        self.assertEqual(self.scheduler.runs, 0)
+        self.assertEqual(self.scheduler.writes, [])
+
+    def test_finished_manual_history_does_not_permanently_block_configuration(self):
+        controller = self.bridge.controller()
+        with controller.locked():
+            request = controller.request_manual_renewal()
+            request.update(state='succeeded', force_consumed=True, completed_at=int(time.time()))
+            controller.save_manual_renewal(request)
+        result = self.request('settings.update', self.params())
+        self.assertTrue(result['ok'], result)
+        result = self.request('renew')
+        self.assertEqual(result['error']['code'], 'busy')
+
+    def test_running_manual_state_is_preserved_while_executor_owns_lock(self):
+        controller = self.bridge.controller()
+        with controller.locked():
+            request = controller.request_manual_renewal()
+            request.update(state='running')
+            controller.save_manual_renewal(request)
+            response = self.request('status')
+            self.assertTrue(response['data']['task']['running'])
+            self.assertEqual(response['data']['manual_renewal']['state'], 'running')
+        response = self.request('status')
+        self.assertEqual(response['data']['manual_renewal']['state'], 'failed')
+
+    def test_failed_issuance_allows_safe_credential_repair_during_cooldown(self):
+        controller = self.bridge.controller()
+        with controller.locked():
+            request = controller.request_manual_renewal()
+            request.update(state='failed', force_consumed=True, recovery_only=True,
+                           resume_normal_at=request['cooldown_until'] + 80 * 86400)
+            controller.save_manual_renewal(request)
+            executor.save_json(controller.state / 'run-baseline.json', {
+                'certificate_id': request['certificate_id'], 'bindings': request['baseline_bindings'],
+                'manual_request_id': request['request_id']})
+        params = self.params()
+        params.update(secret_id='REPAIRED_ID', secret_key='REPAIRED_KEY')
+        result = self.request('settings.update', params)
+        self.assertTrue(result['ok'], result)
+        self.assertEqual(self.read_config()['secret_key'], 'REPAIRED_KEY')
+        self.assertTrue(executor.read_json(controller.state / 'manual-renewal.json')['recovery_only'])
+        self.assertFalse((controller.state / 'run-baseline.json').exists())
+        self.assertEqual(self.request('renew')['error']['code'], 'busy')
+
+    def test_pending_new_certificate_cannot_be_released_by_credential_update(self):
+        controller = self.bridge.controller()
+        with controller.locked():
+            request = controller.request_manual_renewal()
+            request.update(state='failed', force_consumed=True, recovery_only=True,
+                           resume_normal_at=request['cooldown_until'] + 80 * 86400)
+            controller.save_manual_renewal(request)
+            executor.save_json(controller.state / 'pending.json', {'fingerprint': 'b' * 64})
+        params = self.params()
+        params.update(secret_id='REPAIRED_ID', secret_key='REPAIRED_KEY')
+        result = self.request('settings.update', params)
+        self.assertEqual(result['error']['code'], 'conflict')
+        self.assertEqual(self.read_config(), config())
+        self.assertEqual(executor.read_json(controller.state / 'pending.json'), {'fingerprint': 'b' * 64})
+
     def test_unknown_schedule_is_read_only(self):
         self.scheduler.task['schedule']['week_day'] = '1,2,3,4,5'
         params = self.params()
@@ -515,6 +627,20 @@ class BridgeTests(unittest.TestCase):
         for method, params in [('exec', {'command': 'id'}), ('run', {'force': True}),
                                ('status', {'path': '/etc/passwd'}), ('failures.get', {'id': 'x', 'path': '/'})]:
             self.assertEqual(self.request(method, params)['error']['code'], 'invalid_request')
+
+    def test_login_mail_rpc_is_independent_of_certificate_lock_and_redacts_errors(self):
+        params = {'code': '123456', 'policy_version': 'a' * 32}
+        controller = self.bridge.controller()
+        with controller.locked(), mock.patch.object(self.bridge.login_mail, 'send', return_value={'accepted': True}) as send:
+            result = self.request('auth.code.send', params)
+            self.assertTrue(result['ok'], result)
+            send.assert_called_once_with(params)
+        with mock.patch.object(self.bridge.login_mail, 'send', side_effect=bridge_module.login_mail.MailError('private failure')):
+            result = self.request('auth.code.send', params)
+        self.assertEqual(result['error']['code'], 'unavailable')
+        self.assertNotIn('private failure', json.dumps(result))
+        self.assertEqual(self.scheduler.runs, 0)
+        self.assertEqual(self.scheduler.writes, [])
 
     def test_security_update_is_versioned_and_does_not_modify_certificate_or_task(self):
         path=self.home/'access/access.json'

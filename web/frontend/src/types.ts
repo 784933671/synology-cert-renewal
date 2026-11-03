@@ -2,6 +2,22 @@ export interface Session {
   username: string
   csrf_token: string
   must_change_password: boolean
+  email_verification_enabled?: boolean
+  login_email_masked?: string
+}
+export interface LoginChallenge {
+  verification_required: true
+  email_masked: string
+  expires_in: number
+  resend_after: number
+}
+export interface ManualRenewal {
+  request_id: string
+  state: 'queued' | 'running' | 'succeeded' | 'failed' | 'expired'
+  message: string
+  requested_at: string
+  completed_at?: string
+  cooldown_until?: string
 }
 export interface Probe {
   host: string
@@ -75,6 +91,7 @@ export interface RunResult {
   failure?: FailureReport
 }
 export interface Status {
+  manual_renewal?: ManualRenewal | null
   certificate: {
     id: string
     description: string

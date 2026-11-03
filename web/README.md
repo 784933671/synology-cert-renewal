@@ -1,6 +1,6 @@
 # 群晖证书管家 Docker 管理层
 
-中文 Vue 3 + Ant Design Vue 4.2.6 页面，采用蓝白侧边导航、卡片、表单、表格与移动端抽屉导航，支持独立管理员登录、证书与 DNS 凭据配置、续期计划、成功/失败通知邮箱、访问模式切换、失败归档、操作审计和密码修改。
+中文 Vue 3 + Ant Design Vue 4.2.6 页面，采用蓝白侧边导航、卡片、表单、表格与移动端抽屉导航，支持管理员密码与邮箱验证码登录、证书与 DNS 凭据配置、续期计划、立即申请新证书、成功/失败通知邮箱、访问模式切换、失败归档、操作审计和密码修改。
 
 ## 运行结构
 
@@ -54,9 +54,15 @@ macOS 的 hosts 文件是 `/etc/hosts`，Windows 为 `C:\Windows\System32\driver
 
 ## 登录与凭据
 
-无固定默认密码。管理员在私有终端初始化；首次登录必须改密。密码仅保存 scrypt 哈希，Cookie 使用 HttpOnly、Secure、SameSite=Strict，闲置 30 分钟或登录 8 小时后失效。后台状态轮询不延长闲置期限。登录失败限流持久化；退出登录、修改或重置密码撤销会话。
+无固定默认密码。管理员在私有终端初始化，并按下文启用邮箱验证；初始化本身不会自动绑定邮箱。启用后，密码正确只进入验证码步骤，不能访问业务接口；输入邮件中的 6 位数字验证码后才签发完整会话。第一次成功验证同时确认邮箱绑定，首次登录仍须改密。登录邮箱由主机管理员配置，账户页只显示脱敏地址；网页不能更换收件人，成功/失败通知邮箱的修改也不会改变登录邮箱。
 
-DNSPod 密钥只允许写入，GET 接口只返回是否已配置。浏览器不持久化密码或密钥。成功通知与失败通知可分别配置开关和邮箱，普通检查不发邮件。
+验证码有效期 5 分钟，单次登录挑战最长 10 分钟且绑定实际来源 IPv4；换网后需重新登录。每次发送至少间隔 60 秒，单个挑战累计输错 5 次即失效，重发不重置错误次数并立即替换旧码。发送额度按账号、来源 IP 和全局持久限流，账号最多每 15 分钟 5 封、每小时 10 封、每天 20 封；失败发送也占用额度，重启、改密和重置密码不会清除发送记录。
+
+发信复用 DSM 已启用的通知邮件配置和本机 `ssmtp`，不复制 SMTP 密码。发信失败或服务端请求取消时，本轮验证码失效，服务不会降级为仅密码登录。页面刷新可恢复未结束的挑战，不自动重发；网络中断或响应无法解析时，先点击“重新确认登录状态”，确认实际会话或挑战后再继续。“返回登录”会撤销当前挑战。
+
+密码仅保存 scrypt 哈希，验证码保存消息认证码，挑战与会话令牌仅保存哈希。密码、验证码和原始请求正文不写入审计或错误响应。Cookie 使用 `__Host-` 前缀、HttpOnly、Secure、SameSite=Strict。完整会话闲置 30 分钟或登录 8 小时后失效，后台状态轮询不延长闲置期限；退出撤销当前会话，改密撤销全部旧会话和挑战并返回新会话，重置密码、启停邮箱验证或更换绑定策略撤销全部会话和挑战。
+
+DNSPod 密钥只允许写入，GET 接口只返回是否已配置。浏览器不持久化密码、验证码或密钥。成功通知与失败通知可分别配置开关和邮箱，预检查不发邮件；原任务会按已有配置处理失败或待发送通知。
 
 管理 HTTPS 使用现有有效、可信且覆盖管理域名的证书；切换管理目标时也必须满足这些要求。新证书部署后，主机复制到私有版本目录，原子切换指针；容器检查证书与私钥匹配后重启 HTTPS worker。原始证书存储不直接挂载。
 
@@ -85,6 +91,58 @@ DNSPod 密钥只允许写入，GET 接口只返回是否已配置。浏览器不
   --env CERTWEB_DATA_DIR=/data \
   --mount type=bind,source=/usr/local/share/synology-cert-web/data,target=/data \
   --entrypoint python synology-cert-web:local -m web.backend init --username admin
+```
+
+### 绑定登录邮箱
+
+首次激活管理层前配置登录邮箱。已有安装更换邮箱或策略时先停止管理层，完成下列主机配置与认证数据库配置后再启动。这里的 `admin@example.com` 是示例，替换为管理员实际接收验证码的邮箱；不要把生成的策略文件加入源码仓库。
+
+在 NAS root 私有终端中执行，邮箱策略保存于**原证书工具目录**的 `web/login-email.json`，不是管理层的 `access` 目录：
+
+```sh
+CERTWEB_LOGIN_EMAIL='admin@example.com'
+CERTWEB_LOGIN_VERSION=$(/usr/bin/python3 -c 'import secrets; print(secrets.token_hex(16))')
+/usr/bin/python3 - "$CERTWEB_LOGIN_EMAIL" "$CERTWEB_LOGIN_VERSION" <<'PY'
+import json
+import os
+from pathlib import Path
+import tempfile
+import sys
+
+root = Path('/usr/local/share/synology-cert-renewal/web')
+info = root.lstat()
+if root.is_symlink() or not root.is_dir() or info.st_uid != 0 or info.st_mode & 0o077:
+    raise SystemExit('请检查原工具 web 目录的 root 属主与 0700 权限')
+descriptor, temporary = tempfile.mkstemp(prefix='.login-email-', dir=str(root))
+try:
+    with os.fdopen(descriptor, 'w') as handle:
+        json.dump({'recipient': sys.argv[1], 'policy_version': sys.argv[2]}, handle)
+        handle.flush()
+        os.fsync(handle.fileno())
+    os.replace(temporary, str(root / 'login-email.json'))
+    directory = os.open(str(root), os.O_RDONLY)
+    try:
+        os.fsync(directory)
+    finally:
+        os.close(directory)
+finally:
+    if os.path.exists(temporary):
+        os.unlink(temporary)
+PY
+/usr/local/bin/docker run --rm --network none --user 10100:10100 \
+  --read-only --cap-drop ALL --security-opt no-new-privileges \
+  --env CERTWEB_DATA_DIR=/data \
+  --mount type=bind,source=/usr/local/share/synology-cert-web/data,target=/data \
+  --entrypoint python synology-cert-web:local -m web.backend enable-email-login \
+  --username admin --email "$CERTWEB_LOGIN_EMAIL" --policy-version "$CERTWEB_LOGIN_VERSION"
+unset CERTWEB_LOGIN_EMAIL CERTWEB_LOGIN_VERSION
+```
+
+主机文件须为 root 属主、0600 权限；上例通过 root 创建私有临时文件并原子替换。若安装时使用了其他原工具目录或管理员账号，相应替换路径和 `--username`。主机与后端必须使用**相同邮箱和同一随机 32 位小写十六进制 `policy_version`**；更换邮箱时生成新版本并同时更新两处。主机只按私有策略投递固定模板，版本不匹配、策略缺失或文件权限异常均拒绝发信。策略文件不挂载到管理容器。
+
+确认 DSM 通知邮件已配置后激活管理层：
+
+```sh
 /usr/bin/python3 -I /usr/local/share/synology-cert-web/code/install-web.py activate
 ```
 
@@ -94,7 +152,15 @@ DNSPod 密钥只允许写入，GET 接口只返回是否已配置。浏览器不
 
 配置保存使用版本号与原任务互斥锁。先暂停任务并保存私有快照，完成输入校验、实际服务预检及配置写入后记录提交决策，再恢复任务计划。提交前失败回滚；提交后中断按已提交配置继续恢复任务，不用旧快照覆盖新通知或部署待办。409 冲突时页面保留草稿，要求重新读取确认。
 
-原任务运行期间禁止并行保存或执行。手动运行触发原 DSM 任务，不强制向证书机构申请。未完成恢复或绑定变化时阻止不安全的目标切换。失败页面只读取已有脱敏归档，拒绝路径穿越和符号链接。
+原任务运行期间禁止并行保存或执行。手动运行触发原 DSM 任务，按原续期策略决定是否申请；预检查只检查环境与 HTTPS 服务。两者都不会因点击而强制签发。
+
+“立即申请并替换证书”需要二次确认，会创建持久的一次性请求，再触发原 DSM 任务；不会新增定时器或改变原任务的启用状态。请求 10 分钟内未消耗则过期，每次提交后有 1 小时冷却，重启不会绕过。排队或运行中的请求阻止重复提交、保存配置、预检查和再次手动运行。已有未部署候选、恢复、DNS 清理、通知或绑定待办时，需先完成恢复。
+
+执行器在调用证书机构前持久记录请求已消耗；已有 ACME 材料时使用 `--renew --force`，首次申请或隔离损坏材料后使用 `--issue`。只有取得不同于提交时基线指纹的新证书，并完成证书校验、DSM 替换、实际 HTTPS 验证、DNS 清理及通知后，申请状态才显示成功；acme.sh 返回跳过、保留旧证书或只接受了请求都不代表成功。
+
+调度结果不明确时请求仍保留，应刷新状态，不要重复点击。中断后的已消耗请求只恢复现有材料的部署、验证、清理和通知，不重复本次强制申请；候选缺失或损坏时也不会借恢复流程重新签发。该限制持续到下一正常续期窗口且至少覆盖 1 小时冷却；届时恢复原自动策略，不重放强制请求。没有自定义续期窗口的旧配置在冷却结束后恢复原策略。
+
+如果手动申请失败且没有取得新材料，执行器仅在当前证书、候选指纹、绑定及清理/通知状态均能确认安全时，解除属于该请求的保护标记，允许修复凭据或在冷却后提交新的显式申请；原请求的防重放记录继续保留。已有新候选或其他待办时仍禁止解除保护和不安全的目标切换。不要手动删除状态文件来绕过冷却或恢复保护。失败页面只读取已有脱敏归档，拒绝路径穿越和符号链接。
 
 检查管理服务：
 
@@ -110,20 +176,23 @@ sudo /usr/local/etc/rc.d/S99synology-cert-web.sh stop
 sudo /usr/local/etc/rc.d/S99synology-cert-web.sh start
 ```
 
-忘记密码时，在 root 私有终端运行与初始化相同的 `docker run` 命令，将 `init` 替换为 `reset-password`，账号保持为已有管理员。重置后原会话撤销，下次登录必须改密。不要重复执行 `prepare` 或删除登录数据来重置密码。
+忘记密码时，在 root 私有终端运行与初始化相同的 `docker run` 命令，将 `init` 替换为 `reset-password`，账号保持为已有管理员。重置后原会话及挑战撤销，下次登录仍需邮箱验证码并必须改密；邮箱绑定不变。不要重复执行 `prepare` 或删除登录数据来重置密码。
 
-部署配置 `deployment.json`、`deployment.env` 以及 `data`、`tls`、`access` 只在 NAS 保存，不提交仓库。备份时需要保护登录数据库与 TLS 私钥。DSM 升级或网络地址变更后复查桥接、访问策略及实际生效模式、INPUT 规则、域名解析、原任务和内外网访问。不要仅以容器 Running 状态作为验收结论。
+邮箱不可用时先修复 DSM 发信配置；需要更换收件人时，按“绑定登录邮箱”重新生成版本并更新两处。必须临时停用邮箱验证时，仅可在私有终端使用同一隔离容器执行 `python -m web.backend disable-email-login --username admin`，不能通过网页停用。该命令会撤销旧会话及挑战并记录审计，此后账号恢复密码登录；完成恢复后重新执行 `enable-email-login`，确认密码步骤不签发完整会话及实际收信成功。
+
+部署配置 `deployment.json`、`deployment.env`、主机 `web/login-email.json`、`state/login-mail-rate.json`、`state/manual-renewal.json` 以及 `data`、`tls`、`access` 只在 NAS 保存，不提交仓库。备份时需要保护登录数据库、邮箱绑定策略与 TLS 私钥，保留发送限流和手动申请记录。DSM 升级或网络地址变更后复查桥接、访问策略及实际生效模式、INPUT 规则、域名解析、原任务和内外网访问。不要仅以容器 Running 状态作为验收结论。
 
 ## 验证
 
 完整后端与原执行器回归命令见 [根目录说明](../README.md#版本和来源)。前端在 `web/frontend` 中执行 `npm ci`、`npm test`、`npm run build`。
 
 - 原脚本回归与固定 acme.sh 集成测试。
-- API 未登录、首次改密、会话撤销/到期、限流、CSRF/Origin/Host、两种访问模式、IPv4/IPv6/代理来源、路径限制和脱敏测试。
+- API 密码与验证码两步隔离、一次性并发消费、过期/重发/跨 IP、发送失败与取消竞争、持久限流、策略和密码变更撤销、首次改密、会话到期、CSRF/Origin/Host、两种访问模式、路径限制和脱敏测试。
+- 立即申请的排队/过期/冷却、不同指纹成功条件、强制请求不重放、无材料及损坏材料恢复、未来正常续期和配置修复测试。
 - 桥接配置冲突、事务前后恢复窗口、未完成任务保护、真实 socket 协议与父进程退出测试。
 - TLS 权限、指针恢复、域名/链验证、worker 重载、访问策略修订冲突与损坏后拒绝访问、专用防火墙规则及容器停止失败测试。
 - 真实 HTTPS API + 浏览器登录/配置/失败详情/空态/移动布局验收。
-- NAS 部署验收需要另外确认真实 task7、证书指纹、容器健康、启动恢复，以及 `lan` 模式的公网拒绝和 `public` 模式的 IPv4 访问；本地测试不能替代这些步骤。
+- NAS 部署验收需要另外确认真实 task7、证书指纹、容器健康、启动恢复、验证码邮件实际到达，以及 `lan` 模式的公网拒绝和 `public` 模式的 IPv4 访问；本地模拟邮件和固定 acme.sh 测试不能替代真实收信及签发验收。
 
 在 NAS 或允许的 LAN 客户端可先使用下面的命令验证 HTTPS 连通性、域名及证书链，无需先修改 DNS，也不要添加 `-k` 跳过验证：
 

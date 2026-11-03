@@ -21,7 +21,7 @@ const theme = {
     fontFamily: '-apple-system, BlinkMacSystemFont, "Segoe UI", "PingFang SC", "Microsoft YaHei", sans-serif',
   },
 }
-const { session, ready, busy, error, accept, login, logout } = useSession()
+const { session, challenge, recoveryRequired, expiresIn, resendAfter, ready, busy, error, accept, login, verify, resend, cancel, logout, restore } = useSession()
 const pages: Page[] = [
   'overview',
   'certificate',
@@ -113,7 +113,7 @@ onUnmounted(() => {
 <template>
   <AConfigProvider :locale="zhCN" :theme="theme" :csp="{ nonce }" :wave="{ disabled: true }" :auto-insert-space-in-button="false">
   <div v-if="!ready" class="startup" role="status"><ASpin size="large" /><p>正在连接证书管理服务…</p></div>
-  <LoginView v-else-if="!session" :busy="busy" :error="error" @login="login" />
+  <LoginView v-else-if="!session" :busy="busy" :error="error" :challenge="challenge" :expires-in="expiresIn" :resend-after="resendAfter" :recovery-required="recoveryRequired" @login="login" @verify="verify" @resend="resend" @cancel="cancel" @recover="restore" />
   <AppShell
     v-else
     :page="page"

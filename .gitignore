@@ -35,6 +35,8 @@ account.conf
 /web/deployment.env
 /web/deployment.json
 .bootstrap-test.json
+login-email.json
+login-mail-rate.json
 /web/data/
 /web/tls/
 /web/bridge/

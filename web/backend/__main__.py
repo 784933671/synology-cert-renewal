@@ -18,9 +18,21 @@ def main(argv=None):
         command_parser = subparsers.add_parser(command)
         command_parser.add_argument("--username", default="admin")
         command_parser.add_argument("--password-stdin", action="store_true")
+    enable_parser = subparsers.add_parser("enable-email-login")
+    enable_parser.add_argument("--username", default="admin")
+    enable_parser.add_argument("--email", required=True)
+    enable_parser.add_argument("--policy-version", required=True)
+    disable_parser = subparsers.add_parser("disable-email-login")
+    disable_parser.add_argument("--username", default="admin")
     args = parser.parse_args(argv)
     os.umask(0o077)
     try:
+        if args.command in ("enable-email-login", "disable-email-login"):
+            store = AuthStore(Path(os.getenv("CERTWEB_DATA_DIR", "/data")))
+            enabled = args.command == "enable-email-login"
+            store.configure_email_login(args.username, getattr(args, "email", None), getattr(args, "policy_version", None), enabled)
+            print("邮箱登录验证已启用；原有会话与挑战已撤销。" if enabled else "邮箱登录验证已停用；原有会话与挑战已撤销。")
+            return 0
         if args.command != "serve":
             if args.password_stdin:
                 password = sys.stdin.readline(1024).removesuffix("\n").removesuffix("\r")

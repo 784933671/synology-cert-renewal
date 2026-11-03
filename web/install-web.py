@@ -64,7 +64,7 @@ def prepare(args):
     target.mkdir(mode=0o700, exist_ok=True)
     if target.is_symlink() or target.stat().st_uid != 0 or target.stat().st_mode & 0o077:
         raise ValueError('既有桥接目录权限不安全')
-    for name in ('host_bridge.py', 'access_policy.py'):
+    for name in ('host_bridge.py', 'access_policy.py', 'login_mail.py'):
         shutil.copyfile(str(source / name), str(target / name))
         os.chmod(str(target / name), 0o600)
     env = {'CERTWEB_HOME': str(home), 'CERTWEB_BIND': args.bind, 'CERTWEB_PORT': str(args.port),

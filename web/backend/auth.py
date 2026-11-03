@@ -12,6 +12,8 @@ import time
 from contextlib import contextmanager
 from pathlib import Path
 
+from .mfa import EmailLoginMixin, MfaError, masked_email
+
 IDLE_SECONDS = 30 * 60
 ABSOLUTE_SECONDS = 8 * 60 * 60
 PASSWORD_MIN = 12
@@ -49,7 +51,7 @@ def token_hash(value):
     return hashlib.sha256(value.encode("utf-8")).hexdigest()
 
 
-class AuthStore:
+class AuthStore(EmailLoginMixin):
     def __init__(self, directory: Path, clock=time.time):
         self.clock = clock
         self.lock = threading.RLock()
@@ -81,6 +83,7 @@ class AuthStore:
                     id INTEGER PRIMARY KEY AUTOINCREMENT, at REAL NOT NULL,
                     action TEXT NOT NULL, success INTEGER NOT NULL, message TEXT NOT NULL);
             """)
+            self._email_schema(connection)
         self.dummy_hash = password_hash(secrets.token_urlsafe(32))
 
     @contextmanager
@@ -108,8 +111,12 @@ class AuthStore:
                 raise ValueError("管理员已经初始化；如需恢复，请使用 reset-password")
             if reset and (not exists or exists["username"] != username):
                 raise ValueError("管理员账号不存在")
-            connection.execute("INSERT OR REPLACE INTO users VALUES (?, ?, 1)", (username, hashed))
+            if reset:
+                connection.execute("UPDATE users SET password_hash=?,must_change=1,auth_version=auth_version+1 WHERE username=?", (hashed, username))
+            else:
+                connection.execute("INSERT INTO users(username,password_hash,must_change) VALUES (?, ?, 1)", (username, hashed))
             connection.execute("DELETE FROM sessions")
+            connection.execute("DELETE FROM login_challenges")
             connection.execute("DELETE FROM attempts")
         self.audit("password_reset" if reset else "initialize", True, "管理员密码已重置" if reset else "管理员已初始化")
 
@@ -132,26 +139,41 @@ class AuthStore:
         valid = verify_password(password, user[0] if user else self.dummy_hash)
         return bool(user and valid)
 
-    def login(self, username, password):
+    def login(self, username, password, ip=None):
         with self.transaction() as connection:
             user = connection.execute("SELECT password_hash FROM users WHERE username=?", (username,)).fetchone()
         valid = verify_password(password, user[0] if user else self.dummy_hash)
         if not user or not valid:
             return None
         with self.transaction() as connection:
-            current = connection.execute("SELECT password_hash FROM users WHERE username=?", (username,)).fetchone()
-            if not current or not hmac.compare_digest(current[0], user[0]):
+            current = connection.execute("SELECT * FROM users WHERE username=?", (username,)).fetchone()
+            if not current or not hmac.compare_digest(current["password_hash"], user[0]):
                 return None
+            policy = self._email_policy(connection, username)
+            if policy:
+                if not ip:
+                    raise MfaError(403, "verification_required", "请完成邮箱验证码验证")
+                return self._start_challenge(connection, username, ip, current, policy)
             return self._new_session(connection, username)
 
-    def _new_session(self, connection, username):
+    def _new_session(self, connection, username, auth_level=1, policy_version=""):
+        policy = self._email_policy(connection, username)
+        if policy and (auth_level != 2 or policy_version != policy["policy_version"]):
+            raise MfaError(403, "verification_required", "请完成邮箱验证码验证")
+        user = connection.execute("SELECT must_change,auth_version FROM users WHERE username=?", (username,)).fetchone()
         now = self.clock()
         connection.execute("DELETE FROM sessions WHERE created<=? OR last_seen<=?", (now - ABSOLUTE_SECONDS, now - IDLE_SECONDS))
         token = secrets.token_urlsafe(32)
         csrf = secrets.token_urlsafe(32)
-        connection.execute("INSERT INTO sessions VALUES (?, ?, ?, ?, ?)", (token_hash(token), username, csrf, now, now))
-        must_change = connection.execute("SELECT must_change FROM users WHERE username=?", (username,)).fetchone()[0]
-        return token, {"username": username, "csrf_token": csrf, "must_change_password": bool(must_change)}
+        connection.execute("INSERT INTO sessions(token_hash,username,csrf,created,last_seen,auth_version,auth_level,policy_version) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                           (token_hash(token), username, csrf, now, now, user["auth_version"], auth_level, policy_version))
+        return token, self._session_data(username, csrf, user["must_change"], policy)
+
+    def _session_data(self, username, csrf, must_change, policy):
+        result = {"username": username, "csrf_token": csrf, "must_change_password": bool(must_change), "email_verification_enabled": bool(policy)}
+        if policy:
+            result["login_email_masked"] = masked_email(policy["email"])
+        return result
 
     def create_session(self, username):
         with self.transaction() as connection:
@@ -163,21 +185,24 @@ class AuthStore:
         now = self.clock()
         hashed = token_hash(token)
         with self.transaction() as connection:
-            row = connection.execute("SELECT sessions.*, users.must_change FROM sessions JOIN users USING(username) WHERE token_hash=?", (hashed,)).fetchone()
+            row = connection.execute("SELECT sessions.*, users.must_change,users.auth_version AS current_version FROM sessions JOIN users USING(username) WHERE token_hash=?", (hashed,)).fetchone()
             if not row:
                 return None
-            if now - row["created"] >= ABSOLUTE_SECONDS or now - row["last_seen"] >= IDLE_SECONDS or now < row["created"]:
+            policy = self._email_policy(connection, row["username"])
+            if (now - row["created"] >= ABSOLUTE_SECONDS or now - row["last_seen"] >= IDLE_SECONDS or now < row["created"]
+                    or row["auth_version"] != row["current_version"]
+                    or (policy and (row["auth_level"] != 2 or row["policy_version"] != policy["policy_version"]))):
                 connection.execute("DELETE FROM sessions WHERE token_hash=?", (hashed,))
                 return None
             if touch:
                 connection.execute("UPDATE sessions SET last_seen=? WHERE token_hash=?", (now, hashed))
-        return {"username": row["username"], "csrf_token": row["csrf"], "must_change_password": bool(row["must_change"])}
+        return self._session_data(row["username"], row["csrf"], row["must_change"], policy)
 
     def logout(self, token):
         with self.transaction() as connection:
             connection.execute("DELETE FROM sessions WHERE token_hash=?", (token_hash(token),))
 
-    def change_password(self, username, old_password, new_password):
+    def change_password(self, username, old_password, new_password, session_token=None):
         if not valid_password(new_password) or hmac.compare_digest(old_password.encode(), new_password.encode()):
             return None
         with self.transaction() as connection:
@@ -186,16 +211,31 @@ class AuthStore:
             return None
         hashed = password_hash(new_password)
         with self.transaction() as connection:
-            result = connection.execute("UPDATE users SET password_hash=?,must_change=0 WHERE username=? AND password_hash=?", (hashed, username, row[0]))
+            policy = self._email_policy(connection, username)
+            auth_level, policy_version = 1, ""
+            if policy:
+                current = connection.execute("SELECT sessions.*,users.auth_version AS current_version FROM sessions JOIN users USING(username) WHERE token_hash=? AND username=?",
+                                             (token_hash(session_token or ""), username)).fetchone()
+                now = self.clock()
+                if (not current or current["auth_level"] != 2 or current["policy_version"] != policy["policy_version"]
+                        or current["auth_version"] != current["current_version"] or not current["created"] <= now < current["created"] + ABSOLUTE_SECONDS
+                        or now - current["last_seen"] >= IDLE_SECONDS):
+                    raise MfaError(401, "unauthorized", "登录已失效，请重新登录")
+                auth_level, policy_version = 2, policy["policy_version"]
+            result = connection.execute("UPDATE users SET password_hash=?,must_change=0,auth_version=auth_version+1 WHERE username=? AND password_hash=?", (hashed, username, row[0]))
             if result.rowcount != 1:
                 return None
             connection.execute("DELETE FROM sessions WHERE username=?", (username,))
-            return self._new_session(connection, username)
+            connection.execute("DELETE FROM login_challenges WHERE username=?", (username,))
+            return self._new_session(connection, username, auth_level, policy_version)
 
     def audit(self, action, success, message):
         with self.transaction() as connection:
-            connection.execute("INSERT INTO audit(at,action,success,message) VALUES (?,?,?,?)", (self.clock(), action, int(success), message))
-            connection.execute("DELETE FROM audit WHERE id NOT IN (SELECT id FROM audit ORDER BY id DESC LIMIT 2000)")
+            self._audit(connection, action, success, message)
+
+    def _audit(self, connection, action, success, message):
+        connection.execute("INSERT INTO audit(at,action,success,message) VALUES (?,?,?,?)", (self.clock(), action, int(success), message))
+        connection.execute("DELETE FROM audit WHERE id NOT IN (SELECT id FROM audit ORDER BY id DESC LIMIT 2000)")
 
     def audit_list(self):
         with self.transaction() as connection:

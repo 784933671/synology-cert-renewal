@@ -36,6 +36,7 @@ export async function api<T>(
   if (options.signal?.aborted) controller.abort()
   const timeout = setTimeout(abort, 65000)
   const method = options.method || 'GET'
+  const preLogin = path === '/api/login' || path.startsWith('/api/login/')
   try {
     const response = await fetch(path, {
       method,
@@ -47,7 +48,7 @@ export async function api<T>(
         ...(method !== 'GET'
           ? {
               'Content-Type': 'application/json',
-              ...(csrf ? { 'X-CSRF-Token': csrf } : {}),
+              ...(csrf && !preLogin ? { 'X-CSRF-Token': csrf } : {}),
             }
           : {}),
       },
@@ -60,12 +61,13 @@ export async function api<T>(
       throw new ApiError(
         '服务器返回了无法识别的结果，请稍后重试。',
         response.status,
+        'invalid_response',
       )
     }
     if (!response.ok) {
       if (
         response.status === 401 &&
-        !['/api/login', '/api/session'].includes(path)
+        !preLogin && path !== '/api/session'
       )
         authFailure?.('expired')
       if (data?.error?.code === 'password_change_required')

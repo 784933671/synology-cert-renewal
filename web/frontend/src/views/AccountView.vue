@@ -57,6 +57,12 @@ async function submit() {
   <NoticeBar v-if="session.must_change_password" type="warning">首次登录需要更换初始密码，完成后即可管理证书。</NoticeBar>
   <NoticeBar v-if="error" type="error">{{ error }}</NoticeBar>
   <NoticeBar v-if="success" type="success">{{ success }}</NoticeBar>
+  <ACard class="cert-account-card cert-login-verification" title="登录验证">
+    <ATag :color="session.email_verification_enabled ? 'success' : 'default'">{{ session.email_verification_enabled ? '邮箱二步验证已启用' : '邮箱二步验证未启用' }}</ATag>
+    <p v-if="session.email_verification_enabled">密码验证后，还需通过 {{ session.login_email_masked || '已绑定邮箱' }} 接收的验证码完成登录。</p>
+    <p v-else>当前使用管理员账号和密码登录。</p>
+    <p class="monitoring-muted">登录验证邮箱与证书通知邮箱独立，修改通知邮箱不会更改登录验证邮箱。</p>
+  </ACard>
   <ACard class="cert-account-card" title="修改密码">
     <AForm :model="form" layout="vertical" class="cert-account-form" :required-mark="false" :disabled="busy" @finish="submit">
       <input class="visually-hidden" autocomplete="username" :value="session.username" tabindex="-1" aria-hidden="true" />

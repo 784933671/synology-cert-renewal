@@ -48,6 +48,18 @@ describe('同源会话请求', () => {
     await expect(api('/api/settings')).rejects.toBeInstanceOf(ApiError)
     expect(notify).toHaveBeenCalledWith('expired')
   })
+  it('预登录验证端点401不触发退出且不携带旧CSRF', async () => {
+    const notify = vi.fn()
+    onAuthFailure(notify)
+    setCsrf('previous-session-token')
+    const fetcher = vi.fn().mockImplementation(() => Promise.resolve(new Response('{"error":{"code":"invalid_code","message":"验证码不正确"}}', { status: 401 })))
+    vi.stubGlobal('fetch', fetcher)
+    for (const path of ['/api/login', '/api/login/challenge', '/api/login/verify', '/api/login/resend', '/api/login/cancel']) {
+      await expect(api(path, { method: 'POST' })).rejects.toBeInstanceOf(ApiError)
+    }
+    expect(notify).not.toHaveBeenCalled()
+    expect(fetcher.mock.calls.every(([, options]) => !options.headers['X-CSRF-Token'])).toBe(true)
+  })
   it('网络中断不自动重放写操作，不显示原始异常', async () => {
     const fetcher = vi
       .fn()
@@ -56,6 +68,13 @@ describe('同源会话请求', () => {
     await expect(
       api('/api/settings', { method: 'PUT', body: {} }),
     ).rejects.toMatchObject({ message: '无法连接管理服务，请检查网络后重试。' })
+    expect(fetcher).toHaveBeenCalledOnce()
+  })
+  it('HTTP成功但JSON损坏标记为结果未知，不重放验证请求', async () => {
+    const fetcher = vi.fn().mockResolvedValue(new Response('broken response', { status: 200 }))
+    vi.stubGlobal('fetch', fetcher)
+    await expect(api('/api/login/verify', { method: 'POST', body: { code: '123456' } }))
+      .rejects.toMatchObject({ status: 200, code: 'invalid_response' })
     expect(fetcher).toHaveBeenCalledOnce()
   })
   it('冲突状态保留为可识别的409', async () => {

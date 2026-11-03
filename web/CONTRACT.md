@@ -4,16 +4,21 @@
 
 ## 浏览器 API
 
-成功返回 JSON 对象本身；错误 HTTP 400/401/403/409/429/502/503，格式 `{"error":{"code":"...","message":"中文安全摘要"}}`，不得携带原始异常/命令/密钥。
+成功返回 JSON 对象本身；错误 HTTP 400/401/403/409/410/429/502/503，格式 `{"error":{"code":"...","message":"中文安全摘要"}}`，不得携带原始异常、命令、密码、验证码或密钥。所有写请求要求精确同源 Origin 和 JSON；`/api/login` 及其子接口不要求业务 CSRF Token，其他写接口必须使用完整会话的 `X-CSRF-Token`。服务器不信任代理头。
 
-- GET `/api/session` -> `{username,csrf_token,must_change_password}`；未登录返回401。所有写请求使用 `X-CSRF-Token`；登录也要求同源JSON请求，服务器不信任代理头。
-- POST `/api/login` `{username,password}` -> session；HttpOnly Secure SameSite=Strict cookie。
+- GET `/api/session` -> 下述 Session；未登录或仅密码通过时返回401。
+- POST `/api/login` `{username,password}` -> 已启用邮箱验证时返回202和下述 Challenge，设置短期挑战 Cookie；尚未启用或私有终端明确停用时返回200和 Session。
+- GET `/api/login/challenge` -> Challenge 或 `{verification_required:false}`；恢复步骤，不发邮件。挑战不存在、过期或来源 IP 不匹配时清除客户端挑战 Cookie。
+- POST `/api/login/verify` `{code:"6位ASCII数字"}` -> Session；原子消费挑战，签发完整会话 Cookie，并清除挑战 Cookie。
+- POST `/api/login/resend` `{}` -> Challenge；要求有效挑战，发送新码并使旧码失效，不延长挑战总期限或重置错误次数。
+- POST `/api/login/cancel` `{}` -> `{ok:true}`；撤销当前来源 IP 对应的挑战并清除挑战 Cookie，不撤销其他完整会话。
 - POST `/api/logout` `{}` -> `{ok:true}`
-- POST `/api/password` `{current_password,new_password}` -> session（撤销旧会话、返回新会话）。首次密码必须修改，修改前只允许session/password/logout。
+- POST `/api/password` `{current_password,new_password}` -> Session（撤销全部旧会话和挑战、返回新会话）。启用邮箱验证时必须持有匹配当前策略及认证版本的已验证会话。首次密码必须修改，修改前业务访问仅允许session/password/logout。
 - GET `/api/status` -> 下述状态
 - GET `/api/settings` -> 下述配置
 - PUT `/api/settings` -> 提交完整可写配置含revision；返回更新后的配置
 - POST `/api/actions/run` `{}` -> `{accepted:true,message}`：触发原 DSM 任务，包含失败邮件链路；不得强制申请证书
+- POST `/api/actions/renew` `{}` -> `{accepted:true,message,request_id,manual_renewal}`：提交一次性立即申请请求并触发原任务；需要完整登录、完成首次改密、同源 JSON 和 CSRF，不接收客户端 `force`、目标域名或命令参数。接受请求不等于申请成功。
 - POST `/api/actions/check` `{}` -> `{accepted:true,message}`：异步预检，不签发/部署
 - GET `/api/failures` -> `{items:[{id,at,stage_label,summary,code}]}`
 - GET `/api/failures/{id}` -> `{id,report,logs:[{name,text}]}`，仅脱敏归档
@@ -21,6 +26,36 @@
 - GET `/api/security` -> 下述访问安全结构；需要已完成首次改密的登录会话。
 - PUT `/api/security` `{access_mode:"lan"|"public",revision:"32位十六进制"}` -> 更新后的访问安全结构；需要同源 JSON、登录及 CSRF 校验，版本冲突返回409。只允许切换预定义模式，不接收网段、端口或任意防火墙规则。
 - GET `/healthz` -> `{ok:true}`，仅健康检查，不暴露业务信息
+
+## 邮箱登录与会话
+
+```text
+Session = {
+ username, csrf_token, must_change_password,
+ email_verification_enabled,
+ login_email_masked? // 仅启用邮箱验证时存在
+}
+Challenge = {
+ verification_required:true,
+ email_masked,
+ expires_in,   // 当前验证码剩余秒数；发送中或发送失败时为0
+ resend_after  // 本轮60秒发送间隔的剩余秒数，不代表其他额度已恢复
+}
+```
+
+密码通过仅创建 `__Host-certweb_challenge`，不返回 Session、业务 CSRF Token、原始邮箱或验证码；初次发送成功返回202，失败返回503 `mail_unavailable`，仍设置挑战 Cookie以便恢复和重发。密码正确的新登录会撤销当前 Cookie 对应的旧会话，并替换该账号此前未完成的挑战。完整 Cookie 为 `__Host-certweb_session`；两种 Cookie 都为 Secure、HttpOnly、SameSite=Strict、Path=/，无 Domain。
+
+验证码有效期300秒；挑战总有效期600秒，绑定实际 IPv4 来源，重发不延长期限。仅 `ready` 状态可验证，六位码以挑战随机令牌为密钥保存 HMAC，数据库不存明文码或明文挑战令牌。验证、累计错误计数、一次性消费及会话签发在同一数据库事务中完成；累计错误5次删除挑战。完成邮箱验证前不得访问业务接口，成功后再执行首次改密门控。
+
+发送最少间隔60秒，所有发送额度在发信前原子预留，失败也计数。后端持久限制：单账号15分钟5次、1小时10次、24小时20次；单IP15分钟10次、24小时40次；全局15分钟40次、24小时200次。主机另有独立的持久60秒间隔与15分钟5次限制。重启、重置密码或重新启用邮箱验证不会清空发送记录。密码登录和改密仍分别使用15分钟窗口：同IP+账号5次、同IP15次、全局40次。
+
+常见错误：密码不正确为401 `invalid_credentials`；验证码错误为400 `invalid_code`；验证码过期或未完成发送为400 `code_expired`；挑战过期、已消费、次数耗尽、来源IP或认证版本不匹配为410 `challenge_expired`；发送额度不足为429 `rate_limited`。429响应当前统一带 `Retry-After: 900`，实际小时/日额度仍以服务端记录为准。接口均拒绝额外收件人、邮件主题及正文参数。
+
+发信失败使该轮验证码失效；服务端请求取消会按发送轮次撤销 `sending` 或 `ready` 状态，迟到的工作线程不能再次激活，旧轮次取消也不能撤销新轮次。用户“返回登录”删除整个挑战。网络断开不能证明服务端操作已取消：前端应先恢复状态；HTTP成功但JSON解析失败也视为结果未知，通过显式“重新确认登录状态”先读取 `/api/session`，401时再读取 `/api/login/challenge`，不得自动重发或重复提交验证码。
+
+会话闲置30分钟、绝对8小时；状态和访问安全的后台轮询不刷新闲置时间。启用邮箱验证后，旧单因素会话以及认证级别、账号版本或邮箱策略版本不匹配的会话均失效。改密、密码重置、启停邮箱验证、邮箱策略变更会撤销全部旧会话和挑战；重置密码保留邮箱验证要求。邮箱策略缺失或损坏时已启用账号拒绝登录，不自动降级。
+
+主机原工具目录的 `web/login-email.json` 为 root 私有0600文件，所在目录0700，结构为 `{recipient:"admin@example.com",policy_version:"随机32位小写十六进制"}`。后端通过私有终端执行 `python -m web.backend enable-email-login --username admin --email admin@example.com --policy-version <同一版本>` 配置；两处邮箱和版本必须一致，更换绑定时生成新版本。网页只展示脱敏地址，不提供绑定更换或停用接口；首次验证码通过后确认绑定已验证。紧急停用仅通过私有终端 `disable-email-login --username admin`，撤销会话并记录审计。主机策略和认证数据库不提交仓库，部署操作示例见 [README](README.md#绑定登录邮箱)。
 
 ## 状态结构
 
@@ -32,10 +67,23 @@
  last_result:null,
  pending:{deployment:false,dns_cleanup:false,notification:false,interrupted:false},
  check:{running:false,last_result:null},
+ manual_renewal?:{request_id,state,message,requested_at:"ISO8601",cooldown_until:"ISO8601",completed_at?:"ISO8601"},
  server_time:"ISO8601",timezone:"Asia/Shanghai"
 }
 ```
 `last_result` 与 `check.last_result` 如非null为 `{at,success,message,...}`；UI 使用缺省兜底，不显示原始未知对象。
+
+### 一次性立即申请
+
+`manual_renewal` 仅在存在请求记录时返回；`state` 为 `queued`、`running`、`succeeded`、`failed` 或 `expired`。页面以状态与实际证书指纹判断进展，不把动作响应中的 `accepted:true` 当作成功，也不把普通检查的成功结果替代申请结果。
+
+请求固定作用于当前配置的证书和域名，主机记录基线指纹与绑定，10分钟内未消耗则过期；从提交时起冷却1小时，即使任务调度未确认、失败或服务重启也不重置。排队/运行中阻止重复申请、配置保存、预检和普通手动运行。未完成的部署、恢复、DNS清理、通知或新候选证书阻止新增申请；相关冲突返回409。
+
+请求存于原工具 `state/manual-renewal.json`，通过共享任务锁协调，调用ACME前持久记录已消耗并同步文件及目录。原任务启用状态不改变；调度异常仍保留请求，返回安全提示，前端继续查询状态。有ACME材料时使用 `--renew --force`；没有材料或已隔离损坏材料时使用 `--issue`。客户端不传递命令或路径。
+
+成功必须取得与基线不同指纹的新证书，完成域名、私钥、链验证、DSM替换、实际HTTPS验证、DNS清理和通知。acme.sh返回2、缺少新材料或只有原指纹均不能标记成功。签发结果未知、中断、部署或通知失败后，已消耗请求只继续使用现有材料恢复，不能重新执行该请求的强制签发；缺失/损坏材料也不得通过恢复或首次申请分支重复签发。
+
+恢复门控在下一正常续期窗口且不早于1小时冷却后解除；之后沿用普通续期策略，不重放强制标志。无自定义续期窗口的旧配置在冷却后恢复原策略。没有取得新材料的失败请求，仅在原证书及绑定未变、候选仍为原指纹或不存在、无其他恢复/清理/通知待办，且保护标记归属于该请求时，允许安全释放该请求的保护；可修复配置或在冷却后提交新的显式请求，防重放记录保留。新候选或不明归属的标记不能据此清除。
 
 ## 配置结构
 
@@ -87,7 +135,9 @@ PUT 只接收 revision,certificate_id,email,renew_before_days,probes,schedule,no
 
 位置由 `CERTWEB_BRIDGE_SOCKET` 配置。每个连接一条 UTF-8 JSON + 换行，请求最大64KiB，响应上限2MiB，超时60秒。请求 `{"method":"settings.get","params":{}}`。响应 `{"ok":true,"data":...}` 或 `{"ok":false,"error":{"code":"...","message":"..."}}`。
 
-固定方法：status、settings.get、settings.update（params直接为PUT对象）、security.update（params为`{access_mode,revision}`）、run、check、failures.list、failures.get（params:{id}）。`security.update` 仅写入访问策略，不修改证书配置、任务计划或立即执行任意防火墙命令。不得接收任意命令、任意路径或shell字符串。
+固定方法：status、settings.get、settings.update（params直接为PUT对象）、security.update（params为`{access_mode,revision}`）、run、renew、check、failures.list、failures.get（params:{id}）、auth.code.send（params为`{code,policy_version}`）。除明确列出参数的方法外只接受空对象。`security.update` 仅写入访问策略，不修改证书配置、任务计划或立即执行任意防火墙命令。`renew` 提交上述一次性请求，不接收客户端强制参数。不得接收任意命令、任意路径或shell字符串。
+
+`auth.code.send` 仅在密码验证通过或有效挑战重发时由后端调用。主机严格核验六位ASCII数字、策略版本和固定参数集合，收件人只能从root私有策略读取，主题和正文使用固定模板；复用DSM通知邮件配置，成功仅返回 `{accepted:true}`，不回显验证码、邮箱或邮件配置。策略不一致或邮件失败只返回固定错误。主机邮件配置读取超时10秒、SMTP发送超时25秒，输出和错误输出丢弃并回收超时进程；后端将发信等待限制在最多50秒并为请求总超时留出余量，不把登录邮件写入证书续期的待发通知状态。
 
 Bridge root运行，socket仅授权容器 UID/GID 10100 访问；部署目录root私有，socket专用目录root:10100 0750，socket0660。不把完整配置、原始日志、Docker socket或DSM证书目录挂载给容器；访问策略目录以只读方式单独挂载。
 

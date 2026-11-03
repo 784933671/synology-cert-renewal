@@ -30,6 +30,7 @@ describe('管理员会话与密码', () => {
   it('初次401显示登录，不展示不存在的状态；失败后清空密码', async () => {
     vi.mocked(api)
       .mockRejectedValueOnce(new ApiError('请登录', 401))
+      .mockResolvedValueOnce({ verification_required: false })
       .mockRejectedValueOnce(new ApiError('账号或密码不正确', 401))
     wrapper = mount(App)
     await flushPromises()

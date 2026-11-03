@@ -49,7 +49,7 @@ class FixtureBridge:
                 raise BridgeError("stale_revision") from None
         if method.startswith("settings."):
             return safe_data({**settings_payload(), "secret_id_configured": True, "secret_key_configured": True})
-        if method in ("run", "check"):
+        if method in ("run", "renew", "check"):
             return {"accepted": True, "message": "请求已提交"}
         if method == "failures.list":
             return {"items": []}
@@ -110,9 +110,10 @@ class WebApiTests(unittest.IsolatedAsyncioTestCase):
     async def test_login_cookie_and_first_password_gate(self):
         response = await self.login()
         self.assertEqual(response.status_code, 200)
-        self.assertEqual(set(response.json()), {"username", "csrf_token", "must_change_password"})
+        self.assertEqual(set(response.json()), {"username", "csrf_token", "must_change_password", "email_verification_enabled"})
+        self.assertFalse(response.json()["email_verification_enabled"])
         self.assertTrue(response.json()["must_change_password"])
-        cookie = response.headers["set-cookie"]
+        cookie = next(value for value in response.headers.get_list("set-cookie") if value.startswith(COOKIE + "="))
         for part in (COOKIE + "=", "HttpOnly", "Secure", "SameSite=strict", "Path=/", "Max-Age=28800"):
             self.assertIn(part, cookie)
         self.assertNotIn("Domain=", cookie)
@@ -132,7 +133,7 @@ class WebApiTests(unittest.IsolatedAsyncioTestCase):
     async def test_all_mutations_require_csrf(self):
         await self.ready()
         for method, path, body in (("POST", "/api/logout", {}), ("POST", "/api/password", {}),
-                                   ("POST", "/api/actions/run", {}), ("POST", "/api/actions/check", {}),
+                                   ("POST", "/api/actions/run", {}), ("POST", "/api/actions/renew", {}), ("POST", "/api/actions/check", {}),
                                    ("PUT", "/api/settings", settings_payload())):
             with self.subTest(path=path):
                 response = await self.client.request(method, path, json=body, headers={"Origin": ORIGIN})

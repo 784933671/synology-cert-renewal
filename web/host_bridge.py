@@ -31,6 +31,9 @@ _spec.loader.exec_module(executor)
 _policy_spec = importlib.util.spec_from_file_location('certweb_access_policy', Path(__file__).resolve().parent / 'access_policy.py')
 access_policy = importlib.util.module_from_spec(_policy_spec)
 _policy_spec.loader.exec_module(access_policy)
+_mail_spec = importlib.util.spec_from_file_location('certweb_login_mail', Path(__file__).resolve().parent / 'login_mail.py')
+login_mail = importlib.util.module_from_spec(_mail_spec)
+_mail_spec.loader.exec_module(login_mail)
 
 MAX_REQUEST = 64 * 1024
 MAX_RESPONSE = 2 * 1024 * 1024
@@ -232,6 +235,10 @@ class Bridge:
         self.run_requested_at = -float('inf')
         self.recovery_attempt_at = -float('inf')
         self.transaction = self.home / 'state/web-transaction.json'
+        self.login_mail = login_mail.LoginMailer(
+            home=self.home, read=self.read, write=lambda path, value: atomic_bytes(path, canonical(value)),
+            private_directory=lambda path: private_directory(path, self.uid),
+            controller_factory=self.controller_factory, uid=self.uid, hostname=self.management_host or '证书管家')
 
     def read(self, path, default=None):
         if not os.path.lexists(path):
@@ -265,6 +272,11 @@ class Bridge:
             self.actions.release()
 
     def protection(self, controller):
+        controller.assert_manual_idle()
+        try:
+            controller.release_manual_protection()
+        except executor.Failure:
+            reject('手动申请仍有未完成的部署、绑定或清理待办，请先完成恢复。', 'conflict')
         if any(os.path.lexists(controller.state / name) for name in PROTECTION_FILES):
             reject('存在未完成的部署或恢复保护状态，请先完成恢复。', 'conflict')
         if controller.dns_cleanup_count():
@@ -354,12 +366,14 @@ class Bridge:
         controller = self.controller()
         task = self.scheduler.get()
         running = False
+        manual = None
         try:
             with controller.locked():
-                pass
+                manual = controller.manual_renewal(reconcile=True)
         except executor.Busy:
             running = True
             self.run_requested_at = -float('inf')
+            manual = controller.manual_renewal()
         cert = controller.current_cert()
         expiry = executor.certificate_expiry(cert)
         days = controller.config.get('renew_before_days', 2)
@@ -371,7 +385,7 @@ class Bridge:
         with self.check_lock:
             check = copy.deepcopy(self.check_state)
         result = self.safe_result(self.read(controller.state / 'last-result.json'), controller)
-        return {'certificate': {'id': controller.config['certificate_id'],
+        response = {'certificate': {'id': controller.config['certificate_id'],
                                 'description': self.sanitize(controller.config['certificate_description'], controller, 1024),
                                 'domains': controller.config['domains'], 'not_after': utc(expiry),
                                 'fingerprint': executor.fingerprint(cert), 'remaining_seconds': expiry - int(time.time()),
@@ -385,6 +399,17 @@ class Bridge:
                             'notification': bool(notice.get('pending')) if isinstance(notice, dict) else True,
                             'interrupted': any(os.path.lexists(controller.state / name) for name in PROTECTION_FILES if name != 'pending.json') or os.path.lexists(self.transaction)},
                 'check': check, 'server_time': utc(), 'timezone': 'Asia/Shanghai'}
+        if manual:
+            response['manual_renewal'] = self.manual_renewal_data(manual, controller)
+        return response
+
+    def manual_renewal_data(self, request, controller):
+        result = {'request_id': request['request_id'], 'state': request['state'],
+                  'message': self.sanitize(request['message'], controller, 600),
+                  'requested_at': utc(request['requested_at']), 'cooldown_until': utc(request['cooldown_until'])}
+        if type(request.get('completed_at')) is int:
+            result['completed_at'] = utc(request['completed_at'])
+        return result
 
     def validate_update(self, params, controller, task):
         required = {'revision', 'certificate_id', 'email', 'renew_before_days', 'probes', 'schedule', 'notifications'}
@@ -487,6 +512,9 @@ class Bridge:
                 or hashlib.sha256(canonical(current)).hexdigest() != expected):
             reject('已提交事务的配置已发生变化，请管理员核对后恢复。', 'unavailable')
         executor.validate_config(current)
+        controller = self.controller_factory()
+        controller.load()
+        controller.retire_manual_target()
         task = journal.get('desired_task')
         self.scheduler.put(task)
         self.transaction.unlink()
@@ -620,6 +648,7 @@ class Bridge:
                     atomic_bytes(controller.state / 'web-preferences.json', canonical(preferences))
                     self.commit_decision(config, task)
                     committed = True
+                    controller.retire_manual_target()
                     self.scheduler.put(task)
                     result = self.settings_data(controller, self.scheduler.get())
                     self.transaction.unlink()
@@ -646,6 +675,9 @@ class Bridge:
         with self.action():
             controller = self.controller()
             with controller.locked():
+                request = controller.manual_renewal(reconcile=True)
+                if request and request['state'] in ('queued', 'running'):
+                    reject('手动申请正在等待原任务执行，请稍后刷新状态。', 'busy')
                 if time.monotonic() - self.run_requested_at < RUN_START_WINDOW:
                     reject('原任务刚刚收到运行请求，请稍后刷新状态。', 'busy')
                 self.scheduler.get()
@@ -653,6 +685,27 @@ class Bridge:
             self.run_requested_at = time.monotonic()
             self.scheduler.run()
             return {'accepted': True, 'message': '已手动触发原 DSM 任务，自动计划启用状态不变；未到续期时间时仅检查。'}
+
+    def renew(self):
+        with self.action():
+            controller = self.controller()
+            with controller.locked():
+                controller.load()
+                self.protection(controller)
+                self.scheduler.get()
+                previous = controller.manual_renewal()
+                if previous and time.time() < previous['cooldown_until']:
+                    reject('上次立即申请仍在一小时冷却期内，请稍后再试。', 'busy')
+                request = controller.request_manual_renewal()
+            self.run_requested_at = time.monotonic()
+            message = '已提交立即申请请求，由原 DSM 任务申请并替换新证书。'
+            try:
+                self.scheduler.run()
+            except Exception:
+                # 调度超时也可能已启动；保留一次性请求，禁止重复提交直至过期。
+                message = '申请请求已保留，尚无法确认原任务是否启动；请刷新状态，不要重复提交。'
+            return {'accepted': True, 'message': message, 'request_id': request['request_id'],
+                    'manual_renewal': self.manual_renewal_data(request, controller)}
 
     def check(self):
         if not self.actions.acquire(False):
@@ -668,6 +721,7 @@ class Bridge:
             lock_context = controller.locked()
             lock_context.__enter__()
             locked = True
+            controller.assert_manual_idle()
             with self.check_lock:
                 self.check_state['running'] = True
             worker = threading.Thread(target=self._check_worker, args=(controller, lock_context), daemon=True)
@@ -770,9 +824,14 @@ class Bridge:
             if not isinstance(method, str):
                 reject('RPC 方法无效。', 'invalid_request')
             methods = {'status': self.status, 'settings.get': self.settings_get, 'settings.update': self.settings_update,
-                       'run': self.run, 'check': self.check, 'failures.list': self.failure_list,
+                       'run': self.run, 'renew': self.renew, 'check': self.check, 'failures.list': self.failure_list,
                        'security.update': self.security_update}
-            if method == 'failures.get':
+            if method == 'auth.code.send':
+                try:
+                    data = self.login_mail.send(params)
+                except login_mail.MailError:
+                    reject('登录验证码暂时无法发送，请稍后重试。', 'unavailable')
+            elif method == 'failures.get':
                 if set(params) != {'id'}:
                     reject('失败记录请求字段无效。', 'invalid_request')
                 data = self.failure_get(params['id'])

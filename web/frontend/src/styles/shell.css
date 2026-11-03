@@ -60,3 +60,7 @@
   .cert-login-card > .ant-card-body { padding: 24px; }
   .cert-login-heading h1 { font-size: 22px; }
 }
+
+.cert-login-countdown { margin: -4px 0 16px; color: #595959; font-size: 13px; }
+.cert-login-secondary { display: flex; justify-content: space-between; margin-top: 16px; }
+.cert-login-verification.ant-card { margin-bottom: 24px; }

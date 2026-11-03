@@ -97,6 +97,32 @@ class AcmeIntegrationTests(unittest.TestCase):
         self.assertFalse(self.controller.marker.exists())
         self.assertEqual(certctl.fingerprint(self.controller.current_cert()), self.fixture.old_fingerprint)
 
+    def test_real_force_flag_bypasses_future_window_and_reaches_issue_once(self):
+        self.controller.config['renew_before_days'] = 2
+        self.fixture.prepare_candidate('old')
+        self.controller.prepare_acme_config()
+        marker = self.fixture.root / 'issue-calls'
+        harness = self.fixture.root / 'force-harness.sh'
+        # 使用未改动的固定源码，只把实际签发边界替换为离线记录器。
+        harness.write_text('acme_source="$1"\nacme_home="$2"\nissue_marker="$3"\nforce_arg="$4"\n'
+                           '. "$acme_source" --version\n'
+                           'issue() { printf "%s\\n" "$*" >> "$issue_marker"; return 1; }\n'
+                           'if [ "$force_arg" = yes ]; then set -- --force; else set --; fi\n'
+                           'main --home "$acme_home" --config-home "$acme_home" '
+                           '--server https://acme-v02.api.letsencrypt.org/directory --renew -d ttxli.cn "$@"\n')
+        environment = self.controller.operation_environment()
+        environment['NO_ARI'] = '1'
+        command = ['/bin/sh', str(harness), str(self.source), str(self.controller.acme), str(marker)]
+        normal = subprocess.run(command + ['no'], env=environment, capture_output=True, text=True, timeout=20)
+        self.assertEqual(normal.returncode, 2, normal.stdout + normal.stderr)
+        self.assertFalse(marker.exists())
+        forced = subprocess.run(command + ['yes'], env=environment, capture_output=True, text=True, timeout=20)
+        self.assertEqual(forced.returncode, 1, forced.stdout + forced.stderr)
+        self.assertEqual(len(marker.read_text().splitlines()), 1)
+        self.assertIn('dns_tencent', marker.read_text())
+        self.assertNotIn('Skipping. Next renewal time is:', forced.stdout + forced.stderr)
+        self.assertFalse(self.network_calls.exists())
+
     def test_run_reissues_damaged_pending_before_saved_renewal_time(self):
         self.damaged_pending()
         real_popen = subprocess.Popen

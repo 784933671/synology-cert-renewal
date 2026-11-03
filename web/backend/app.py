@@ -18,8 +18,10 @@ from . import validation
 from .auth import ABSOLUTE_SECONDS, AuthStore, valid_password
 from .bridge import BridgeClient, BridgeError
 from .config import Config
+from .mfa import CHALLENGE_SECONDS, EmailDelivery, MfaError
 
 COOKIE = "__Host-certweb_session"
+CHALLENGE_COOKIE = "__Host-certweb_challenge"
 BODY_LIMIT = 128 * 1024
 SECURITY_HEADERS = {
     "Content-Security-Policy": "default-src 'none'; script-src 'self'; style-src 'self'; img-src 'self' data:; font-src 'self'; connect-src 'self'; base-uri 'none'; form-action 'self'; frame-ancestors 'none'; object-src 'none'",
@@ -194,6 +196,13 @@ def create_app(config=None, store=None, bridge=None):
     async def api_error(_request, error):
         return error_response(error.status, error.code, error.message)
 
+    @app.exception_handler(MfaError)
+    async def mfa_error(_request, error):
+        response = error_response(error.status, error.code, error.message)
+        if error.code == "challenge_expired":
+            clear_challenge_cookie(response)
+        return response
+
     @app.exception_handler(HTTPException)
     async def http_error(_request, error):
         return error_response(error.status_code, "not_found" if error.status_code == 404 else "invalid_request", "请求的页面或接口不存在" if error.status_code == 404 else "请求方法或内容不正确")
@@ -224,7 +233,35 @@ def create_app(config=None, store=None, bridge=None):
         token, current = result
         response = JSONResponse(current)
         response.set_cookie(COOKIE, token, max_age=ABSOLUTE_SECONDS, secure=True, httponly=True, samesite="strict", path="/")
+        clear_challenge_cookie(response)
         return response
+
+    def clear_challenge_cookie(response):
+        response.delete_cookie(CHALLENGE_COOKIE, secure=True, httponly=True, samesite="strict", path="/")
+
+    async def deliver_code(delivery, request, initial=False):
+        try:
+            try:
+                result = await asyncio.wait_for(bridge.call("auth.code.send", {"code": delivery.code, "policy_version": delivery.policy_version}),
+                                                min(config.bridge_timeout, max(0.01, config.request_timeout - 1), 50))
+                if not isinstance(result, dict) or result.get("accepted") is not True:
+                    raise ValueError("delivery unavailable")
+            except Exception:
+                await run_in_threadpool(store.finish_delivery, delivery, request.client.host, False)
+                response = error_response(503, "mail_unavailable", "验证码发送未完成，请稍后重试或联系管理员")
+            else:
+                meta = await run_in_threadpool(store.finish_delivery, delivery, request.client.host, True)
+                if not meta["verification_required"]:
+                    raise MfaError(410, "challenge_expired", "登录验证已失效，请重新输入账号密码")
+                response = JSONResponse(meta, status_code=202 if initial else 200)
+            if initial:
+                response.set_cookie(CHALLENGE_COOKIE, delivery.token, max_age=CHALLENGE_SECONDS, secure=True, httponly=True, samesite="strict", path="/")
+                response.delete_cookie(COOKIE, secure=True, httponly=True, samesite="strict", path="/")
+            return response
+        except asyncio.CancelledError:
+            # 工作线程不会随请求取消；按轮次撤销已完成或尚未完成的验证码。
+            store.invalidate_delivery(delivery)
+            raise
 
     async def call_bridge(method, params=None, audit=None):
         try:
@@ -258,11 +295,46 @@ def create_app(config=None, store=None, bridge=None):
         allowed = await run_in_threadpool(store.allow_attempt, request.client.host, data["username"])
         if not allowed:
             raise ApiError(429, "rate_limited", "登录尝试过于频繁，请在 15 分钟后重试")
-        result = await password_work(store.login, data["username"], data["password"])
-        await run_in_threadpool(store.audit, "login", bool(result), "管理员登录成功" if result else "账号或密码不正确")
+        result = await password_work(store.login, data["username"], data["password"], request.client.host)
+        await run_in_threadpool(store.audit, "login", bool(result), "密码校验通过，等待邮箱验证" if isinstance(result, EmailDelivery) else "管理员登录成功" if result else "账号或密码不正确")
         if not result:
             raise ApiError(401, "invalid_credentials", "账号或密码不正确")
+        if isinstance(result, EmailDelivery):
+            await run_in_threadpool(store.logout, request.cookies.get(COOKIE, ""))
+            return await deliver_code(result, request, initial=True)
         return authenticated_response(result)
+
+    @app.get("/api/login/challenge")
+    async def login_challenge(request: Request):
+        meta = await run_in_threadpool(store.challenge, request.cookies.get(CHALLENGE_COOKIE, ""), request.client.host)
+        response = JSONResponse(meta)
+        if not meta["verification_required"]:
+            clear_challenge_cookie(response)
+        return response
+
+    @app.post("/api/login/verify")
+    async def login_verify(request: Request):
+        data = await json_body(request)
+        if set(data) != {"code"}:
+            raise ApiError(400, "invalid_request", "请仅提交邮箱验证码")
+        result = await run_in_threadpool(store.verify_challenge, request.cookies.get(CHALLENGE_COOKIE, ""), request.client.host, data["code"])
+        return authenticated_response(result)
+
+    @app.post("/api/login/resend")
+    async def login_resend(request: Request):
+        if await json_body(request) != {}:
+            raise ApiError(400, "invalid_request", "此操作不接受额外参数")
+        delivery = await run_in_threadpool(store.resend_challenge, request.cookies.get(CHALLENGE_COOKIE, ""), request.client.host)
+        return await deliver_code(delivery, request)
+
+    @app.post("/api/login/cancel")
+    async def login_cancel(request: Request):
+        if await json_body(request) != {}:
+            raise ApiError(400, "invalid_request", "此操作不接受额外参数")
+        await run_in_threadpool(store.cancel_challenge, request.cookies.get(CHALLENGE_COOKIE, ""), request.client.host)
+        response = JSONResponse({"ok": True})
+        clear_challenge_cookie(response)
+        return response
 
     @app.get("/api/session")
     async def get_session(request: Request):
@@ -292,7 +364,7 @@ def create_app(config=None, store=None, bridge=None):
             raise ApiError(400, "invalid_password", "新密码须为 12 至 128 个字符，并且不同于旧密码") from None
         if not await run_in_threadpool(store.allow_attempt, request.client.host, current["username"], "password"):
             raise ApiError(429, "rate_limited", "密码校验过于频繁，请在 15 分钟后重试")
-        result = await password_work(store.change_password, current["username"], data["current_password"], data["new_password"])
+        result = await password_work(store.change_password, current["username"], data["current_password"], data["new_password"], request.cookies.get(COOKIE, ""))
         await run_in_threadpool(store.audit, "password", bool(result), "管理员密码已更新，旧会话已撤销" if result else "密码校验失败")
         if not result:
             raise ApiError(400, "invalid_password", "旧密码不正确，或新密码与旧密码相同")
@@ -327,6 +399,10 @@ def create_app(config=None, store=None, bridge=None):
     @app.post("/api/actions/run")
     async def run(request: Request):
         return await action(request, "run")
+
+    @app.post("/api/actions/renew")
+    async def renew(request: Request):
+        return await action(request, "renew")
 
     @app.post("/api/actions/check")
     async def check(request: Request):
