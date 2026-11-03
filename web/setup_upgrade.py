@@ -2,6 +2,7 @@
 import contextlib
 import fcntl
 import json
+import math
 import os
 from pathlib import Path
 import re
@@ -16,11 +17,13 @@ DOCKER = '/usr/local/bin/docker'
 CONTAINER = 'synology-cert-web'
 LABEL = 'io.github.784933671.certweb.managed'
 DEFAULT_HOME = Path('/usr/local/share/synology-cert-web')
+HEALTH_WAIT_SECONDS = 180
+RENEWAL_WAIT_SECONDS = 1800
 ACME_STAMP = '3.1.6\n807da6498377ee5e0cf43a78091f46f12dc59a89\nddbe1bcbd1a44a2623a2af167ebdc678669e6e2eb396742f2d1d28e02dc14220\n'
 WEB_FILES = (
     '.dockerignore', '__init__.py', 'Dockerfile', 'compose.yaml', 'requirements.txt',
     'access_policy.py', 'container_entry.py', 'deployment.py', 'healthcheck.py',
-    'host_bridge.py', 'install-web.py', 'login_mail.py', 'monitor.py', 'observability.py', 'startup_check.py', 'network_guard.py', 'tls_sync.py',
+    'host_bridge.py', 'install-web.py', 'login_mail.py', 'monitor.py', 'observability.py', 'startup_check.py', 'adaptive_schedule.py', 'network_guard.py', 'tls_sync.py',
     'frontend/index.html', 'frontend/package.json', 'frontend/package-lock.json',
     'frontend/tsconfig.json', 'frontend/vite.config.ts', 'frontend/vitest.config.ts',
 )
@@ -33,11 +36,20 @@ NATIVE_FILES = {'certctl.py': 'certctl.py', 'run_history.py': 'run_history.py', 
                 'web/host_bridge.py': 'web/host_bridge.py', 'web/access_policy.py': 'web/access_policy.py',
                 'web/login_mail.py': 'web/login_mail.py', 'web/monitor.py': 'web/monitor.py',
                 'web/observability.py': 'web/observability.py',
+                'web/adaptive_schedule.py': 'web/adaptive_schedule.py',
                 'acme/dnsapi/dns_tencent.sh': 'dns_tencent_tracked.sh'}
 
 
 class UpgradeError(RuntimeError):
     pass
+
+
+class UpgradeBusy(UpgradeError):
+    pass
+
+
+class UpgradePending(UpgradeError):
+    """保留运行中的监督进程与升级事务，待稍后确认。"""
 
 
 def safe_errors(method):
@@ -152,7 +164,7 @@ def copy_payload(source_root, destination):
 
 class Upgrade:
     def __init__(self, source_root, home=DEFAULT_HOME, runner=None, uid=0,
-                 clock=time.time, sleeper=time.sleep):
+                 clock=time.monotonic, sleeper=time.sleep):
         self.source = Path(source_root).resolve()
         self.home = Path(home)
         self.runner = runner or run_command
@@ -201,7 +213,7 @@ class Upgrade:
             try:
                 fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
             except BlockingIOError:
-                raise UpgradeError('其他安装或证书任务正在运行，请稍后重试') from None
+                raise UpgradeBusy('其他安装或证书任务正在运行，请稍后重试') from None
             yield
 
     def save_journal(self, state):
@@ -295,14 +307,58 @@ class Upgrade:
                     and item['State'].get('Health', {}).get('Status') == 'healthy')
 
     def wait_healthy(self, image):
-        # 为主机启动稳定窗口和后续 Docker 健康探测留出余量。
-        for _ in range(180):
+        began = previous = self.clock()
+        if not math.isfinite(began):
+            raise UpgradePending('无法确认启动等待时间，已保留监督服务与升级记录，请稍后重新运行恢复')
+        deadline = began + HEALTH_WAIT_SECONDS + RENEWAL_WAIT_SECONDS
+        ready_deadline = began + HEALTH_WAIT_SECONDS
+        while True:
             if self.healthy(image):
                 return
-            self.sleep(1)
-        raise UpgradeError('新版本健康检查失败')
+            current = self.clock()
+            if not math.isfinite(current) or current < previous:
+                raise UpgradePending('启动计时异常，已保留监督服务与升级记录，请稍后重新运行恢复')
+            previous = current
+            try:
+                with self.locked(self.native / 'state/run.lock'):
+                    busy = False
+            except UpgradeBusy:
+                busy = True
+            if busy:
+                ready_deadline = None
+            elif ready_deadline is None:
+                # 续期完成后重新留足容器稳定窗口和健康探测时间。
+                ready_deadline = current + HEALTH_WAIT_SECONDS
+            if ready_deadline is not None and current >= ready_deadline:
+                raise UpgradeError('新版本健康检查失败')
+            if current >= deadline:
+                raise UpgradePending('证书任务或后续启动仍未确认完成，已保留监督服务与升级记录；请任务结束后重新运行恢复')
+            self.sleep(min(1, deadline - current))
 
     def restore(self, state):
+        # 必须先持有续期锁再停止监督，避免超时回滚中切断管理层的恢复能力。
+        try:
+            with self.locked(self.native / 'state/run.lock'):
+                errors = self.restore_idle(state)
+        except UpgradeBusy:
+            raise UpgradePending('证书任务正在运行，尚未停止管理服务或回滚；请任务结束后重新运行恢复') from None
+        if not errors:
+            try:
+                self.lifecycle('start')
+                self.wait_healthy(state['old_image'])
+            except UpgradePending:
+                state['phase'] = 'rollback_failed'
+                self.save_journal(state)
+                raise
+            except (Exception, KeyboardInterrupt):
+                errors.append('restart')
+        state['phase'] = 'rollback_failed' if errors else 'rolled_back'
+        self.save_journal(state)
+        if errors:
+            raise UpgradeError('自动恢复未完成；备份已保留，请重新运行升级恢复，不要删除认证数据')
+        return {'recovered': True, 'backup': str(self.home / 'upgrades' / state['work'])}
+
+    def restore_idle(self, state):
         work = self.home / 'upgrades' / state['work']
         previous = work / 'previous-code'
         backup_code = previous if previous.exists() else self.home / 'code'
@@ -313,7 +369,7 @@ class Upgrade:
             # 停止结果不明确时，后续仍必须独立确认监督锁和所有数据库写入者。
             pass
         try:
-            with self.locked(self.home / 'supervisor.lock'), self.locked(self.native / 'state/run.lock'):
+            with self.locked(self.home / 'supervisor.lock'):
                 self.ensure_writers_stopped()
                 if state['snapshot']:
                     regular(work / 'manifest.json', self.uid, True)
@@ -353,17 +409,23 @@ class Upgrade:
                 self.command([DOCKER, 'tag', state['old_image'], 'synology-cert-web:local'])
         except (Exception, KeyboardInterrupt):
             errors.append('restore')
-        if not errors:
-            try:
+        return errors
+
+    def resume_starting(self, state):
+        try:
+            image = self.command([DOCKER, 'image', 'inspect', state['tag'], '--format', '{{.Id}}']).strip()
+            if not re.fullmatch(r'sha256:[0-9a-f]{64}', image):
+                raise UpgradeError('待确认升级镜像无效')
+            if not self.healthy(image):
                 self.lifecycle('start')
-                self.wait_healthy(state['old_image'])
-            except (Exception, KeyboardInterrupt):
-                errors.append('restart')
-        state['phase'] = 'rollback_failed' if errors else 'rolled_back'
-        self.save_journal(state)
-        if errors:
-            raise UpgradeError('自动恢复未完成；备份已保留，请重新运行升级恢复，不要删除认证数据')
-        return {'recovered': True, 'backup': str(work)}
+                self.wait_healthy(image)
+            state['phase'] = 'complete'
+            self.save_journal(state)
+            return {'recovered': True, 'backup': str(self.home / 'upgrades' / state['work'])}
+        except UpgradePending:
+            raise
+        except (Exception, KeyboardInterrupt):
+            return self.restore(state)
 
     @safe_errors
     def recover(self):
@@ -374,6 +436,8 @@ class Upgrade:
             state = self.read_journal()
             if state['phase'] in ('complete', 'rolled_back'):
                 return {'recovered': False}
+            if state['phase'] == 'starting':
+                return self.resume_starting(state)
             return self.restore(state)
 
     @safe_errors
@@ -383,6 +447,8 @@ class Upgrade:
             if self.journal.exists():
                 state = self.read_journal()
                 if state['phase'] not in ('complete', 'rolled_back'):
+                    if state['phase'] == 'starting':
+                        return self.resume_starting(state)
                     return self.restore(state)
             changes = self.native_changes()
             item = self.inspect_container()
@@ -431,6 +497,8 @@ class Upgrade:
                 state['phase'] = 'complete'
                 self.save_journal(state)
                 return {'upgraded': True, 'image_tag': tag, 'backup': str(work)}
+            except UpgradePending:
+                raise
             except (Exception, KeyboardInterrupt):
                 if not stop_attempted:
                     state['phase'] = 'rolled_back'

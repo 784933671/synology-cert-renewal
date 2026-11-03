@@ -103,7 +103,8 @@ class BridgeTests(unittest.TestCase):
         current = self.bridge.settings_get()
         keys = ('revision', 'certificate_id', 'email', 'renew_before_days', 'probes', 'schedule', 'notifications')
         result = {key: copy.deepcopy(current[key]) for key in keys}
-        result['schedule'].pop('editable')
+        for key in ('editable', 'active_mode', 'message'):
+            result['schedule'].pop(key, None)
         return result
 
     def request(self, method, params=None):
@@ -115,6 +116,103 @@ class BridgeTests(unittest.TestCase):
     def monitor_params(self):
         value = self.bridge.monitor_get()
         return {key: value[key] for key in ('revision', 'enabled', 'missed_runs', 'grace_minutes', 'expiry_hours')}
+
+    def adaptive_params(self):
+        params = self.params()
+        params['schedule'] = {'enabled': True, 'mode': 'adaptive', 'interval_hours': 1, 'hour': 3, 'minute': 18}
+        return params
+
+    def verified_current(self):
+        controller = self.bridge.controller()
+        candidate = controller.candidate()
+        candidate.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+        candidate.write_text('fixture')
+        executor.save_json(self.home / 'state/last-result.json',
+                           {'at': executor.now(), 'success': True, 'fingerprint': 'a' * 64})
+
+    def test_adaptive_plan_persists_base_time_and_returns_physical_mode(self):
+        self.verified_current()
+        value = self.bridge.settings_update(self.adaptive_params())
+        self.assertEqual(value['schedule']['mode'], 'adaptive')
+        self.assertEqual(value['schedule']['active_mode'], 'daily')
+        self.assertEqual(value['schedule']['hour'], 3)
+        self.assertEqual(value['schedule']['minute'], 18)
+        preferences = executor.read_json(self.home / 'state/web-preferences.json')
+        self.assertEqual(preferences['adaptive_schedule'], {'version': 1, 'hour': 3, 'minute': 18})
+        self.assertEqual(self.scheduler.runs, 0)
+        self.assertEqual(self.read_config(), config())
+        self.assertIn('自适应', self.bridge.status()['task']['schedule_text'])
+
+    def test_adaptive_plan_uses_hourly_when_in_window_or_result_unconfirmed(self):
+        value = self.bridge.settings_update(self.adaptive_params())
+        self.assertEqual(value['schedule']['active_mode'], 'hourly')
+        self.assertEqual(bridge_module.read_schedule(self.scheduler.task)['interval_hours'], 1)
+        self.verified_current()
+        with mock.patch.object(executor, 'certificate_expiry', return_value=int(time.time()) + 3600):
+            value = self.bridge.settings_update(self.adaptive_params())
+        self.assertEqual(value['schedule']['active_mode'], 'hourly')
+        self.assertEqual(self.scheduler.runs, 0)
+
+    def test_switching_back_to_fixed_plan_removes_adaptive_without_losing_mail_preference(self):
+        self.bridge.settings_update(self.adaptive_params())
+        params = self.params(); params['schedule'].update(mode='daily', hour=6, minute=40)
+        result = self.bridge.settings_update(params)
+        self.assertEqual(result['schedule']['mode'], 'daily')
+        self.assertNotIn('adaptive_schedule', executor.read_json(self.home / 'state/web-preferences.json'))
+        self.assertEqual(executor.read_json(self.home / 'state/web-preferences.json')['success_email'], 'success@example.com')
+
+    def test_failed_adaptive_save_restores_previous_task_and_preferences(self):
+        self.verified_current()
+        executor.save_json(self.home / 'state/web-preferences.json', {'success_email': 'old@example.com'})
+        before = (self.home / 'state/web-preferences.json').read_bytes()
+        original_task = self.scheduler.get()
+        self.preflight.side_effect = executor.Failure('preflight failed')
+        with self.assertRaises(bridge_module.BridgeError): self.bridge.settings_update(self.adaptive_params())
+        self.assertEqual((self.home / 'state/web-preferences.json').read_bytes(), before)
+        self.assertEqual(self.scheduler.get(), original_task)
+        self.assertFalse(self.bridge.transaction.exists())
+
+    def test_invalid_adaptive_fields_are_rejected_before_mutation(self):
+        for key, invalid in (('hour', 24), ('minute', True), ('interval_hours', 2), ('enabled', 1)):
+            params = self.adaptive_params(); params['schedule'][key] = invalid
+            with self.assertRaises(bridge_module.BridgeError): self.bridge.settings_update(params)
+        self.assertEqual(self.scheduler.writes, [])
+
+    def test_adaptive_display_exposes_pending_sync_and_external_plan_conflict(self):
+        self.verified_current()
+        self.bridge.settings_update(self.adaptive_params())
+        with mock.patch.object(executor, 'certificate_expiry', return_value=int(time.time()) + 3600):
+            value = self.bridge.settings_get()['schedule']
+            self.assertEqual(value['active_mode'], 'daily')
+            self.assertIn('待同步', value['message'])
+        self.scheduler.task['schedule']['minute'] = 19
+        value = self.bridge.settings_get()['schedule']
+        self.assertFalse(value['editable'])
+        self.assertIn('另外修改', value['message'])
+
+    def test_adaptive_display_surfaces_safe_sync_failure(self):
+        self.verified_current()
+        self.bridge.settings_update(self.adaptive_params())
+        self.bridge.management_home = self.home
+        executor.save_json(self.home / 'adaptive-schedule.json', {'version': 1, 'status': 'error', 'message': 'SECRET', 'at': executor.now(), 'plan': {'version': 1, 'hour': 3, 'minute': 18}, 'certificate_id': 'ABC123'})
+        value = self.bridge.settings_get()['schedule']
+        self.assertIn('未确认', value['message'])
+        self.assertNotIn('SECRET', value['message'])
+
+    def test_adaptive_display_does_not_reuse_expired_or_other_plan_error(self):
+        self.verified_current()
+        self.bridge.settings_update(self.adaptive_params())
+        self.bridge.management_home = self.home
+        value = {'version': 1, 'status': 'error', 'message': 'SECRET', 'at': bridge_module.utc(time.time() - 181),
+                 'plan': {'version': 1, 'hour': 3, 'minute': 18}, 'certificate_id': 'ABC123'}
+        executor.save_json(self.home / 'adaptive-schedule.json', value)
+        self.assertIn('已过期', self.bridge.settings_get()['schedule']['message'])
+        value.update(at=executor.now(), plan={'version': 1, 'hour': 4, 'minute': 18})
+        executor.save_json(self.home / 'adaptive-schedule.json', value)
+        self.assertIn('等待自适应同步确认', self.bridge.settings_get()['schedule']['message'])
+        value.update(plan={'version': 1, 'hour': 3, 'minute': 18}, certificate_id='OTHER')
+        executor.save_json(self.home / 'adaptive-schedule.json', value)
+        self.assertIn('等待自适应同步确认', self.bridge.settings_get()['schedule']['message'])
 
     def test_monitor_config_changes_without_mutating_renewal_or_credentials(self):
         before = (self.home / 'config.json').read_bytes()
@@ -1065,6 +1163,31 @@ class LifecycleTests(unittest.TestCase):
 
 
 class SchedulerTests(unittest.TestCase):
+    def test_dispatch_callback_runs_only_after_read_and_executable_checks(self):
+        home = Path('/private/cert')
+        events = []
+        scheduler = bridge_module.Scheduler(home, lambda *args, **kwargs: events.append('capture'))
+        scheduler.get = mock.Mock(side_effect=lambda: events.append('get'))
+        with mock.patch.object(bridge_module.shutil, 'which', return_value='/usr/syno/bin/synoschedtask'):
+            scheduler.run(before_dispatch=lambda: events.append('claim'))
+        self.assertEqual(events, ['get', 'claim', 'capture'])
+        events.clear()
+        scheduler.get.side_effect = bridge_module.BridgeError('unavailable', 'get failed')
+        with self.assertRaises(bridge_module.BridgeError):
+            scheduler.run(before_dispatch=lambda: events.append('claim'))
+        self.assertEqual(events, [])
+        scheduler.get.side_effect = None
+        with mock.patch.object(bridge_module.shutil, 'which', return_value=None), self.assertRaises(bridge_module.BridgeError):
+            scheduler.run(before_dispatch=lambda: events.append('claim'))
+        self.assertEqual(events, [])
+
+    def test_dispatch_callback_failure_prevents_command_execution(self):
+        scheduler = bridge_module.Scheduler(Path('/private/cert'), mock.Mock())
+        scheduler.get = mock.Mock()
+        with mock.patch.object(bridge_module.shutil, 'which', return_value='/usr/syno/bin/synoschedtask'), self.assertRaises(OSError):
+            scheduler.run(before_dispatch=mock.Mock(side_effect=OSError('claim fsync failed')))
+        scheduler.capture.assert_not_called()
+
     def test_fixed_task_only_and_readback_mismatch_is_an_error(self):
         scheduler = bridge_module.Scheduler(Path('/private/cert'))
         value = task(Path('/private/cert'))

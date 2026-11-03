@@ -26,11 +26,12 @@ export interface Probe {
 }
 export interface Schedule {
   enabled: boolean
-  mode: 'hourly' | 'daily' | 'unsupported'
+  mode: 'hourly' | 'daily' | 'adaptive' | 'unsupported'
   interval_hours: number
   hour: number
   minute: number
   editable?: boolean
+  active_mode?: 'daily' | 'hourly'
   message?: string
 }
 export interface Notifications {

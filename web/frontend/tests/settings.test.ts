@@ -119,6 +119,37 @@ describe('配置校验与最小提交', () => {
       failure_email: 'error@example.com',
     })
   })
+  it('自适应保留每日基准时间，提交时去掉执行频率和提示等只读字段', () => {
+    const original = settings()
+    original.schedule = { ...original.schedule, mode: 'adaptive', hour: 3, minute: 18,
+      interval_hours: 12, active_mode: 'hourly', editable: true, message: '正在处理待办' }
+    const draft = makeDraft(original)
+    expect(validateDraft(draft, original)).toEqual([])
+    expect(buildPayload(draft, original.revision).schedule).toEqual({
+      enabled: true, mode: 'adaptive', interval_hours: 1, hour: 3, minute: 18,
+    })
+    draft.schedule.hour = 6
+    expect(original.schedule.hour).toBe(3)
+  })
+  it.each([-1, 24, 1.5, Number.NaN])('自适应每日基准小时无效时拒绝保存 %s', (hour) => {
+    const original = settings(), draft = makeDraft(original)
+    draft.schedule.mode = 'adaptive'
+    draft.schedule.hour = hour
+    expect(validateDraft(draft, original)).toContain('检查小时必须是 0～23 的整数。')
+  })
+  it('自适应只读计划仍禁止保存，改回固定计划不携带自适应展示字段', () => {
+    const original = settings(), draft = makeDraft(original)
+    draft.schedule = { ...draft.schedule, mode: 'adaptive', hour: 3, minute: 18,
+      active_mode: 'daily', editable: false, message: '执行计划已变化' }
+    expect(validateDraft(draft, original)).toContain('当前计划无法通过网页修改，请先检查群晖任务计划。')
+    draft.schedule.editable = true
+    draft.schedule.mode = 'hourly'
+    draft.schedule.interval_hours = 6
+    expect(validateDraft(draft, original)).toEqual([])
+    expect(buildPayload(draft, original.revision).schedule).toEqual({
+      enabled: true, mode: 'hourly', interval_hours: 6, hour: 0, minute: 18,
+    })
+  })
   it('关闭的通知可留空，但非空邮箱仍必须有效', () => {
     const original = settings(),
       draft = makeDraft(original)

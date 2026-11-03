@@ -349,10 +349,11 @@ class DeploymentRecoveryTests(unittest.TestCase):
         events = []
         self.service.stop_container = Mock(side_effect=lambda: events.append('container'))
         self.service.stop_startup_check = Mock(side_effect=lambda: events.append('startup'))
+        self.service.stop_schedule_sync = Mock(side_effect=lambda: events.append('schedule'))
         self.service.stop_monitor = Mock(side_effect=lambda: events.append('monitor'))
         with patch('web.deployment.signal.signal'), patch('builtins.print'):
             self.service.serve()
-        self.assertEqual(events, ['container', 'startup', 'monitor'])
+        self.assertEqual(events, ['container', 'schedule', 'startup', 'monitor'])
 
     def test_monitor_shutdown_kills_child_after_bounded_timeout(self):
         child = Mock(); child.poll.return_value = None
@@ -779,6 +780,78 @@ class StartupRenewalTests(unittest.TestCase):
         self.service.stop_startup_check()
         self.child.terminate.assert_called_once(); self.child.kill.assert_called_once()
         self.assertEqual([call.kwargs['timeout'] for call in self.child.wait.call_args_list], [5, 5])
+
+
+class AdaptiveScheduleProcessTests(unittest.TestCase):
+    def setUp(self):
+        temporary = tempfile.TemporaryDirectory(); self.addCleanup(temporary.cleanup)
+        self.home = Path(temporary.name).resolve()
+        code = self.home / 'code'; code.mkdir()
+        self.script = code / 'adaptive_schedule.py'; self.script.write_text('')
+        self.now = 0
+        config = {'home': str(self.home), 'native_home': str(self.home / 'native'), 'task_id': 31,
+                  'bind': '10.10.10.37', 'networks': ['10.10.10.0/24'], 'denied': ['10.10.10.1'], 'port': 18443}
+        self.service = deployment.Deployment(config, self.home / 'deployment.json', clock=lambda: self.now)
+        self.service.startup_requested_generation = ('f' * 64, '2026-11-03T07:00:00Z')
+        self.child = Mock(); self.child.poll.return_value = None
+        patcher = patch('web.deployment.subprocess.Popen', return_value=self.child)
+        self.spawn = patcher.start(); self.addCleanup(patcher.stop)
+
+    def tick(self, when):
+        self.now = when; self.service.start_schedule_sync()
+
+    def test_one_fixed_helper_per_minute_and_never_overlaps(self):
+        self.tick(0); self.tick(59); self.tick(60)
+        self.spawn.assert_called_once()
+        self.child.poll.return_value = 0
+        self.tick(60)
+        self.assertEqual(self.spawn.call_count, 2)
+        self.tick(61); self.assertEqual(self.spawn.call_count, 2)
+        args = self.spawn.call_args.args[0]
+        self.assertEqual(args, [deployment.sys.executable, '-I', str(self.script),
+                               '--native-home', str(self.home / 'native'), '--web-home', str(self.home), '--task-id', '31'])
+        self.assertNotIn('--run', args)
+
+    def test_no_sync_before_supervisor_ownership_or_after_shutdown(self):
+        self.service.startup_requested_generation = None
+        self.tick(0)
+        self.service.startup_requested_generation = ('a' * 64, '2026-11-03T07:00:00Z')
+        self.service.stopping = True; self.tick(60)
+        self.spawn.assert_not_called()
+
+    def test_long_helper_is_terminated_reaped_and_retried_without_blocking(self):
+        self.tick(0); self.tick(119); self.child.terminate.assert_not_called()
+        self.tick(120); self.child.terminate.assert_called_once()
+        self.tick(124); self.child.kill.assert_not_called()
+        self.tick(125); self.child.kill.assert_called_once()
+        self.tick(130); self.child.kill.assert_called_once()
+        self.child.wait.assert_not_called(); self.spawn.assert_called_once()
+        self.child.poll.return_value = -9; self.tick(140)
+        self.assertEqual(self.spawn.call_count, 2)
+
+    def test_prelaunch_failure_is_bounded_and_does_not_stop_container(self):
+        self.service.stop_container = Mock()
+        self.spawn.side_effect = OSError('PRIVATE_DETAIL')
+        self.tick(0); self.tick(59); self.spawn.assert_called_once()
+        self.tick(60); self.assertEqual(self.spawn.call_count, 2)
+        self.spawn.side_effect = None; self.script.chmod(0o666)
+        self.tick(120); self.assertEqual(self.spawn.call_count, 2)
+        self.script.unlink(); self.script.symlink_to('/dev/null')
+        self.tick(180); self.assertEqual(self.spawn.call_count, 2)
+        self.service.stop_container.assert_not_called()
+
+    def test_failure_exit_retries_next_minute_without_touching_original_task(self):
+        self.tick(0)
+        self.child.poll.return_value = 1; self.tick(10)
+        self.spawn.assert_called_once()
+        self.tick(60); self.assertEqual(self.spawn.call_count, 2)
+
+    def test_shutdown_reaps_sync_with_bounded_wait(self):
+        self.tick(0)
+        self.child.wait.side_effect = [subprocess.TimeoutExpired('sync', 5), 0]
+        self.service.stop_schedule_sync()
+        self.child.terminate.assert_called_once(); self.child.kill.assert_called_once()
+        self.assertEqual([x.kwargs['timeout'] for x in self.child.wait.call_args_list], [5, 5])
 
 
 class ContainerTLSReloadTests(unittest.TestCase):

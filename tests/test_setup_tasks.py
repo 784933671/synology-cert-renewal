@@ -79,6 +79,28 @@ class TaskSetupTests(unittest.TestCase):
         self.assertEqual(sum(call[1] == 'set' for call in self.api.calls), 1)
         self.assertEqual((self.root / 'task.json').stat().st_mode & 0o777, 0o600)
 
+    def test_new_task_initializes_adaptive_once_and_preserves_fixed_preferences_on_reentry(self):
+        task = self.setup.ensure('admin@example.com')
+        path = self.home / 'state/web-preferences.json'
+        self.assertEqual(json.loads(path.read_text()), {'adaptive_schedule': {'version': 1, 'hour': 3, 'minute': 18}})
+        path.write_text('{"success_email":"fixed@example.com"}')
+        self.setup.ensure('admin@example.com')
+        self.setup.activate(task['id'])
+        self.assertEqual(json.loads(path.read_text()), {'success_email': 'fixed@example.com'})
+
+    def test_adoption_never_creates_or_overwrites_adaptive_preferences(self):
+        self.api.existing()
+        self.setup.ensure('admin@example.com')
+        self.assertFalse((self.home / 'state/web-preferences.json').exists())
+
+    def test_lost_create_response_resumes_default_adaptive_initialization(self):
+        self.api.fail_create = 'after'
+        with self.assertRaises(RuntimeError): self.setup.ensure('admin@example.com')
+        self.api.fail_create = None
+        self.setup.ensure('admin@example.com')
+        self.assertEqual(json.loads((self.home / 'state/web-preferences.json').read_text())['adaptive_schedule'],
+                         {'version': 1, 'hour': 3, 'minute': 18})
+
     def test_completed_activation_does_not_override_later_user_changes(self):
         task = self.setup.ensure('admin@example.com')
         self.setup.activate(task['id'])
@@ -189,7 +211,7 @@ class PreparationTests(unittest.TestCase):
         self.native = self.root / 'native';self.native.mkdir(mode=0o700)
         for name in ('config.json', 'certctl.py'):(self.native / name).write_text('{}')
         self.source = self.root / 'source';self.source.mkdir(mode=0o700)
-        self.sources = ['Dockerfile', 'compose.yaml', 'deployment.py', 'host_bridge.py', 'login_mail.py', 'monitor.py', 'observability.py', 'startup_check.py',
+        self.sources = ['Dockerfile', 'compose.yaml', 'deployment.py', 'host_bridge.py', 'login_mail.py', 'monitor.py', 'observability.py', 'startup_check.py', 'adaptive_schedule.py',
                         'access_policy.py', 'backend/app.py', 'frontend/package.json']
         for name in self.sources:
             path = self.source / name;path.parent.mkdir(parents=True, exist_ok=True)

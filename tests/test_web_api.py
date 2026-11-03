@@ -484,6 +484,47 @@ class WebApiTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual((await self.client.put("/api/settings", json=value, headers=headers)).status_code, 400)
         self.assertEqual(len(self.bridge.calls), 1)
 
+    async def test_adaptive_settings_save_requires_login_csrf_and_reaches_bridge(self):
+        data = settings_payload()
+        data["schedule"].update(mode="adaptive", hour=3, minute=18)
+        response = await self.client.put("/api/settings", json=data, headers={"Origin": ORIGIN})
+        self.assertEqual(response.status_code, 401)
+        headers = await self.ready()
+        response = await self.client.put("/api/settings", json=data, headers={"Origin": ORIGIN})
+        self.assertEqual(response.status_code, 403)
+        self.assertEqual(self.bridge.calls, [])
+        response = await self.client.put("/api/settings", json=data, headers=headers)
+        self.assertEqual(response.status_code, 200, response.text)
+        self.assertEqual(self.bridge.calls, [("settings.update", data)])
+        audit = (await self.client.get("/api/audit")).json()
+        self.assertIn("settings.update", [item["action"] for item in audit["items"]])
+
+    async def test_adaptive_settings_only_accepts_one_hour_interval(self):
+        headers = await self.ready()
+        for interval in (0, 2, 3, 4, 6, 8, 12, True, "1"):
+            with self.subTest(interval=interval):
+                data = settings_payload()
+                data["schedule"].update(mode="adaptive", hour=3, minute=18, interval_hours=interval)
+                response = await self.client.put("/api/settings", json=data, headers=headers)
+                self.assertEqual(response.status_code, 400, response.text)
+        self.assertEqual(self.bridge.calls, [])
+        data = settings_payload()
+        data["schedule"].update(mode="adaptive", hour=3, minute=18, interval_hours=1)
+        self.assertEqual((await self.client.put("/api/settings", json=data, headers=headers)).status_code, 200)
+        self.assertEqual(self.bridge.calls, [("settings.update", data)])
+
+    async def test_adaptive_settings_rejects_display_fields_and_arbitrary_options(self):
+        headers = await self.ready()
+        for field, value in (("active_mode", "hourly"), ("message", "ok"), ("editable", True),
+                             ("window_hours", 48), ("command", "anything")):
+            with self.subTest(field=field):
+                data = settings_payload()
+                data["schedule"].update(mode="adaptive", hour=3, minute=18)
+                data["schedule"][field] = value
+                response = await self.client.put("/api/settings", json=data, headers=headers)
+                self.assertEqual(response.status_code, 400, response.text)
+        self.assertEqual(self.bridge.calls, [])
+
     async def test_settings_nested_fields_validated(self):
         headers = await self.ready()
         for key, values in (("schedule", {"minute": 60, "hour": 24, "interval_hours": 5, "mode": "unsupported", "enabled": "yes"}),
@@ -713,6 +754,29 @@ class BridgeProtocolTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(self.requests[-1], {"method": "settings.update", "params": payload})
             self.assertNotIn("fixture-secret", updated.text)
             self.assertNotIn("fixture-secret", (await client.get("/api/audit")).text)
+
+    async def test_authenticated_adaptive_settings_reaches_real_unix_socket(self):
+        data_dir = Path(self.tmp.name) / "data"
+        store = AuthStore(data_dir)
+        store.initialize("admin", INITIAL_PASSWORD)
+        with store.transaction() as connection:
+            connection.execute("UPDATE users SET must_change=0")
+        app = create_app(Config(data_dir=data_dir, bridge_socket=self.socket, allowed_networks=("10.10.10.0/24",),
+                                allowed_hosts=("ttxli.cn:18443",), origin=ORIGIN), store, self.bridge)
+        async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app, client=("10.10.10.24", 43210)), base_url=ORIGIN) as client:
+            response = await client.post("/api/login", json={"username": "admin", "password": INITIAL_PASSWORD}, headers={"Origin": ORIGIN})
+            self.assertEqual(response.status_code, 200)
+            headers = {"Origin": ORIGIN, "X-CSRF-Token": response.json()["csrf_token"]}
+            payload = settings_payload()
+            payload["schedule"].update(mode="adaptive", hour=3, minute=18)
+            saved = copy.deepcopy(payload)
+            saved["schedule"].update(active_mode="daily", editable=True, message="当前每天检查")
+            self.response = json.dumps({"ok": True, "data": saved}).encode() + b"\n"
+            response = await client.put("/api/settings", json=payload, headers=headers)
+            self.assertEqual(response.status_code, 200, response.text)
+            self.assertEqual(response.json()["schedule"]["mode"], "adaptive")
+            self.assertEqual(response.json()["schedule"]["active_mode"], "daily")
+            self.assertEqual(self.requests, [{"method": "settings.update", "params": payload}])
 
     async def test_response_sanitizes_secret_fields_and_labeled_text(self):
         self.response = json.dumps({"ok": True, "data": {"secret_id": "fixture-secret-id", "secret_key": "fixture-secret-key",

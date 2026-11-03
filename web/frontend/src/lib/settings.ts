@@ -29,7 +29,7 @@ export function validateDraft(draft: Draft, settings: Settings): string[] {
   if (!integer(draft.renew_before_days, 1, 30))
     errors.push('提前续期时间必须是 1～30 天的整数。')
   const plan = draft.schedule
-  if (!['hourly', 'daily'].includes(plan.mode) || plan.editable === false)
+  if (!['hourly', 'daily', 'adaptive'].includes(plan.mode) || plan.editable === false)
     errors.push('当前计划无法通过网页修改，请先检查群晖任务计划。')
   if (!integer(plan.minute, 0, 59)) errors.push('检查分钟必须是 0～59 的整数。')
   if (
@@ -37,7 +37,7 @@ export function validateDraft(draft: Draft, settings: Settings): string[] {
     ![1, 2, 3, 4, 6, 8, 12].includes(plan.interval_hours)
   )
     errors.push('请选择支持的小时检查频率。')
-  if (plan.mode === 'daily' && !integer(plan.hour, 0, 23))
+  if (['daily', 'adaptive'].includes(plan.mode) && !integer(plan.hour, 0, 23))
     errors.push('检查小时必须是 0～23 的整数。')
   if (
     (draft.notifications.success_enabled ||
@@ -98,7 +98,7 @@ export function buildPayload(draft: Draft, revision: string) {
       enabled: draft.schedule.enabled,
       mode: draft.schedule.mode,
       interval_hours:
-        draft.schedule.mode === 'daily' ? 1 : draft.schedule.interval_hours,
+        draft.schedule.mode === 'hourly' ? draft.schedule.interval_hours : 1,
       hour: draft.schedule.mode === 'hourly' ? 0 : draft.schedule.hour,
       minute: draft.schedule.minute,
     },

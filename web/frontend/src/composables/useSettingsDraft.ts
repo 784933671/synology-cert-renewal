@@ -19,7 +19,7 @@ export function useSettingsDraft() {
   const writable = computed(
     () =>
       !!draft.value &&
-      ['hourly', 'daily'].includes(draft.value.schedule.mode) &&
+      ['hourly', 'daily', 'adaptive'].includes(draft.value.schedule.mode) &&
       draft.value.schedule.editable !== false,
   )
   function accept(value: Settings) {

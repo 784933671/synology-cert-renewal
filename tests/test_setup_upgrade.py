@@ -6,9 +6,11 @@ import shutil
 import sqlite3
 import tempfile
 import unittest
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
-from web.setup_upgrade import Upgrade, UpgradeError, ACME_STAMP, NATIVE_FILES, copy_payload
+from web.setup_upgrade import (Upgrade, UpgradeError, UpgradePending, ACME_STAMP, NATIVE_FILES,
+                               HEALTH_WAIT_SECONDS, RENEWAL_WAIT_SECONDS, copy_payload)
+from web.deployment import Deployment
 
 ROOT = Path(__file__).resolve().parents[1]
 OLD = 'sha256:' + '1' * 64
@@ -29,6 +31,7 @@ class DockerFixture:
         self.other_writer = False
         self.migrate = False
         self.before_stop = None
+        self.after_start = None
 
     def __call__(self, args, timeout=60):
         self.calls.append(args)
@@ -69,6 +72,8 @@ class DockerFixture:
             if self.migrate and self.image == NEW:
                 with sqlite3.connect(str(self.home / 'data/auth.sqlite3')) as c:
                     c.execute('CREATE TABLE upgraded_table (value TEXT)')
+            if self.after_start:
+                self.after_start()
         else:
             raise AssertionError(args)
         return ''
@@ -111,7 +116,33 @@ class UpgradeTests(unittest.TestCase):
         (self.home / 'data/auth.sqlite3').chmod(0o600)
         self.original_db = (self.home / 'data/auth.sqlite3').read_bytes()
         self.runner = DockerFixture(self.home)
-        self.upgrade = Upgrade(self.source, self.home, runner=self.runner, uid=os.getuid(), sleeper=lambda _: None)
+        self.elapsed = 0
+        self.upgrade = Upgrade(self.source, self.home, runner=self.runner, uid=os.getuid(),
+                               clock=lambda: self.elapsed, sleeper=self.advance)
+
+    def advance(self, seconds):
+        self.elapsed += seconds
+
+    def hold_renewal(self):
+        path = self.native / 'state/run.lock'
+        if not path.exists():
+            self.write(path, '')
+        handle = path.open('a')
+        self.addCleanup(handle.close)
+        fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        return handle
+
+    def start_busy_upgrade(self):
+        handles = []
+        def start():
+            if self.runner.image == NEW:
+                if not handles:
+                    handles.append(self.hold_renewal())
+                self.runner.running = False
+        self.runner.after_start = start
+        with self.assertRaises(UpgradePending):
+            self.upgrade.run()
+        return handles[0]
 
     @staticmethod
     def write(path, text):
@@ -166,6 +197,144 @@ class UpgradeTests(unittest.TestCase):
         self.assertTrue(self.runner.running)
         self.assertEqual(json.loads(self.upgrade.journal.read_text())['phase'], 'rolled_back')
         self.assert_preserved()
+
+    def test_long_startup_renewal_has_full_health_budget_after_real_lock_releases(self):
+        handles = []
+        def start():
+            if self.runner.image == NEW:
+                handles.append(self.hold_renewal())
+                self.runner.running = False
+                service = Deployment({'home': str(self.home), 'native_home': str(self.native),
+                    'bind': '10.10.10.37', 'networks': ['10.10.10.0/24'], 'denied': ['10.10.10.1'],
+                    'port': 18443, 'hostname': 'ttxli.cn'}, self.home / 'deployment.json')
+                (self.home / 'tls').mkdir()
+                (self.home / 'tls/current.cert').write_text('existing certificate')
+                service.apply_access_policy = Mock(return_value={'mode': 'lan'})
+                service.start_bridge = Mock()
+                service.bridge_ready = Mock(return_value=True)
+                service.container = Mock(return_value={'State': {'Running': False, 'Restarting': False}})
+                service.compose = Mock()
+                service.reconcile()
+                state = json.loads((self.home / 'deployment-state.json').read_text())
+                self.assertEqual((state['stage'], state['status']), ('tls', 'waiting'))
+                service.compose.assert_not_called()
+        self.runner.after_start = start
+        def advance(seconds):
+            self.advance(seconds)
+            if self.elapsed >= 240 and not handles[0].closed:
+                handles[0].close()
+            if self.elapsed >= 240 + HEALTH_WAIT_SECONDS - 1:
+                self.runner.running = True
+        self.upgrade.sleep = advance
+        with patch('web.setup_upgrade.time', Mock(time=Mock(side_effect=AssertionError('wall clock used')))):
+            result = self.upgrade.run()
+        self.assertTrue(result['upgraded'])
+        self.assertEqual(self.elapsed, 240 + HEALTH_WAIT_SECONDS - 1)
+        self.assertEqual(sum(args[-1] == 'stop' for args in self.runner.calls), 1)
+        self.assertEqual(json.loads(self.upgrade.journal.read_text())['phase'], 'complete')
+        self.assert_preserved()
+
+    def test_long_busy_timeout_keeps_supervisor_and_starting_transaction_for_recovery(self):
+        handle = self.start_busy_upgrade()
+        self.assertEqual(self.elapsed, RENEWAL_WAIT_SECONDS + HEALTH_WAIT_SECONDS)
+        self.assertEqual(sum(args[-1] == 'stop' for args in self.runner.calls), 1)
+        self.assertEqual(json.loads(self.upgrade.journal.read_text())['phase'], 'starting')
+        self.assertNotEqual((self.home / 'code/deployment.py').read_text(), '# original deployment\n')
+        self.assert_preserved()
+        handle.close()
+        self.runner.running = True
+        calls = len(self.runner.calls)
+        self.assertTrue(self.upgrade.recover()['recovered'])
+        self.assertEqual(json.loads(self.upgrade.journal.read_text())['phase'], 'complete')
+        self.assertFalse(any(args[-1] in ('stop', 'start') for args in self.runner.calls[calls:]))
+        self.assertEqual(self.runner.image, NEW)
+
+    def test_upgrade_retry_confirms_pending_start_before_new_package_can_be_applied(self):
+        handle = self.start_busy_upgrade()
+        handle.close()
+        self.runner.running = True
+        calls = len(self.runner.calls)
+        self.assertTrue(self.upgrade.run()['recovered'])
+        self.assertEqual(json.loads(self.upgrade.journal.read_text())['phase'], 'complete')
+        self.assertFalse(any(args[-1] in ('stop', 'start') for args in self.runner.calls[calls:]))
+
+    def test_recovery_while_renewal_still_busy_does_not_stop_supervisor(self):
+        self.start_busy_upgrade()
+        stops = sum(args[-1] == 'stop' for args in self.runner.calls)
+        with self.assertRaises(UpgradePending):
+            self.upgrade.recover()
+        self.assertEqual(sum(args[-1] == 'stop' for args in self.runner.calls), stops)
+        self.assertEqual(json.loads(self.upgrade.journal.read_text())['phase'], 'starting')
+        self.assert_preserved()
+
+    def test_failed_health_cannot_stop_service_if_renewal_wins_rollback_race(self):
+        self.runner.failed_health = True
+        actual_wait = self.upgrade.wait_healthy
+        handles = []
+        def wait(image):
+            try:
+                actual_wait(image)
+            except UpgradeError:
+                handles.append(self.hold_renewal())
+                raise
+        self.upgrade.wait_healthy = wait
+        with self.assertRaises(UpgradePending):
+            self.upgrade.run()
+        self.assertEqual(sum(args[-1] == 'stop' for args in self.runner.calls), 1)
+        self.assertTrue(self.runner.running)
+        self.assertEqual(json.loads(self.upgrade.journal.read_text())['phase'], 'starting')
+        handles[0].close()
+        self.upgrade.wait_healthy = actual_wait
+        self.assertTrue(self.upgrade.recover()['recovered'])
+        self.assertEqual(json.loads(self.upgrade.journal.read_text())['phase'], 'rolled_back')
+        self.assertEqual(self.runner.image, OLD)
+        self.assert_preserved()
+
+    def test_restore_holds_run_lock_before_stopping_and_releases_before_restart(self):
+        self.runner.failed_health = True
+        runner = self.runner
+        stops = []
+        starts = []
+        def command(args, timeout=60):
+            if not args[0].endswith('docker'):
+                path = self.native / 'state/run.lock'
+                with path.open('a') as handle:
+                    try:
+                        fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                        busy = False
+                    except BlockingIOError:
+                        busy = True
+                (stops if args[-1] == 'stop' else starts).append(busy)
+            return runner(args, timeout)
+        self.upgrade.runner = command
+        with self.assertRaisesRegex(UpgradeError, '已恢复原版本'):
+            self.upgrade.run()
+        self.assertEqual(stops, [True, True])
+        self.assertEqual(starts, [False, False])
+        self.assert_preserved()
+
+    def test_interruption_during_busy_health_wait_keeps_supervisor_for_completion(self):
+        def start():
+            self.hold_renewal()
+            self.runner.running = False
+        self.runner.after_start = start
+        def interrupt(_seconds):
+            raise KeyboardInterrupt()
+        self.upgrade.sleep = interrupt
+        with self.assertRaises(UpgradePending):
+            self.upgrade.run()
+        self.assertEqual(sum(args[-1] == 'stop' for args in self.runner.calls), 1)
+        self.assertEqual(json.loads(self.upgrade.journal.read_text())['phase'], 'starting')
+
+    def test_invalid_monotonic_clock_does_not_trigger_destructive_rollback(self):
+        self.runner.failed_health = True
+        self.elapsed = 10
+        self.upgrade.sleep = lambda _seconds: setattr(self, 'elapsed', 0)
+        with self.assertRaises(UpgradePending):
+            self.upgrade.run()
+        self.assertEqual(sum(args[-1] == 'stop' for args in self.runner.calls), 1)
+        self.assertTrue(self.runner.running)
+        self.assertEqual(json.loads(self.upgrade.journal.read_text())['phase'], 'starting')
 
     def test_build_failure_never_stops_or_mutates_live_service(self):
         self.runner.failed_build = True

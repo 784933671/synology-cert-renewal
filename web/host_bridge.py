@@ -37,6 +37,9 @@ _mail_spec.loader.exec_module(login_mail)
 _observe_spec = importlib.util.spec_from_file_location('certweb_observability', Path(__file__).resolve().parent / 'observability.py')
 observability = importlib.util.module_from_spec(_observe_spec)
 _observe_spec.loader.exec_module(observability)
+_adaptive_spec = importlib.util.spec_from_file_location('certweb_adaptive_schedule', Path(__file__).resolve().parent / 'adaptive_schedule.py')
+adaptive_schedule = importlib.util.module_from_spec(_adaptive_spec)
+_adaptive_spec.loader.exec_module(adaptive_schedule)
 
 MAX_REQUEST = 64 * 1024
 MAX_RESPONSE = 2 * 1024 * 1024
@@ -170,11 +173,13 @@ class Scheduler:
             reject('群晖任务保存后的回读结果不一致。', 'unavailable')
         return observed
 
-    def run(self):
+    def run(self, before_dispatch=None):
         self.get()
         command = shutil.which('synoschedtask')
         if not command:
             reject('无法触发群晖原任务。', 'unavailable')
+        if before_dispatch is not None:
+            before_dispatch()
         self.capture([command, '--run', 'id=' + str(self.task_id), 'check_time=0', 'check_status=0'], timeout=20)
 
     def history(self):
@@ -335,6 +340,34 @@ class Bridge:
                    'preferences': self.read(controller.state / 'web-preferences.json')}
         return hashlib.sha256(canonical(payload)).hexdigest()
 
+    def schedule_data(self, controller, task, preferences=None):
+        preferences = self.read(controller.state / 'web-preferences.json', {}) if preferences is None else preferences
+        value = adaptive_schedule.display_schedule(task, preferences, read_schedule)
+        if value['mode'] != 'adaptive' or not value['editable']:
+            return value
+        if not task['enable']:
+            value['message'] = adaptive_schedule.MESSAGES['paused']
+            return value
+        expected = adaptive_schedule.desired_mode(controller, executor, self.uid)
+        if value.get('active_mode') != expected:
+            value['message'] = '检查频率待同步：当前{}，应切换为{}；原任务保持运行。'.format(
+                '每天' if value.get('active_mode') == 'daily' else '每小时', '每天' if expected == 'daily' else '每小时')
+        if self.management_home is not None:
+            try:
+                status = self.read(self.management_home / 'adaptive-schedule.json')
+                if status is not None and (not isinstance(status, dict) or status.get('version') != 1):
+                    raise ValueError('计划状态无效')
+                if status is None or status.get('plan') != adaptive_schedule.preference_plan(preferences) or status.get('certificate_id') not in (None, controller.config['certificate_id']):
+                    if value.get('active_mode') == expected:
+                        value['message'] = '检查计划已保存，等待自适应同步确认；当前实际频率仍以 DSM 任务为准。'
+                elif not 0 <= time.time() - adaptive_schedule.monitor.timestamp(status.get('at')) <= 180:
+                    value['message'] = '自适应同步状态已过期或时间异常，请核对计划；当前实际频率仍以 DSM 任务为准。'
+                elif status.get('status') in ('error', 'conflict'):
+                    value['message'] = adaptive_schedule.MESSAGES[status['status']]
+            except (OSError, ValueError, BridgeError):
+                value['message'] = '自适应同步状态暂不可读，请核对计划；当前实际频率仍以 DSM 任务为准。'
+        return value
+
     def settings_data(self, controller, task):
         config = controller.config
         extra = task['extra']
@@ -346,7 +379,7 @@ class Bridge:
                 'secret_id_configured': bool(config.get('secret_id')), 'secret_key_configured': bool(config.get('secret_key')),
                 'probes': [{'host': self.sanitize(probe['host'], controller, 253), 'port': probe['port'],
                             'server_name': probe['server_name']} for probe in config['probes']],
-                'schedule': read_schedule(task),
+                'schedule': self.schedule_data(controller, task, preferences),
                 'notifications': {'success_enabled': 'success_notify_email' in config,
                                   'success_email': config.get('success_notify_email', preferences.get('success_email', config['email'])),
                                   'failure_enabled': extra.get('notify_enable') is True,
@@ -388,6 +421,16 @@ class Bridge:
         label = ('每 {} 小时第 {} 分钟'.format(schedule['interval_hours'], schedule['minute']) if schedule['mode'] == 'hourly'
                  else '每天 {:02d}:{:02d}'.format(schedule['hour'], schedule['minute']) if schedule['mode'] == 'daily'
                  else 'DSM 自定义计划（只读）')
+        preferences = self.read(controller.state / 'web-preferences.json', {})
+        plan = adaptive_schedule.preference_plan(preferences)
+        if plan is not None:
+            phase = ('每天' if schedule['mode'] == 'daily' else '每小时' if schedule['mode'] == 'hourly' else '待确认')
+            if not adaptive_schedule.belongs_to_plan(schedule, plan):
+                phase = '计划冲突，需核对'
+            label = '自适应：平时每天 {:02d}:{:02d}，到期前 48 小时或有待办时每小时检查（当前{}）'.format(plan['hour'], plan['minute'], phase)
+            view = self.schedule_data(controller, task, preferences)
+            if '待同步' in view.get('message', '') or '未确认' in view.get('message', '') or '不可读' in view.get('message', ''):
+                label += '；' + view['message']
         notice = self.read(controller.state / 'success-notification.json', {})
         with self.check_lock:
             check = copy.deepcopy(self.check_state)
@@ -487,10 +530,33 @@ class Bridge:
             executor.validate_config(config)
         except executor.Failure:
             reject('证书、邮箱、密钥或验证端点配置无效，请检查填写内容。')
-        task = write_schedule(task, params['schedule'])
+        preferences = copy.deepcopy(self.read(controller.state / 'web-preferences.json', {}))
+        adaptive_schedule.preference_plan(preferences)
+        schedule = params['schedule']
+        if isinstance(schedule, dict) and schedule.get('mode') == 'adaptive':
+            if (set(schedule) != {'enabled', 'mode', 'interval_hours', 'hour', 'minute'}
+                    or type(schedule['enabled']) is not bool or type(schedule['interval_hours']) is not int
+                    or schedule['interval_hours'] != 1):
+                reject('自适应检查计划字段无效。')
+            try:
+                plan = adaptive_schedule.validate_plan({'version': 1, 'hour': schedule['hour'], 'minute': schedule['minute']})
+            except ValueError:
+                reject('自适应检查时间无效。')
+            previous_config = controller.config
+            try:
+                controller.config = config
+                mode = adaptive_schedule.desired_mode(controller, executor, self.uid)
+            finally:
+                controller.config = previous_config
+            task = write_schedule(task, adaptive_schedule.physical_settings(plan, mode, schedule['enabled']))
+            preferences['adaptive_schedule'] = plan
+        else:
+            task = write_schedule(task, schedule)
+            preferences.pop('adaptive_schedule', None)
+        preferences['success_email'] = notices['success_email']
         task['extra'].update(notify_enable=notices['failure_enabled'], notify_if_error=True,
                              notify_mail=notices['failure_email'])
-        return config, task, {'success_email': notices['success_email']}
+        return config, task, preferences
 
     def snapshot(self, controller, task):
         root = controller.state / 'web-backups'

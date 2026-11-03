@@ -19,6 +19,7 @@ class NativeStub:
         self.home, self.uid = home, uid
         self.prepare = Mock()
         self.run = Mock()
+        self.dispatch = Mock(side_effect=lambda before_dispatch: (before_dispatch(), self.run_command())[1])
 
     def locked(self):
         return startup.monitor.locked(self.home / 'state/run.lock', self.uid)
@@ -37,6 +38,8 @@ class StartupCheckTests(unittest.TestCase):
         self.now = startup.monitor.timestamp('2026-11-03T03:20:00Z')
         self.container = 'a' * 64
         self.source = NativeStub(self.native, self.uid)
+        self.source.run_command = self.source.run
+        self.source.run = self.source.dispatch
         self.path = self.web / 'startup-check.json'
 
     def checker(self, **changes):
@@ -58,7 +61,7 @@ class StartupCheckTests(unittest.TestCase):
         (self.native / 'web').mkdir(mode=0o700, exist_ok=True)
         for relative in ('certctl.py', 'failure_diagnostics.py', 'run_history.py',
                          'web/host_bridge.py', 'web/access_policy.py', 'web/login_mail.py',
-                         'web/observability.py', 'web/monitor.py'):
+                         'web/observability.py', 'web/monitor.py', 'web/adaptive_schedule.py'):
             target = self.native / relative
             shutil.copyfile(str(root / relative), str(target)); target.chmod(0o600)
         source = startup.NativeTask(self.native, 7, self.uid)
@@ -76,37 +79,37 @@ class StartupCheckTests(unittest.TestCase):
             self.assertEqual(self.saved()['status'], 'dispatching')
             self.assertFalse(startup.monitor.lock_busy(self.state / 'run.lock', self.uid))
             self.assertTrue(startup.monitor.lock_busy(self.web / 'startup-check.lock', self.uid))
-        self.source.run.side_effect = dispatch
+        self.source.run_command.side_effect = dispatch
         self.assertEqual(self.checker().once(), 0)
         self.assertEqual(self.saved()['status'], 'dispatched')
         self.assertEqual(self.path.stat().st_mode & 0o777, 0o600)
         self.assertEqual(self.checker().once(), 0)
-        self.source.run.assert_called_once_with()
+        self.source.run_command.assert_called_once_with()
         self.source.prepare.assert_called_once_with()
 
     def test_same_generation_does_not_need_dsm_to_be_available_again(self):
         self.assertEqual(self.checker().once(), 0)
         self.source.prepare.side_effect = RuntimeError('UNSAFE_COMMAND_SECRET')
         self.assertEqual(self.checker().once(), 0)
-        self.source.run.assert_called_once()
+        self.source.run_command.assert_called_once()
 
     def test_different_start_time_and_new_container_are_distinct_generations(self):
         self.assertEqual(self.checker().once(), 0)
         self.assertEqual(self.checker(started_at='2026-11-03T03:19:00Z').once(), 0)
         self.assertEqual(self.checker(started_at='2026-11-03T03:19:00Z', generation_id='b' * 64).once(), 0)
-        self.assertEqual(self.source.run.call_count, 3)
+        self.assertEqual(self.source.run_command.call_count, 3)
 
     def test_clock_rollback_does_not_skip_a_new_generation(self):
         self.assertEqual(self.checker(started_at='2026-11-03T03:19:00Z').once(), 0)
         self.now -= 3600
         self.assertEqual(self.checker(started_at='2026-11-03T02:19:00Z', generation_id='b' * 64).once(), 0)
         self.assertEqual(self.saved()['generation_id'], 'b' * 64)
-        self.assertEqual(self.source.run.call_count, 2)
+        self.assertEqual(self.source.run_command.call_count, 2)
 
     def test_supervisor_restarts_in_same_second_are_distinct(self):
         self.assertEqual(self.checker().once(), 0)
         self.assertEqual(self.checker(generation_id='b' * 64).once(), 0)
-        self.assertEqual(self.source.run.call_count, 2)
+        self.assertEqual(self.source.run_command.call_count, 2)
 
     def test_concurrent_helper_waits_for_independent_startup_lock(self):
         entered, release = threading.Event(), threading.Event()
@@ -114,7 +117,7 @@ class StartupCheckTests(unittest.TestCase):
         def dispatch():
             entered.set()
             self.assertTrue(release.wait(3))
-        self.source.run.side_effect = dispatch
+        self.source.run_command.side_effect = dispatch
         thread = threading.Thread(target=lambda: result.append(self.checker().once()))
         thread.start()
         try:
@@ -124,7 +127,7 @@ class StartupCheckTests(unittest.TestCase):
             release.set(); thread.join(3)
         self.assertEqual(result, [0])
         self.assertEqual(self.checker().once(), 0)
-        self.source.run.assert_called_once()
+        self.source.run_command.assert_called_once()
 
     def test_running_task_defers_then_its_completion_covers_startup(self):
         with startup.monitor.locked(self.state / 'run.lock', self.uid):
@@ -133,36 +136,36 @@ class StartupCheckTests(unittest.TestCase):
         self.completion('2026-11-03T03:19:00Z')
         self.assertEqual(self.checker().once(), 0)
         self.assertEqual(self.saved()['status'], 'completed')
-        self.source.run.assert_not_called()
+        self.source.run_command.assert_not_called()
 
     def test_running_task_without_new_completion_is_retried_normally(self):
         self.completion('2026-11-03T03:17:59Z')
         with startup.monitor.locked(self.state / 'run.lock', self.uid):
             self.assertEqual(self.checker().once(), startup.RETRY)
         self.assertEqual(self.checker().once(), 0)
-        self.source.run.assert_called_once()
+        self.source.run_command.assert_called_once()
 
     def test_failed_daily_check_also_counts_as_a_completed_check(self):
         self.completion('2026-11-03T03:19:00Z', success=False)
         self.assertEqual(self.checker().once(), 0)
         self.assertEqual(self.saved()['status'], 'completed')
-        self.source.run.assert_not_called()
+        self.source.run_command.assert_not_called()
 
     def test_previous_second_precision_result_does_not_cover_later_nano_start(self):
         self.completion('2026-11-03T03:18:00Z')
         self.assertEqual(self.checker().once(), 0)
-        self.source.run.assert_called_once()
+        self.source.run_command.assert_called_once()
 
     def test_completion_exactly_at_start_covers_it(self):
         self.completion('2026-11-03T03:18:00Z')
         self.assertEqual(self.checker(started_at='2026-11-03T03:18:00Z').once(), 0)
-        self.source.run.assert_not_called()
+        self.source.run_command.assert_not_called()
 
     def test_future_completion_or_clock_rollback_is_not_used_to_skip_startup(self):
         self.completion('2026-11-03T05:19:00Z')
         self.assertEqual(self.checker().once(), 0)
         self.assertEqual(self.checker(started_at='2026-11-03T06:18:00Z').once(), 0)
-        self.assertEqual(self.source.run.call_count, 2)
+        self.assertEqual(self.source.run_command.call_count, 2)
 
     def test_pause_then_enable_retries_without_claim(self):
         source = self.native_source()
@@ -248,15 +251,19 @@ class StartupCheckTests(unittest.TestCase):
         task = source.scheduler.api.return_value
         source.scheduler.api.side_effect = [task, dict(task, enable=False)]
         with patch.object(startup.shutil, 'which', return_value='/usr/syno/bin/synoschedtask'):
+            self.assertEqual(self.checker(source=source).once(), startup.RETRY)
+            self.assertFalse(self.path.exists())
+            source.scheduler.capture.assert_not_called()
+            source.scheduler.api.side_effect = None
             self.assertEqual(self.checker(source=source).once(), 0)
-        self.assertEqual(self.saved()['status'], 'unknown')
-        source.scheduler.capture.assert_not_called()
+        self.assertEqual(self.saved()['status'], 'dispatched')
+        source.scheduler.capture.assert_called_once()
 
     def test_claim_write_failure_prevents_dispatch(self):
         with patch.object(startup.monitor, 'write_json', side_effect=OSError('disk full')):
             self.assertEqual(self.checker().once(), 1)
         self.assertFalse(self.path.exists())
-        self.source.run.assert_not_called()
+        self.source.run_command.assert_not_called()
         self.assertEqual(self.checker().once(), 0)
 
     def test_error_after_claim_replace_but_before_fsync_never_dispatches_or_replays(self):
@@ -268,7 +275,7 @@ class StartupCheckTests(unittest.TestCase):
             self.assertEqual(self.checker().once(), 1)
         self.assertEqual(self.saved()['status'], 'dispatching')
         self.assertEqual(self.checker().once(), 0)
-        self.source.run.assert_not_called()
+        self.source.run_command.assert_not_called()
 
     def test_state_update_failure_after_acceptance_keeps_original_claim(self):
         original = startup.monitor.write_json
@@ -280,7 +287,7 @@ class StartupCheckTests(unittest.TestCase):
             self.assertEqual(self.checker().once(), 0)
         self.assertEqual(self.saved()['status'], 'dispatching')
         self.assertEqual(self.checker().once(), 0)
-        self.source.run.assert_called_once()
+        self.source.run_command.assert_called_once()
 
     def test_interruption_before_claim_allows_retry(self):
         self.source.prepare.side_effect = KeyboardInterrupt()
@@ -289,7 +296,7 @@ class StartupCheckTests(unittest.TestCase):
         self.source.prepare.side_effect = None
         self.assertEqual(self.checker().once(), 0)
 
-    def test_interruption_between_claim_and_dispatch_does_not_replay(self):
+    def test_interruption_while_releasing_native_lock_before_dispatch_allows_retry(self):
         original = self.source.locked
         @contextlib.contextmanager
         def interrupted_release():
@@ -297,17 +304,32 @@ class StartupCheckTests(unittest.TestCase):
                 yield
             raise KeyboardInterrupt()
         self.source.locked = interrupted_release
+        self.assertEqual(self.checker().once(), startup.RETRY)
+        self.assertFalse(self.path.exists())
+        self.source.run_command.assert_not_called()
+        self.source.locked = original
         self.assertEqual(self.checker().once(), 0)
-        self.assertEqual(self.saved()['status'], 'dispatching')
-        self.assertEqual(self.checker().once(), 0)
-        self.source.run.assert_not_called()
+        self.source.run_command.assert_called_once()
+
+    def test_second_dsm_query_failure_before_command_is_retryable(self):
+        source = self.native_source()
+        task = source.scheduler.api.return_value
+        source.scheduler.api.side_effect = [task, subprocess.TimeoutExpired(['private'], 20)]
+        with patch.object(startup.shutil, 'which', return_value='/usr/syno/bin/synoschedtask'):
+            self.assertEqual(self.checker(source=source).once(), startup.RETRY)
+            self.assertFalse(self.path.exists())
+            source.scheduler.capture.assert_not_called()
+            source.scheduler.api.side_effect = None
+            self.assertEqual(self.checker(source=source).once(), 0)
+        self.assertEqual(self.saved()['status'], 'dispatched')
+        source.scheduler.capture.assert_called_once()
 
     def test_interruption_during_dispatch_records_uncertain_outcome(self):
-        self.source.run.side_effect = KeyboardInterrupt()
+        self.source.run_command.side_effect = KeyboardInterrupt()
         self.assertEqual(self.checker().once(), 0)
         self.assertEqual(self.saved()['status'], 'unknown')
         self.assertEqual(self.checker().once(), 0)
-        self.source.run.assert_called_once()
+        self.source.run_command.assert_called_once()
 
     def test_durable_dispatching_claim_from_crashed_process_is_not_replayed(self):
         self.assertEqual(self.checker().once(), 0)
@@ -315,7 +337,7 @@ class StartupCheckTests(unittest.TestCase):
         data.update(status='dispatching', message=startup.MESSAGES['dispatching'])
         startup.monitor.write_json(self.path, data, self.uid)
         self.assertEqual(self.checker().once(), 0)
-        self.source.run.assert_called_once()
+        self.source.run_command.assert_called_once()
 
     def test_state_symlink_does_not_read_or_replace_target(self):
         target = self.root / 'unrelated'; target.write_text('private')
@@ -329,7 +351,7 @@ class StartupCheckTests(unittest.TestCase):
         target = self.root / 'unrelated'; target.write_text('private')
         (self.web / 'startup-check.lock').symlink_to(target)
         self.assertEqual(self.checker().once(), 1)
-        self.source.run.assert_not_called()
+        self.source.run_command.assert_not_called()
 
     def test_state_hardlink_and_public_permissions_are_rejected(self):
         self.assertEqual(self.checker().once(), 0)
@@ -338,7 +360,7 @@ class StartupCheckTests(unittest.TestCase):
         (self.web / 'alias').unlink()
         self.path.chmod(0o644)
         self.assertEqual(self.checker().once(), 1)
-        self.source.run.assert_called_once()
+        self.source.run_command.assert_called_once()
 
     def test_duplicate_json_keys_and_wrong_types_are_not_silently_repaired(self):
         self.assertEqual(self.checker().once(), 0)
@@ -352,7 +374,7 @@ class StartupCheckTests(unittest.TestCase):
                 self.assertEqual(self.checker().once(), 1)
         self.path.write_text('{"version":1,"version":1}')
         self.assertEqual(self.checker().once(), 1)
-        self.source.run.assert_called_once()
+        self.source.run_command.assert_called_once()
 
     def test_last_result_invalid_or_linked_is_not_treated_as_completion(self):
         path = self.state / 'last-result.json'
@@ -362,7 +384,7 @@ class StartupCheckTests(unittest.TestCase):
         path.unlink(); path.symlink_to(self.root / 'missing')
         self.assertEqual(self.checker().once(), 1)
         self.assertFalse(self.path.exists())
-        self.source.run.assert_not_called()
+        self.source.run_command.assert_not_called()
 
     def test_unsafe_directories_and_invalid_generation_are_rejected(self):
         for value in ('short', 'A' * 64, 'a' * 63 + '\n'):
@@ -373,7 +395,7 @@ class StartupCheckTests(unittest.TestCase):
             self.assertEqual(self.checker(task_id=value).once(), 1)
         self.web.chmod(0o755)
         self.assertEqual(self.checker().once(), 1)
-        self.source.run.assert_not_called()
+        self.source.run_command.assert_not_called()
 
     def test_native_module_symlink_is_rejected_before_import(self):
         self.native_source()

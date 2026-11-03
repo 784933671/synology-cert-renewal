@@ -25,7 +25,7 @@ def source_files(source):
     top = {'.dockerignore', 'Dockerfile', 'compose.yaml', '__init__.py', 'README.md', 'CONTRACT.md',
            'DEPLOYMENT.md', 'requirements.txt', 'requirements.in', 'requirements-test.txt',
            'requirements-test.in', 'deployment.env.example', 'access_policy.py', 'container_entry.py',
-           'deployment.py', 'healthcheck.py', 'host_bridge.py', 'install-web.py', 'login_mail.py', 'monitor.py', 'observability.py', 'startup_check.py',
+           'deployment.py', 'healthcheck.py', 'host_bridge.py', 'install-web.py', 'login_mail.py', 'monitor.py', 'observability.py', 'startup_check.py', 'adaptive_schedule.py',
            'network_guard.py', 'tls_sync.py', 'setup.py', 'setup_tasks.py', 'setup_upgrade.py'}
     frontend = {'package.json', 'package-lock.json', 'tsconfig.json', 'vite.config.ts', 'vitest.config.ts',
                 'index.html', '.gitignore'}
@@ -52,7 +52,7 @@ def source_files(source):
             raise ValueError('构建源不能包含符号链接')
         if path.is_file():
             result[str(relative)] = hashlib.sha256(path.read_bytes()).hexdigest()
-    for required in ('Dockerfile', 'compose.yaml', 'deployment.py', 'host_bridge.py', 'login_mail.py', 'monitor.py', 'observability.py', 'startup_check.py',
+    for required in ('Dockerfile', 'compose.yaml', 'deployment.py', 'host_bridge.py', 'login_mail.py', 'monitor.py', 'observability.py', 'startup_check.py', 'adaptive_schedule.py',
                      'access_policy.py', 'backend/app.py', 'frontend/package.json'):
         if required not in result:
             raise ValueError('管理源码缺少必要文件')
@@ -107,7 +107,7 @@ def prepare(args):
         else:
             if target.exists():
                 private_root(target, directory=True)
-                if any(os.path.lexists(target / name) for name in ('host_bridge.py', 'access_policy.py', 'login_mail.py', 'monitor.py', 'observability.py')):
+                if any(os.path.lexists(target / name) for name in ('host_bridge.py', 'access_policy.py', 'login_mail.py', 'monitor.py', 'observability.py', 'adaptive_schedule.py')):
                     raise ValueError('原执行器中已有桥接，需按升级流程处理')
             staging = Path(tempfile.mkdtemp(prefix='.' + home.name + '-prepare-', dir=str(home.parent)))
             for name in files:
@@ -126,7 +126,7 @@ def prepare(args):
             os.rename(str(staging), str(home));staging = None;new_home = True
         target.mkdir(mode=0o700, exist_ok=True)
         private_root(target, directory=True)
-        for name in ('host_bridge.py', 'access_policy.py', 'login_mail.py', 'monitor.py', 'observability.py'):
+        for name in ('host_bridge.py', 'access_policy.py', 'login_mail.py', 'monitor.py', 'observability.py', 'adaptive_schedule.py'):
             path = target / name
             content = (home / 'code' / name).read_bytes()
             if os.path.lexists(path):

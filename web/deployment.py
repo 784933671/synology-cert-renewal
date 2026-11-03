@@ -32,6 +32,8 @@ MANAGED_LABEL = 'io.github.784933671.certweb.managed'
 DEFAULT_CONFIG = Path('/usr/local/share/synology-cert-web/deployment.json')
 START_STABLE_SECONDS = 60
 STARTUP_CHECK_RETRY_SECONDS = 60
+SCHEDULE_SYNC_SECONDS = 60
+SCHEDULE_SYNC_TIMEOUT = 120
 
 
 def private_json(path, value):
@@ -106,6 +108,10 @@ class Deployment:
         self.startup_terminating_at = None
         self.startup_killed = False
         self.startup_message = None
+        self.schedule_sync = None
+        self.schedule_attempted_at = None
+        self.schedule_terminating_at = None
+        self.schedule_killed = False
         self.stopping = False
         self.last_message = None
         self.started = False
@@ -328,6 +334,52 @@ class Deployment:
                 self.startup_check.kill()
                 self.startup_check.wait(timeout=5)
 
+    def start_schedule_sync(self):
+        """只同步原 DSM 任务的频率，签发仍由原任务独立执行。"""
+        if self.stopping or self.startup_requested_generation is None:
+            return
+        current = self.clock()
+        try:
+            if self.schedule_sync is not None:
+                result = self.schedule_sync.poll()
+                if result is None:
+                    elapsed = current - self.schedule_attempted_at
+                    if elapsed >= SCHEDULE_SYNC_TIMEOUT or elapsed < 0:
+                        if self.schedule_terminating_at is None:
+                            self.schedule_sync.terminate()
+                            self.schedule_terminating_at = current
+                        elif not self.schedule_killed and current - self.schedule_terminating_at >= 5:
+                            self.schedule_sync.kill()
+                            self.schedule_killed = True
+                    return
+                self.schedule_sync = None
+                self.schedule_terminating_at = None
+                self.schedule_killed = False
+            if (self.schedule_attempted_at is not None
+                    and 0 <= current - self.schedule_attempted_at < SCHEDULE_SYNC_SECONDS):
+                return
+            self.schedule_attempted_at = current
+            script = self.code / 'adaptive_schedule.py'
+            info = script.lstat()
+            if (not stat.S_ISREG(info.st_mode) or info.st_uid != os.geteuid()
+                    or info.st_nlink != 1 or info.st_mode & 0o022):
+                raise ValueError('计划同步程序权限无效')
+            self.schedule_sync = subprocess.Popen([sys.executable, '-I', str(script),
+                '--native-home', self.config['native_home'], '--web-home', str(self.home),
+                '--task-id', str(self.config.get('task_id', 7))], env=self.env,
+                stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL, start_new_session=True)
+        except (OSError, ValueError, subprocess.SubprocessError):
+            self.startup_notice('自适应计划暂未同步，稍后重试；原 DSM 任务继续执行。')
+
+    def stop_schedule_sync(self):
+        if self.schedule_sync is not None and self.schedule_sync.poll() is None:
+            self.schedule_sync.terminate()
+            try:
+                self.schedule_sync.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                self.schedule_sync.kill()
+                self.schedule_sync.wait(timeout=5)
     def publish_health(self):
         item = self.observed_container
         state = item.get('State', {}) if isinstance(item, dict) else {}
@@ -528,10 +580,12 @@ class Deployment:
                 signal.signal(sig, lambda *_: setattr(self, 'stopping', True))
             try:
                 self.startup_requested_generation = (secrets.token_hex(32), dt.datetime.now(dt.timezone.utc).isoformat())
+                self.start_schedule_sync()
                 self.start_startup_check()
                 while not self.stopping:
                     self.reconcile()
                     self.start_monitor()
+                    self.start_schedule_sync()
                     self.start_startup_check()
                     for _ in range(10):
                         if self.stopping:
@@ -545,6 +599,10 @@ class Deployment:
                     self.stop_container()
                 except (OSError, RuntimeError, subprocess.TimeoutExpired):
                     stopped = False
+                try:
+                    self.stop_schedule_sync()
+                except (OSError, subprocess.TimeoutExpired):
+                    pass
                 try:
                     self.stop_startup_check()
                 except (OSError, subprocess.TimeoutExpired):

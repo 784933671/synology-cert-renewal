@@ -75,10 +75,12 @@ def settings(value):
     schedule = value["schedule"]
     exact_keys(schedule, {"enabled", "mode", "interval_hours", "hour", "minute"})
     boolean(schedule["enabled"])
-    if schedule["mode"] not in ("hourly", "daily"):
+    if schedule["mode"] not in ("hourly", "daily", "adaptive"):
         fail()
     integer(schedule["interval_hours"], 1, 12)
     if schedule["interval_hours"] not in (1, 2, 3, 4, 6, 8, 12):
+        fail()
+    if schedule["mode"] == "adaptive" and schedule["interval_hours"] != 1:
         fail()
     integer(schedule["hour"], 0, 23)
     integer(schedule["minute"], 0, 59)

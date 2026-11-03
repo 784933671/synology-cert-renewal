@@ -75,7 +75,7 @@ Challenge = {
 
 ### 启动检查
 
-主机监督程序取得独占锁后，以本次启动标识及开始时间异步调用固定 `startup_check.py`，不依赖管理页 HTTPS 健康。首个运行容器建立基线，不重复投递；后续容器 ID 或 `StartedAt` 变化触发新的启动检查。每次启动复用原 DSM 普通任务，不传强制续期参数、不创建第二套周期计划；暂停时延后，续期锁占用时延后，启动后已完成的普通执行覆盖该次检查。投递前将启动标识与状态写入 root 私有 `startup-check.json`，未知投递结果不重放。网页刷新、监督轮询、HTTPS 工作进程重载不构成容器新启动。新安装任务默认每天 NAS 本地时间 03:18，已有任务升级时保留自定义计划。
+主机监督程序取得独占锁后，以本次启动标识及开始时间异步调用固定 `startup_check.py`，不依赖管理页 HTTPS 健康。首个运行容器建立基线，不重复投递；后续容器 ID 或 `StartedAt` 变化触发新的启动检查。每次启动复用原 DSM 普通任务，不传强制续期参数、不创建第二套周期计划；暂停时延后，续期锁占用时延后，启动后已完成的普通执行覆盖该次检查。在最后一次 DSM 任务查询及命令定位通过后、真正调用运行命令前，将启动标识与状态写入 root 私有 `startup-check.json`。确定尚未投递的临时错误返回可重试状态；未知投递结果不重放。网页刷新、监督轮询、HTTPS 工作进程重载不构成容器新启动。新安装任务默认自适应模式，日常时间为 NAS 本地时间 03:18；已有任务升级时保留自定义计划。
 
 ### 原续期状态
 
@@ -118,12 +118,16 @@ Challenge = {
  renew_before_days:2,
  secret_id_configured:true,secret_key_configured:true,
  probes:[{host:"127.0.0.1",port:5001,server_name:"ttxli.cn"}],
- schedule:{enabled:true,mode:"daily",interval_hours:1,hour:3,minute:18},
+ schedule:{enabled:true,mode:"adaptive",interval_hours:1,hour:3,minute:18,active_mode:"daily",editable:true,message:"..."},
  notifications:{success_enabled:true,success_email:"...",failure_enabled:true,failure_email:"..."},
  deployment_method:"local_api",timezone:"Asia/Shanghai"
 }
 ```
 PUT 只接收 revision,certificate_id,email,renew_before_days,probes,schedule,notifications,secret_id,secret_key。描述和域名从群晖所选证书派生，不直接编辑。secret_id/secret_key 为write-only，可选空串或省略表示保留，两项更换须同时提供；绝不回显。服务端校验续期1..30天、端口1..65535、邮箱、域名/IP、目标证书、每小时频率1/2/3/4/6/8/12或每天固定时分、分钟0..59。
+
+`schedule.mode` 支持 `adaptive/daily/hourly/unsupported`（最后一种只读）；PUT仍只发送 `enabled/mode/interval_hours/hour/minute` 五项，自适应 `interval_hours` 为 1，`active_mode`、`editable` 和 `message` 只用于展示。`adaptive` 日常采用指定时分，当前证书剩余不超过 48 小时或恢复未完成时改为每小时指定分钟；只有当前证书成功结果指纹吻合、已验证并无待办才允许降为每日。不改变 `read_schedule` 对物理 DSM 计划的解释，独立预警继续按实际计划计算漏跑。
+
+配置偏好 `state/web-preferences.json` 可含 `adaptive_schedule:{version:1,hour,minute}`，缺省代表固定计划。自适应同步器每分钟读取此设置，在 `run.lock` 内确认任务身份与当前计划，只调整原任务的物理日/小时频率，不执行签发或建立新任务；暂停、未恢复配置事务及手工修改冲突均保留原状态。
 
 配置更新需共享certctl互斥锁、revision冲突检测、对当前配置和DSM任务备份并可回滚；保留所有恢复与通知待办标记。检测到未完成恢复、绑定变化等会阻止不安全的目标切换。
 

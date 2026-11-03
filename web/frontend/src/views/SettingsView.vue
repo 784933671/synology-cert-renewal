@@ -81,7 +81,7 @@ onUnmounted(() => {
             <CertificateFields v-model="draft" :settings="settings" />
             <ProbeFields v-model="draft.probes" :domains="domains" />
           </template>
-          <ScheduleFields v-else-if="section === 'renewal'" v-model="draft.schedule" v-model:days="draft.renew_before_days" />
+          <ScheduleFields v-else-if="section === 'renewal'" v-model="draft.schedule" v-model:days="draft.renew_before_days" :saved="settings.schedule" />
           <NotificationFields v-else v-model="draft.notifications" />
         </div>
         <div class="settings-save-bar">

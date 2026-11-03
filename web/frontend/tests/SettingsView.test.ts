@@ -13,6 +13,7 @@ afterEach(() => {
   wrapper = undefined
   document.body.innerHTML = ''
   vi.mocked(api).mockReset()
+  vi.unstubAllGlobals()
 })
 function input(label: string) {
   const field = wrapper!.findAll('label').find((node) => node.text().includes(label))!
@@ -139,6 +140,120 @@ describe('配置编辑完整状态', () => {
       method: 'PUT',
       body: expect.objectContaining({ renew_before_days: 3, schedule: expect.objectContaining({ mode: 'daily', hour: 6, minute: 30 }) }),
     }))
+  })
+  it('切换自适应检查保留每日时分，保存期间禁用并以回读的实际频率为准', async () => {
+    const saved = settings()
+    saved.schedule = { ...saved.schedule, mode: 'adaptive', hour: 3, minute: 18,
+      active_mode: 'hourly', editable: true, message: '当前存在待办，每小时检查。' }
+    let finish!: (value: ReturnType<typeof settings>) => void
+    vi.mocked(api).mockResolvedValueOnce(settings()).mockImplementationOnce(() => new Promise((resolve) => { finish = resolve }))
+    wrapper = mount(SettingsView, { attachTo: document.body, props: { section: 'renewal' } })
+    await flushPromises()
+    await choose('schedule-mode', '自适应检查')
+    expect(wrapper.find('#schedule-interval').exists()).toBe(false)
+    await input('平时检查小时').setValue('3')
+    await input('检查分钟').setValue('18')
+    expect(wrapper.text()).toContain('平时每天 03:18 检查')
+    expect(wrapper.text()).toContain('到期前 48 小时或待办未完成时，每小时第 18 分钟检查')
+    await wrapper.get('form').trigger('submit')
+    await flushPromises()
+    expect(input('平时检查小时').attributes('disabled')).toBeDefined()
+    expect(wrapper.get('#schedule-enabled').attributes('disabled')).toBeDefined()
+    const options = vi.mocked(api).mock.calls.at(-1)![1]!
+    expect((options.body as { schedule: unknown }).schedule).toEqual({
+      enabled: true, mode: 'adaptive', interval_hours: 1, hour: 3, minute: 18,
+    })
+    finish(saved)
+    await flushPromises()
+    expect(wrapper.text()).toContain('配置已保存并生效')
+    expect(wrapper.text()).toContain('最近读取的执行频率：每小时第 18 分钟')
+    expect(wrapper.text()).toContain('当前存在待办，每小时检查')
+    expect(wrapper.emitted('dirty')?.at(-1)).toEqual([false])
+  })
+  it('编辑自适应草稿不冒充已经生效的执行时间，暂停状态也沿用已保存值', async () => {
+    const saved = settings()
+    saved.schedule = { ...saved.schedule, mode: 'adaptive', hour: 3, minute: 18, active_mode: 'daily' }
+    vi.mocked(api).mockResolvedValueOnce(saved)
+    wrapper = mount(SettingsView, { attachTo: document.body, props: { section: 'renewal' } })
+    await flushPromises()
+    await input('平时检查小时').setValue('6')
+    await input('检查分钟').setValue('30')
+    await wrapper.get('#schedule-enabled').trigger('click')
+    expect(wrapper.text()).toContain('平时每天 06:30 检查')
+    expect(wrapper.text()).toContain('最近读取的执行频率：每天 03:18')
+    expect(wrapper.text()).not.toContain('最近读取的执行频率：每天 06:30')
+    expect(wrapper.text()).not.toContain('已保存的自动检查已暂停')
+    expect(wrapper.emitted('dirty')?.at(-1)).toEqual([true])
+  })
+  it('自适应切换导致保存版本冲突时保留草稿，重新读取才恢复保存', async () => {
+    const initial = settings(), latest = settings()
+    initial.schedule = { ...initial.schedule, mode: 'adaptive', hour: 3, minute: 18, active_mode: 'daily' }
+    latest.schedule = { ...initial.schedule, active_mode: 'hourly' }
+    latest.revision = 'after-cadence-switch'
+    vi.mocked(api).mockResolvedValueOnce(initial)
+      .mockRejectedValueOnce(new ApiError('执行计划已经更新', 409, 'stale_revision'))
+      .mockResolvedValueOnce(latest)
+    vi.stubGlobal('confirm', vi.fn(() => true))
+    wrapper = mount(SettingsView, { attachTo: document.body, props: { section: 'renewal' } })
+    await flushPromises()
+    await input('平时检查小时').setValue('6')
+    await wrapper.get('form').trigger('submit')
+    await flushPromises()
+    expect(wrapper.text()).toContain('当前草稿已保留')
+    expect(input('平时检查小时').element.value).toBe('6')
+    expect(button('保存配置').attributes('disabled')).toBeDefined()
+    await wrapper.get('form').trigger('submit')
+    expect(api).toHaveBeenCalledTimes(2)
+    await button('重新读取').trigger('click')
+    await flushPromises()
+    expect(input('平时检查小时').element.value).toBe('3')
+    expect(wrapper.text()).toContain('最近读取的执行频率：每小时第 18 分钟')
+    expect(wrapper.text()).not.toContain('当前草稿已保留')
+    await input('平时检查小时').setValue('5')
+    expect(button('保存配置').attributes('disabled')).toBeUndefined()
+  })
+  it('自适应保存失败保留草稿且允许重试，成功回读可确认暂停', async () => {
+    const initial = settings(), saved = settings()
+    initial.schedule = { ...initial.schedule, mode: 'adaptive', hour: 3, minute: 18, active_mode: 'daily' }
+    saved.schedule = { ...initial.schedule, enabled: false }
+    vi.mocked(api).mockResolvedValueOnce(initial)
+      .mockRejectedValueOnce(new ApiError('保存暂不可用', 503, 'unavailable'))
+      .mockResolvedValueOnce(saved)
+    wrapper = mount(SettingsView, { attachTo: document.body, props: { section: 'renewal' } })
+    await flushPromises()
+    await wrapper.get('#schedule-enabled').trigger('click')
+    await wrapper.get('form').trigger('submit')
+    await flushPromises()
+    expect(wrapper.text()).toContain('保存暂不可用')
+    expect(button('保存配置').attributes('disabled')).toBeUndefined()
+    await wrapper.get('form').trigger('submit')
+    await flushPromises()
+    expect(wrapper.text()).toContain('已保存的自动检查已暂停')
+    expect(wrapper.text()).toContain('配置已保存并生效')
+    expect(wrapper.emitted('dirty')?.at(-1)).toEqual([false])
+    expect(api).toHaveBeenCalledTimes(3)
+  })
+  it('自适应频率未知或计划冲突时不推测生效时间', async () => {
+    const value = settings()
+    value.schedule = { ...value.schedule, mode: 'adaptive', hour: 3, minute: 18 }
+    vi.mocked(api).mockResolvedValueOnce(value)
+    wrapper = mount(SettingsView, { attachTo: document.body, props: { section: 'renewal' } })
+    await flushPromises()
+    expect(wrapper.text()).toContain('执行频率暂未确认')
+    expect(wrapper.text()).not.toContain('最近读取的执行频率')
+    wrapper.unmount()
+    value.schedule.editable = false
+    value.schedule.active_mode = 'hourly'
+    value.schedule.message = '原任务计划已被修改，请核对后再操作。'
+    vi.mocked(api).mockResolvedValueOnce(value)
+    wrapper = mount(SettingsView, { attachTo: document.body, props: { section: 'renewal' } })
+    await flushPromises()
+    expect(wrapper.text()).toContain('原任务计划已被修改')
+    expect(wrapper.text()).not.toContain('最近读取的执行频率')
+    expect(wrapper.get('#schedule-mode').attributes('disabled')).toBeDefined()
+    await wrapper.get('form').trigger('submit')
+    await flushPromises()
+    expect(api).toHaveBeenCalledTimes(2)
   })
   it('验证目标支持增删、限制八项且至少保留一项', async () => {
     vi.mocked(api).mockResolvedValueOnce(settings())

@@ -73,7 +73,7 @@ class NativeTask:
         monitor.directory(home / 'web', uid)
         for relative in ('certctl.py', 'failure_diagnostics.py', 'run_history.py',
                          'web/host_bridge.py', 'web/access_policy.py', 'web/login_mail.py',
-                         'web/observability.py', 'web/monitor.py'):
+                         'web/observability.py', 'web/monitor.py', 'web/adaptive_schedule.py'):
             info = (home / relative).lstat()
             if (not stat.S_ISREG(info.st_mode) or info.st_uid != uid
                     or info.st_nlink != 1 or info.st_mode & 0o022):
@@ -116,9 +116,9 @@ class NativeTask:
         except self.bridge.executor.Busy:
             raise RetryLater() from None
 
-    def run(self):
+    def run(self, before_dispatch):
         # Scheduler.run 再次读取并验证任务，暂停状态不会被 check_status=0 绕过。
-        self.scheduler.run()
+        self.scheduler.run(before_dispatch=before_dispatch)
 
 
 class StartupCheck:
@@ -151,6 +151,11 @@ class StartupCheck:
             return False
         return completed >= self.started
 
+    def claim_dispatch(self):
+        # 只在 DSM 查询及命令定位成功后记录意图；此前失败可以安全重试。
+        self.save('dispatching')
+        self.claimed = True
+
     def attempt(self):
         self.generation, self.started = identity(self.generation_id, self.started_at)
         if type(self.task_id) is not int or not 1 <= self.task_id <= 2147483647:
@@ -171,19 +176,17 @@ class StartupCheck:
                 if self.completed_since_start():
                     self.save('completed')
                     return 0
-                # fsync 完成后才允许投递；若此处中断，保守保留 claim，不重放。
-                self.save('dispatching')
-                self.claimed = True
             try:
                 # 原任务需要同一把续期锁，必须先释放才能等待 DSM 应答。
-                source.run()
+                source.run(self.claim_dispatch)
                 self.save('dispatched')
             except BaseException:
-                self.message = MESSAGES['unknown']
-                try:
-                    self.save('unknown')
-                except Exception:
-                    pass
+                if self.claimed:
+                    self.message = MESSAGES['unknown']
+                    try:
+                        self.save('unknown')
+                    except Exception:
+                        pass
                 raise
             return 0
 

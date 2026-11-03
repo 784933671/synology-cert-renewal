@@ -522,7 +522,7 @@ def main(argv=None):
                 print('正在构建并检查升级镜像；切换前会备份现有代码和认证数据。' if command == 'upgrade' else '正在检查未完成的升级事务。')
                 result = updater.run() if command == 'upgrade' else updater.recover()
                 if command == 'upgrade' and result.get('recovered'):
-                    print('已恢复上次中断前的版本，继续执行本次升级……')
+                    print('上次中断的升级事务已处理，继续执行本次升级……')
                     result = updater.run()
                 print('升级完成，原配置、密码、邮箱验证和续期计划已保留。' if result.get('upgraded') else '恢复检查完成，未宣称新版本已上线。')
             else:

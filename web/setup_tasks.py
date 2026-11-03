@@ -8,9 +8,9 @@ import shlex
 import uuid
 
 if __package__:
-    from .host_bridge import Scheduler, atomic_bytes, canonical, private_directory, safe_file
+    from .host_bridge import Scheduler, atomic_bytes, canonical, private_directory, safe_file, adaptive_schedule
 else:
-    from host_bridge import Scheduler, atomic_bytes, canonical, private_directory, safe_file
+    from host_bridge import Scheduler, atomic_bytes, canonical, private_directory, safe_file, adaptive_schedule
 
 
 class TaskSetup:
@@ -79,6 +79,25 @@ class TaskSetup:
             raise ValueError('发现多个执行本工具的任务，请先在 DSM 中核对，安装器不会重复创建或删除任务')
         return found
 
+    def initialize_adaptive(self, state):
+        if state['phase'] != 'created':
+            return
+        directory = self.home / 'state'
+        directory.mkdir(mode=0o700, exist_ok=True)
+        private_directory(directory, self.uid)
+        path = directory / 'web-preferences.json'
+        with adaptive_schedule.monitor.locked(directory / 'run.lock', self.uid):
+            if os.path.lexists(directory / 'web-transaction.json'):
+                raise ValueError('配置事务尚未恢复，暂不初始化检查计划')
+            preferences = adaptive_schedule.monitor.read_json(path, {}, self.uid)
+            if not isinstance(preferences, dict):
+                raise ValueError('检查计划配置无效')
+            if 'adaptive_schedule' not in preferences and not os.path.lexists(path):
+                preferences['adaptive_schedule'] = dict(adaptive_schedule.DEFAULT_PLAN)
+                adaptive_schedule.monitor.write_json(path, preferences, self.uid)
+            else:
+                adaptive_schedule.preference_plan(preferences)
+
     def ensure(self, email, real_owner='root'):
         if (not isinstance(email, str) or email.startswith('-') or len(email) > 254
                 or re.fullmatch(r'[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,63}', email) is None
@@ -100,6 +119,7 @@ class TaskSetup:
             elif state['task_id'] != task['id'] or state['name'] != task['name']:
                 raise ValueError('任务与安装恢复记录不一致')
             self.save(state)
+            self.initialize_adaptive(state)
             return task
         if state and state['phase'] != 'prepared':
             raise ValueError('上次创建结果尚未确认或原任务已消失，请先在 DSM 核对；不会再次创建')
@@ -134,6 +154,7 @@ class TaskSetup:
             raise ValueError('新任务的计划、通知或停用状态回读不一致')
         state.update(phase='created', task_id=task['id'])
         self.save(state)
+        self.initialize_adaptive(state)
         return task
 
     def activate(self, identifier):
@@ -152,6 +173,7 @@ class TaskSetup:
         if (not isinstance(expected, dict) or task['schedule'] != expected.get('schedule')
                 or task['extra'] != expected.get('extra')):
             raise ValueError('新任务计划或通知已发生变化，停止自动启用')
+        self.initialize_adaptive(state)
         if not task['enable']:
             task = copy.deepcopy(task)
             task['enable'] = True
