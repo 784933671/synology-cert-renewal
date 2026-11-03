@@ -27,3 +27,18 @@ account.conf
 *.pfx
 *.log
 *.zip
+
+# 可视化管理构建缓存与运行数据
+/web/frontend/node_modules/
+/web/frontend/dist/
+/web/frontend/coverage/
+/web/deployment.env
+/web/deployment.json
+.bootstrap-test.json
+/web/data/
+/web/tls/
+/web/bridge/
+/web/deployment-state.json
+*.sqlite3
+*.sqlite3-*
+/.playwright-cli/

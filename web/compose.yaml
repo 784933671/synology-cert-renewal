@@ -1,0 +1,56 @@
+services:
+  certweb:
+    image: synology-cert-web:local
+    build:
+      context: .
+    container_name: synology-cert-web
+    labels:
+      io.github.784933671.certweb.managed: "true"
+    network_mode: host
+    user: "10100:10100"
+    read_only: true
+    init: true
+    restart: "no"
+    cap_drop: [ALL]
+    security_opt:
+      - no-new-privileges:true
+    mem_limit: 384m
+    cpuset: "0"
+    ulimits:
+      nproc:
+        soft: 96
+        hard: 96
+      nofile:
+        soft: 1024
+        hard: 1024
+    stop_grace_period: 25s
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,nodev,size=16m,mode=1777
+    volumes:
+      - ${CERTWEB_HOME:?set private deployment directory}/data:/data:rw
+      - ${CERTWEB_HOME:?set private deployment directory}/bridge:/bridge:ro
+      - ${CERTWEB_HOME:?set private deployment directory}/tls:/tls:ro
+    environment:
+      CERTWEB_DATA_DIR: /data
+      CERTWEB_BRIDGE_SOCKET: /bridge/certweb.sock
+      CERTWEB_STATIC_DIR: /app/static
+      CERTWEB_BIND: ${CERTWEB_BIND:?set NAS LAN IPv4}
+      CERTWEB_PORT: ${CERTWEB_PORT:-18443}
+      CERTWEB_ALLOWED_NETWORKS: ${CERTWEB_ALLOWED_NETWORKS:?set exact LAN CIDR}
+      CERTWEB_DENIED_ADDRESSES: ${CERTWEB_DENIED_ADDRESSES:?set router address}
+      CERTWEB_ALLOWED_HOSTS: ${CERTWEB_ALLOWED_HOSTS:?set hostname and port}
+      CERTWEB_ORIGIN: ${CERTWEB_ORIGIN:?set HTTPS origin}
+      CERTWEB_TLS_CERT: /tls/current.cert
+      CERTWEB_TLS_KEY: /tls/current.key
+      TZ: Asia/Shanghai
+    healthcheck:
+      test: [CMD, python, -m, web.healthcheck]
+      interval: 30s
+      timeout: 6s
+      start_period: 20s
+      retries: 3
+    logging:
+      driver: json-file
+      options:
+        max-size: 2m
+        max-file: "3"

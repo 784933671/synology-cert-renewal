@@ -6,6 +6,12 @@
 
 当前按用户要求在证书到期前 48 小时进入续期窗口，每小时检查一次，通常在剩余 47～48 小时时开始续期。首次签发或材料损坏后的修复不等待该窗口；提前时间缩短后，网络或签发故障的处理余量也相应减少。
 
+## Docker 中文管理页面
+
+可使用 [Docker 管理层](web/README.md) 登录查看证书状态，并配置 DNSPod 凭据、提前续期天数、检查计划和成功/失败通知邮箱，查看失败归档与操作审计。管理入口为 `https://ttxli.cn:18443`，仅监听 NAS 的 `10.10.10.37`，不新增 HTTP 入口。
+
+Docker 只承载页面和管理 API；原 DSM 任务 7 继续执行签发、部署、验证和通知，不增加第二套续期定时器。路由器和内网 DNS 配置暂由用户后续处理，18443 保持不做公网端口映射。访问前需要让客户端将 `ttxli.cn` 解析到 NAS 内网地址；具体步骤、安装命令和验收方法见 [管理层说明](web/README.md)，实际部署结果见 [Docker 部署验收](web/DEPLOYMENT.md)。
+
 ## 安装前准备
 
 1. 在“控制面板 → 信息中心”确认 DSM 为 6.2.4 或 7.x。若没有 Python 3.8 以上，在套件中心安装或更新 Python3。
@@ -154,17 +160,19 @@ DNS 清理失败时先查看本次失败归档，必要时核查 `state/dns-clea
 
 `synowebapi` 是 DSM 本机接口；升级 DSM 后需重新验证参数兼容性、服务绑定和实际 HTTPS 生效情况。
 
-本地验证命令（需要 Python3 和 OpenSSL）：
+完整本地测试需要 Python 3.12、OpenSSL 及管理 API 测试依赖；原 NAS 执行器仍仅需要 Python 3.8 以上标准库：
 
 ```sh
-python3 -m unittest discover -s tests -v
+python3.12 -m venv .venv
+.venv/bin/python -m pip install --require-hashes -r web/requirements-test.txt
+.venv/bin/python -m unittest discover -s tests -v
 sh -n install.sh
 ```
 
 离线 ACME 集成测试需要提供安装器所固定提交的源码目录；未指定时相关集成测试会跳过，其余测试照常运行：
 
 ```sh
-ACME_TEST_SOURCE=/固定提交的acme.sh源码目录 python3 -m unittest discover -s tests -v
+ACME_TEST_SOURCE=/固定提交的acme.sh源码目录 .venv/bin/python -m unittest discover -s tests -v
 ```
 
 测试覆盖证书域名/密钥/链、真实 TLS 三级链与缺失中间证书、部署补偿、48 小时策略、损坏材料恢复、绑定保护及旧基线迁移。DNS 测试覆盖精确删除、分页、失败持久化、独立重试、异常响应、权限、进程超时和告警退出码；固定版真实 acme.sh 的离线测试验证清理错误被吞掉时仍能保留恢复记录，并验证真实签名流程下接口错误的安全提取。失败诊断测试覆盖阶段分类、证据不足兜底、不同操作的证据隔离、敏感内容脱敏、归档权限、大小及数量/天数限制、归档失败提示。安装器测试检查原上游钩子保留、辅助文件和私有权限。模拟的签发、DNS API 和 DSM 导入不等于真实设备验收；NAS 实测结果见 [部署验收记录](DEPLOYMENT.md)。
