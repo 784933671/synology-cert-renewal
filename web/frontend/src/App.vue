@@ -124,7 +124,11 @@ onUnmounted(() => {
     />
     <FailuresView v-else-if="page === 'failures'" />
     <AuditView v-else-if="page === 'audit'" />
-    <SecurityView v-else-if="page === 'security'" />
+    <SecurityView
+      v-else-if="page === 'security'"
+      @dirty="dirty = $event"
+      @busy="working = $event"
+    />
     <AccountView
       v-else
       :session="session"

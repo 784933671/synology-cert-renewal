@@ -30,8 +30,10 @@ services:
       - ${CERTWEB_HOME:?set private deployment directory}/data:/data:rw
       - ${CERTWEB_HOME:?set private deployment directory}/bridge:/bridge:ro
       - ${CERTWEB_HOME:?set private deployment directory}/tls:/tls:ro
+      - ${CERTWEB_HOME:?set private deployment directory}/access:/access:ro
     environment:
       CERTWEB_DATA_DIR: /data
+      CERTWEB_ACCESS_POLICY_FILE: /access/access.json
       CERTWEB_BRIDGE_SOCKET: /bridge/certweb.sock
       CERTWEB_STATIC_DIR: /app/static
       CERTWEB_BIND: ${CERTWEB_BIND:?set NAS LAN IPv4}

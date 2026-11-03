@@ -516,6 +516,39 @@ class BridgeTests(unittest.TestCase):
                                ('status', {'path': '/etc/passwd'}), ('failures.get', {'id': 'x', 'path': '/'})]:
             self.assertEqual(self.request(method, params)['error']['code'], 'invalid_request')
 
+    def test_security_update_is_versioned_and_does_not_modify_certificate_or_task(self):
+        path=self.home/'access/access.json'
+        policy=bridge_module.access_policy.initialize_policy(path,owner_uid=os.getuid(),gid=os.getgid())
+        self.bridge.access_policy_path=path
+        self.bridge.policy_gid=os.getgid()
+        before=self.read_config();schedule=self.scheduler.get()
+        result=self.request('security.update',{'access_mode':'public','revision':policy['revision']})
+        self.assertTrue(result['ok'],result)
+        self.assertEqual(result['data']['mode'],'public')
+        self.assertNotEqual(result['data']['revision'],policy['revision'])
+        self.assertEqual(self.read_config(),before)
+        self.assertEqual(self.scheduler.get(),schedule)
+        self.assertEqual(self.scheduler.runs,0)
+        stale=self.request('security.update',{'access_mode':'lan','revision':policy['revision']})
+        self.assertEqual(stale['error']['code'],'stale_revision')
+        back=self.request('security.update',{'access_mode':'lan','revision':result['data']['revision']})
+        self.assertTrue(back['ok']);self.assertEqual(back['data']['mode'],'lan')
+
+    def test_security_update_rejects_arbitrary_paths_and_unknown_modes(self):
+        for params in [{'access_mode':'public','revision':'a'*32,'path':'/etc/passwd'},
+                       {'access_mode':'anything','revision':'a'*32}, {'access_mode':'public','revision':None}]:
+            self.assertEqual(self.request('security.update',params)['error']['code'],'validation')
+        self.assertEqual(self.request('security.update',{'access_mode':'public','revision':'a'*32})['error']['code'],'unavailable')
+
+    def test_security_update_corrupt_policy_is_not_silently_reinitialized(self):
+        path=self.home/'access/access.json'
+        policy=bridge_module.access_policy.initialize_policy(path,owner_uid=os.getuid(),gid=os.getgid())
+        self.bridge.access_policy_path=path;self.bridge.policy_gid=os.getgid()
+        path.write_text('{invalid')
+        result=self.request('security.update',{'access_mode':'public','revision':policy['revision']})
+        self.assertEqual(result['error']['code'],'unavailable')
+        self.assertEqual(path.read_text(),'{invalid')
+
 
 class TransportTests(unittest.TestCase):
     def exchange(self, payload, uid=10100, timeout=1, bridge=None):

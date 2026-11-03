@@ -28,6 +28,9 @@ import uuid
 _spec = importlib.util.spec_from_file_location('certweb_executor', Path(__file__).resolve().parents[1] / 'certctl.py')
 executor = importlib.util.module_from_spec(_spec)
 _spec.loader.exec_module(executor)
+_policy_spec = importlib.util.spec_from_file_location('certweb_access_policy', Path(__file__).resolve().parent / 'access_policy.py')
+access_policy = importlib.util.module_from_spec(_policy_spec)
+_policy_spec.loader.exec_module(access_policy)
 
 MAX_REQUEST = 64 * 1024
 MAX_RESPONSE = 2 * 1024 * 1024
@@ -213,12 +216,14 @@ def write_schedule(task, settings):
 
 
 class Bridge:
-    def __init__(self, home=executor.DEFAULT_HOME, controller_factory=None, scheduler=None, uid=0, management_host=None):
+    def __init__(self, home=executor.DEFAULT_HOME, controller_factory=None, scheduler=None, uid=0, management_host=None, access_policy_path=None, policy_gid=10100):
         if management_host is not None and (not executor.valid_domain(management_host) or management_host.startswith('*.')):
             reject('管理域名必须是小写的完整域名，不能使用通配符。')
         self.home = Path(home)
         self.uid = uid
         self.management_host = management_host
+        self.access_policy_path = Path(access_policy_path) if access_policy_path is not None else None
+        self.policy_gid = policy_gid
         self.controller_factory = controller_factory or (lambda: executor.Controller(self.home))
         self.scheduler = scheduler or Scheduler(self.home)
         self.actions = threading.Lock()
@@ -742,6 +747,21 @@ class Bridge:
                 continue
         return {'items': items}
 
+    def security_update(self, params):
+        if (not isinstance(params, dict) or set(params) != {'access_mode', 'revision'}
+                or params['access_mode'] not in ('lan', 'public')
+                or not isinstance(params['revision'], str) or not re.fullmatch(r'[0-9a-f]{32}', params['revision'])):
+            reject('访问模式或配置版本无效。')
+        if self.access_policy_path is None:
+            reject('当前安装尚未启用访问模式配置。', 'unavailable')
+        try:
+            return access_policy.write_policy(self.access_policy_path, params['access_mode'], params['revision'],
+                                              owner_uid=self.uid, gid=self.policy_gid)
+        except access_policy.PolicyConflict:
+            reject('访问模式已被其他操作修改，请刷新后重试。', 'stale_revision')
+        except (OSError, ValueError):
+            reject('访问策略无法保存，请检查策略文件和目录权限。', 'unavailable')
+
     def dispatch(self, request):
         try:
             if not isinstance(request, dict) or set(request) != {'method', 'params'} or not isinstance(request['params'], dict):
@@ -750,15 +770,16 @@ class Bridge:
             if not isinstance(method, str):
                 reject('RPC 方法无效。', 'invalid_request')
             methods = {'status': self.status, 'settings.get': self.settings_get, 'settings.update': self.settings_update,
-                       'run': self.run, 'check': self.check, 'failures.list': self.failure_list}
+                       'run': self.run, 'check': self.check, 'failures.list': self.failure_list,
+                       'security.update': self.security_update}
             if method == 'failures.get':
                 if set(params) != {'id'}:
                     reject('失败记录请求字段无效。', 'invalid_request')
                 data = self.failure_get(params['id'])
             elif method in methods:
-                if method != 'settings.update' and params:
+                if method not in ('settings.update', 'security.update') and params:
                     reject('该操作不接受额外参数。', 'invalid_request')
-                data = methods[method](params) if method == 'settings.update' else methods[method]()
+                data = methods[method](params) if method in ('settings.update', 'security.update') else methods[method]()
             else:
                 reject('不支持该 RPC 操作。', 'invalid_request')
             return {'ok': True, 'data': data}
@@ -978,6 +999,7 @@ def main(argv=None):
     parser.add_argument('--gid', type=int, default=10100)
     parser.add_argument('--parent-pid', type=int)
     parser.add_argument('--management-host', required=True)
+    parser.add_argument('--access-policy', type=Path)
     args = parser.parse_args(argv)
     if os.geteuid() != 0 or args.uid <= 0 or args.gid <= 0 or (args.parent_pid is not None and args.parent_pid <= 1):
         print('桥接须由 root 运行，并指定独立的非 root 容器身份。', file=sys.stderr)
@@ -988,7 +1010,9 @@ def main(argv=None):
     signal.signal(signal.SIGTERM, lambda *_: stop.set())
     signal.signal(signal.SIGINT, lambda *_: stop.set())
     try:
-        serve(Bridge(args.home, management_host=args.management_host), args.socket or args.home / 'web-run/certweb.sock', args.uid, args.gid, stop, args.parent_pid)
+        if args.access_policy is not None and (not args.access_policy.is_absolute() or str(args.access_policy) != str(args.access_policy.resolve())):
+            raise ValueError('访问策略路径必须是无符号链接的绝对路径')
+        serve(Bridge(args.home, management_host=args.management_host, access_policy_path=args.access_policy, policy_gid=args.gid), args.socket or args.home / 'web-run/certweb.sock', args.uid, args.gid, stop, args.parent_pid)
     except Exception:
         print('桥接启动失败，请核查私有目录、进程锁及未完成事务。', file=sys.stderr)
         return 1

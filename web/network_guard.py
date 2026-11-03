@@ -34,21 +34,27 @@ def command(args):
 
 
 class NetworkGuard:
-    def __init__(self, bind, networks, denied, port, run=command):
+    def __init__(self, bind, networks, denied, port, run=command, access_mode='lan'):
         self.bind, self.networks, self.denied = validate_network(bind, networks, denied, port)
         self.port, self.run = port, run
+        self.access_mode = access_mode
 
     def desired(self, version, hook='INPUT'):
+        if self.access_mode not in ('lan', 'public'):
+            raise GuardError('访问模式无效，管理服务保持关闭。')
         chain = 'CERTWEB_INPUT' if version == 4 else 'CERTWEB6_INPUT'
         jump = ['-A', hook]
         if version == 4:
             jump += ['-d', self.bind + '/32']
         jump += ['-p', 'tcp', '-m', 'tcp', '--dport', str(self.port), '-j', chain]
         rules = []
-        if version == 4:
+        if version == 4 and self.access_mode == 'public':
+            rules.append(['-A', chain, '-j', 'ACCEPT'])
+        elif version == 4:
             rules += [['-A', chain, '-s', value + '/32', '-j', 'DROP'] for value in self.denied]
             rules += [['-A', chain, '-s', value, '-j', 'ACCEPT'] for value in self.networks]
-        rules.append(['-A', chain, '-j', 'DROP'])
+        if version == 6 or self.access_mode == 'lan':
+            rules.append(['-A', chain, '-j', 'DROP'])
         return chain, jump, rules
 
     def snapshot(self, version):

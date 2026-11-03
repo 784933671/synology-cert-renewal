@@ -102,6 +102,27 @@ class NetworkBoundaryTests(unittest.TestCase):
         with patch.object(self.guard,'valid',return_value=False),self.assertRaises(GuardError):
             self.guard.install()
 
+    def test_public_mode_removes_lan_source_filters_and_preserves_ipv6_block(self):
+        self.guard.install()
+        self.guard.access_mode='public'
+        self.assertFalse(self.guard.valid())
+        self.guard.install()
+        self.assertTrue(self.guard.valid())
+        self.assertEqual([r for r in self.firewall.rules[4] if r[:2]==['-A','CERTWEB_INPUT']],
+                         [['-A','CERTWEB_INPUT','-j','ACCEPT']])
+        self.assertEqual([r for r in self.firewall.rules[6] if r[:2]==['-A','CERTWEB6_INPUT']],
+                         [['-A','CERTWEB6_INPUT','-j','DROP']])
+        self.guard.access_mode='lan'
+        self.assertFalse(self.guard.valid())
+        self.guard.install()
+        self.assertTrue(self.guard.valid())
+        self.assertIn(['-A','CERTWEB_INPUT','-s','10.10.10.1/32','-j','DROP'],self.firewall.rules[4])
+
+    def test_invalid_access_mode_never_modifies_firewall(self):
+        self.guard.access_mode='anything'
+        with self.assertRaises(GuardError):self.guard.install()
+        self.assertTrue(all(c[3:]==['-S'] for c in self.firewall.calls))
+
 
 class TLSSynchronizationTests(unittest.TestCase):
     @classmethod
@@ -202,7 +223,36 @@ class DeploymentRecoveryTests(unittest.TestCase):
         self.service.stop_container=Mock()
         self.service.compose=Mock()
         self.service.log=Mock(side_effect=lambda *_:setattr(self.service,'stopping',True))
-        self.service.serve()
+        with patch('web.deployment.read_policy',return_value={'mode':'lan','revision':'a'*32}):
+            self.service.serve()
+        self.service.compose.assert_not_called()
+        self.service.stop_container.assert_called()
+
+    def test_access_mode_applied_only_after_container_stop_and_rule_validation(self):
+        events=[]
+        policy={'mode':'public','revision':'a'*32}
+        self.service.guard.valid=Mock(return_value=False)
+        self.service.stop_container=Mock(side_effect=lambda:events.append('stop'))
+        self.service.guard.install=Mock(side_effect=lambda:events.append('rules'))
+        with patch('web.deployment.read_policy',return_value=policy),patch('web.deployment.write_applied',side_effect=lambda *_:events.append('applied')):
+            self.assertEqual(self.service.apply_access_policy(),policy)
+        self.assertEqual(events,['stop','rules','applied'])
+        self.assertEqual(self.service.guard.access_mode,'public')
+
+    def test_failed_rules_do_not_claim_new_mode_applied(self):
+        self.service.guard.valid=Mock(return_value=False)
+        self.service.stop_container=Mock()
+        self.service.guard.install=Mock(side_effect=GuardError('failed'))
+        with patch('web.deployment.read_policy',return_value={'mode':'public','revision':'a'*32}),patch('web.deployment.write_applied') as applied,self.assertRaises(GuardError):
+            self.service.apply_access_policy()
+        applied.assert_not_called()
+
+    def test_missing_policy_keeps_container_closed(self):
+        self.service.stop_container=Mock()
+        self.service.compose=Mock()
+        self.service.log=Mock(side_effect=lambda *_:setattr(self.service,'stopping',True))
+        with patch('web.deployment.read_policy',side_effect=FileNotFoundError):
+            self.service.serve()
         self.service.compose.assert_not_called()
         self.service.stop_container.assert_called()
 

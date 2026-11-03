@@ -128,7 +128,12 @@ export interface AuditItem {
   success: boolean
   message: string
 }
+export type AccessMode = 'lan' | 'public'
 export interface Security {
+  access_mode: AccessMode
+  applied_mode: AccessMode | null
+  revision: string
+  pending: boolean
   lan_only: boolean
   allowed_networks: string[]
   https: boolean

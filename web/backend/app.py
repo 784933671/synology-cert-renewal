@@ -202,7 +202,8 @@ def create_app(config=None, store=None, bridge=None):
 
     async def session(request, write=False, allow_change=False):
         token = request.cookies.get(COOKIE, "")
-        current = await run_in_threadpool(store.session, token, request.url.path != "/api/status")
+        polling = request.method == "GET" and request.url.path in ("/api/status", "/api/security")
+        current = await run_in_threadpool(store.session, token, not polling)
         if not current:
             raise ApiError(401, "unauthorized", "登录已失效，请重新登录")
         if write:
@@ -231,7 +232,7 @@ def create_app(config=None, store=None, bridge=None):
                 await run_in_threadpool(store.audit, audit, False, "执行器连接异常，操作未确认完成")
             raise ApiError(503, "unavailable", "群晖执行器暂不可用，请稍后重试") from None
         if audit:
-            await run_in_threadpool(store.audit, audit, True, "配置已更新" if audit == "settings.update" else "执行请求已提交")
+            await run_in_threadpool(store.audit, audit, True, "访问范围已保存，等待应用" if audit == "security.update" else "配置已更新" if audit == "settings.update" else "执行请求已提交")
         return result
 
     @app.get("/healthz")
@@ -345,8 +346,22 @@ def create_app(config=None, store=None, bridge=None):
     @app.get("/api/security")
     async def security(request: Request):
         await session(request)
-        return {"lan_only": True, "allowed_networks": list(config.allowed_networks), "https": True,
-                "session_idle_minutes": 30, "session_absolute_hours": 8}
+        return await run_in_threadpool(config.security_snapshot)
+
+    @app.put("/api/security")
+    async def update_security(request: Request):
+        await session(request, write=True)
+        data = await json_body(request)
+        try:
+            validation.exact_keys(data, {"access_mode", "revision"})
+            if data["access_mode"] not in ("lan", "public") or not isinstance(data["revision"], str) or not re.fullmatch(r"[0-9a-f]{32}", data["revision"]):
+                raise ValueError()
+        except ValueError:
+            raise ApiError(400, "validation", "访问范围配置不符合要求") from None
+        if config.access_policy_file is None:
+            raise ApiError(503, "unavailable", "访问范围配置尚未启用")
+        await call_bridge("security.update", data, "security.update")
+        return await run_in_threadpool(config.security_snapshot)
 
     @app.api_route("/{path:path}", methods=["GET", "HEAD"])
     async def static(path: str):

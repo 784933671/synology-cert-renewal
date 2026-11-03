@@ -13,6 +13,7 @@ import sys
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from network_guard import validate_network
 from deployment import load_config, private_json
+from access_policy import initialize_policy
 
 DEFAULT_HOME = Path('/usr/local/share/synology-cert-web')
 RC = Path('/usr/local/etc/rc.d/S99synology-cert-web.sh')
@@ -40,7 +41,7 @@ def prepare(args):
     # 构建上下文仅包含代码；禁止复制本地凭据、链接和构建缓存。
     for current, directories, files in os.walk(str(source), followlinks=False):
         relative = Path(current).relative_to(source)
-        directories[:] = [name for name in directories if name not in ('node_modules', 'dist', '__pycache__', 'coverage', 'data', 'tls', 'bridge', '.git')]
+        directories[:] = [name for name in directories if name not in ('node_modules', 'dist', '__pycache__', 'coverage', 'data', 'tls', 'bridge', 'access', '.git')]
         destination = home / 'code' / relative
         destination.mkdir(mode=0o700, parents=True, exist_ok=True)
         for name in directories + files:
@@ -53,17 +54,19 @@ def prepare(args):
                 continue
             shutil.copyfile(str(Path(current) / name), str(destination / name))
             os.chmod(str(destination / name), 0o600)
-    for directory in ('data', 'bridge', 'tls'):
+    for directory in ('data', 'bridge', 'tls', 'access'):
         path = home / directory
         path.mkdir(mode=0o700)
         os.chown(str(path), 10100 if directory == 'data' else 0, 10100)
         os.chmod(str(path), 0o700 if directory == 'data' else 0o750)
+    initialize_policy(home / 'access/access.json', mode=args.access_mode)
     target = native / 'web'
     target.mkdir(mode=0o700, exist_ok=True)
     if target.is_symlink() or target.stat().st_uid != 0 or target.stat().st_mode & 0o077:
         raise ValueError('既有桥接目录权限不安全')
-    shutil.copyfile(str(source / 'host_bridge.py'), str(target / 'host_bridge.py'))
-    os.chmod(str(target / 'host_bridge.py'), 0o600)
+    for name in ('host_bridge.py', 'access_policy.py'):
+        shutil.copyfile(str(source / name), str(target / name))
+        os.chmod(str(target / name), 0o600)
     env = {'CERTWEB_HOME': str(home), 'CERTWEB_BIND': args.bind, 'CERTWEB_PORT': str(args.port),
            'CERTWEB_ALLOWED_NETWORKS': ','.join(args.network), 'CERTWEB_DENIED_ADDRESSES': ','.join(args.deny),
            'CERTWEB_ALLOWED_HOSTS': checked['authority'], 'CERTWEB_ORIGIN': args.origin}
@@ -85,6 +88,7 @@ def main():
     command.add_argument('--deny', action='append', required=True)
     command.add_argument('--port', type=int, default=18443)
     command.add_argument('--origin', required=True)
+    command.add_argument('--access-mode', choices=['lan', 'public'], default='lan')
     commands.add_parser('build')
     commands.add_parser('activate')
     args = parser.parse_args()

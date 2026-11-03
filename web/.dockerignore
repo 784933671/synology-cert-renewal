@@ -9,6 +9,7 @@ frontend/coverage
 data
 tls
 bridge
+access
 *.log
 *.db
 *.db-*

@@ -12,6 +12,7 @@ from unittest.mock import patch
 
 import httpx
 
+from web import access_policy
 from web.backend.__main__ import main
 from web.backend.app import BODY_LIMIT, COOKIE, SECURITY_HEADERS, create_app
 from web.backend.auth import ABSOLUTE_SECONDS, IDLE_SECONDS, AuthStore, password_hash, verify_password
@@ -39,6 +40,12 @@ class FixtureBridge:
         self.calls.append((method, copy.deepcopy(params)))
         if self.error:
             raise self.error
+        if method == "security.update":
+            try:
+                return access_policy.write_policy(self.policy_path, params["access_mode"], params["revision"],
+                                                  owner_uid=os.getuid(), gid=os.getgid())
+            except access_policy.PolicyConflict:
+                raise BridgeError("stale_revision") from None
         if method.startswith("settings."):
             return safe_data({**settings_payload(), "secret_id_configured": True, "secret_key_configured": True})
         if method in ("run", "check"):
@@ -182,6 +189,14 @@ class WebApiTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual((await self.client.get("/api/status")).status_code, 200)
         self.now[0] += 300
         self.assertEqual((await self.client.get("/api/status")).status_code, 401)
+
+    async def test_security_application_polling_does_not_extend_idle_timeout(self):
+        await self.ready()
+        for _ in range(5):
+            self.now[0] += 300
+            self.assertEqual((await self.client.get("/api/security")).status_code, 200)
+        self.now[0] += 300
+        self.assertEqual((await self.client.get("/api/security")).status_code, 401)
 
     async def test_user_navigation_extends_idle_but_not_absolute_expiry(self):
         await self.ready()
@@ -417,7 +432,123 @@ class WebApiTests(unittest.IsolatedAsyncioTestCase):
         await self.ready()
         self.assertEqual((await self.client.get("/api/security")).json(), {
             "lan_only": True, "allowed_networks": ["10.10.10.0/24"], "https": True,
-            "session_idle_minutes": 30, "session_absolute_hours": 8})
+            "session_idle_minutes": 30, "session_absolute_hours": 8,
+            "access_mode": "lan", "applied_mode": "lan", "revision": "0" * 32, "pending": False})
+
+    async def configure_access_policy(self, mode="lan", peer="10.10.10.24"):
+        self.policy_path = self.root / "access/access.json"
+        value = access_policy.initialize_policy(self.policy_path, mode, os.getuid(), os.getgid())
+        self.bridge.policy_path = self.policy_path
+        reader = patch("web.backend.config.read_policy", side_effect=lambda path: access_policy.read_policy(path, os.getuid()))
+        reader.start()
+        self.addCleanup(reader.stop)
+        self.config = replace(self.config, access_policy_file=self.policy_path)
+        self.app = create_app(self.config, self.store, self.bridge)
+        await self.client.aclose()
+        self.client = self.make_client(peer=peer)
+        return value
+
+    async def test_public_mode_accepts_public_and_gateway_sources_but_still_requires_login(self):
+        await self.configure_access_policy("public", peer="203.0.113.8")
+        for peer in ("203.0.113.8", "10.10.10.1"):
+            async with self.make_client(peer) as client:
+                self.assertEqual((await client.get("/api/status")).status_code, 401)
+                self.assertEqual((await self.login(client)).status_code, 200)
+                self.assertEqual((await client.get("/api/status")).json()["error"]["code"], "password_change_required")
+        async with self.make_client("2001:db8::1") as client:
+            self.assertEqual((await self.login(client)).status_code, 403)
+
+    async def test_public_mode_preserves_host_origin_proxy_csrf_and_https_guards(self):
+        await self.configure_access_policy("public", peer="203.0.113.8")
+        headers = await self.ready()
+        self.assertEqual((await self.client.get("/api/status", headers={"Host": "evil.example"})).status_code, 400)
+        self.assertEqual((await self.client.get("/api/status", headers={"X-Forwarded-For": "10.10.10.24"})).status_code, 403)
+        self.assertEqual((await self.client.post("/api/actions/check", json={}, headers={"Origin": "https://evil.example"})).status_code, 403)
+        self.assertEqual((await self.client.post("/api/actions/check", json={}, headers={"Origin": ORIGIN})).json()["error"]["code"], "csrf_failed")
+        async with self.make_client("203.0.113.8", base="http://ttxli.cn:18443") as client:
+            self.assertEqual((await client.get("/api/status")).status_code, 403)
+        self.assertEqual((await self.client.post("/api/actions/check", json={}, headers=headers)).status_code, 200)
+
+    async def test_policy_changes_are_hot_loaded_without_restarting_application(self):
+        current = await self.configure_access_policy()
+        async with self.make_client("203.0.113.8") as client:
+            self.assertEqual((await client.get("/api/status")).status_code, 403)
+            changed = access_policy.write_policy(self.policy_path, "public", current["revision"], os.getuid(), os.getgid())
+            self.assertEqual((await client.get("/api/status")).status_code, 401)
+            access_policy.write_policy(self.policy_path, "lan", changed["revision"], os.getuid(), os.getgid())
+            self.assertEqual((await client.get("/api/status")).status_code, 403)
+
+    async def test_configured_missing_or_corrupt_policy_denies_all_requests(self):
+        await self.configure_access_policy("public")
+        self.policy_path.unlink()
+        self.assertEqual((await self.client.get("/healthz")).status_code, 503)
+        self.policy_path.write_text('{"mode":"public","revision":"bad"}')
+        self.policy_path.chmod(0o640)
+        self.assertEqual((await self.client.get("/api/session")).status_code, 503)
+        self.assertEqual(self.bridge.calls, [])
+
+    async def test_security_update_requires_authentication_csrf_and_first_password_change(self):
+        value = await self.configure_access_policy()
+        body = {"access_mode": "public", "revision": value["revision"]}
+        self.assertEqual((await self.client.put("/api/security", json=body, headers={"Origin": ORIGIN})).status_code, 401)
+        login = await self.login()
+        headers = {"Origin": ORIGIN, "X-CSRF-Token": login.json()["csrf_token"]}
+        self.assertEqual((await self.client.put("/api/security", json=body, headers=headers)).json()["error"]["code"], "password_change_required")
+        await self.ready()
+        self.assertEqual((await self.client.put("/api/security", json=body, headers={"Origin": ORIGIN})).json()["error"]["code"], "csrf_failed")
+        self.assertEqual(self.bridge.calls, [])
+
+    async def test_security_update_reports_pending_application_and_rejects_stale_revision(self):
+        value = await self.configure_access_policy()
+        access_policy.write_applied(self.policy_path, value, os.getuid(), os.getgid())
+        headers = await self.ready()
+        body = {"access_mode": "public", "revision": value["revision"]}
+        response = await self.client.put("/api/security", json=body, headers=headers)
+        self.assertEqual(response.status_code, 200)
+        saved = response.json()
+        self.assertEqual(saved["access_mode"], "public")
+        self.assertEqual(saved["applied_mode"], "lan")
+        self.assertTrue(saved["pending"])
+        self.assertFalse(saved["lan_only"])
+        self.assertEqual(saved["allowed_networks"], ["0.0.0.0/0"])
+        self.assertEqual(self.bridge.calls[-1], ("security.update", body))
+        current = access_policy.read_policy(self.policy_path, os.getuid())
+        access_policy.write_applied(self.policy_path, current, os.getuid(), os.getgid())
+        applied = (await self.client.get("/api/security")).json()
+        self.assertEqual(applied["applied_mode"], "public")
+        self.assertFalse(applied["pending"])
+        stale = await self.client.put("/api/security", json=body, headers=headers)
+        self.assertEqual(stale.status_code, 409)
+        audit = (await self.client.get("/api/audit")).json()["items"]
+        updates = [entry for entry in audit if entry["action"] == "security.update"]
+        self.assertEqual({entry["success"] for entry in updates}, {True, False})
+
+    async def test_security_can_close_public_access_without_skipping_save_response(self):
+        value = await self.configure_access_policy("public", peer="203.0.113.8")
+        headers = await self.ready()
+        response = await self.client.put("/api/security", json={"access_mode": "lan", "revision": value["revision"]}, headers=headers)
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.json()["access_mode"], "lan")
+        self.assertEqual((await self.client.get("/api/security")).status_code, 403)
+
+    async def test_security_update_rejects_extra_fields_and_invalid_values(self):
+        value = await self.configure_access_policy()
+        headers = await self.ready()
+        valid = {"access_mode": "public", "revision": value["revision"]}
+        for body in ({**valid, "path": "/etc/anything"}, {**valid, "access_mode": "all"},
+                     {**valid, "revision": "bad"}, {"access_mode": "public"}):
+            with self.subTest(body=body):
+                self.assertEqual((await self.client.put("/api/security", json=body, headers=headers)).status_code, 400)
+        self.assertEqual(self.bridge.calls, [])
+
+    async def test_security_missing_applied_record_is_pending_and_unconfigured_update_is_unavailable(self):
+        headers = await self.ready()
+        self.assertEqual((await self.client.put("/api/security", json={"access_mode": "public", "revision": "0" * 32}, headers=headers)).status_code, 503)
+        await self.configure_access_policy()
+        await self.ready()
+        data = (await self.client.get("/api/security")).json()
+        self.assertTrue(data["pending"])
+        self.assertIsNone(data["applied_mode"])
 
     async def test_database_contains_hashes_not_password_or_session_token(self):
         await self.ready()

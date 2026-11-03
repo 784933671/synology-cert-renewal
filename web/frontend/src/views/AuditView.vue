@@ -15,6 +15,7 @@ const actions: Record<string, string> = {
   password: '修改密码',
   'password.change': '修改密码',
   'settings.update': '更新配置',
+  'security.update': '修改访问模式',
   run: '手动运行任务',
   check: '手动检查',
   'actions.run': '手动运行任务',

@@ -1,4 +1,4 @@
-"""群晖原生监督进程：先验证内网边界，再启动 Docker 管理服务。"""
+"""群晖原生监督进程：先应用访问策略，再启动 Docker 管理服务。"""
 import argparse
 import fcntl
 import ipaddress
@@ -14,10 +14,12 @@ import time
 from urllib.parse import urlsplit
 
 if __package__:
+    from .access_policy import read_policy, initialize_policy, write_policy, write_applied
     from .network_guard import NetworkGuard, GuardError, validate_network
     from .tls_sync import sync_tls, TLSBusy
 else:
     sys.path.insert(0, str(Path(__file__).resolve().parent))
+    from access_policy import read_policy, initialize_policy, write_policy, write_applied
     from network_guard import NetworkGuard, GuardError, validate_network
     from tls_sync import sync_tls, TLSBusy
 
@@ -74,6 +76,7 @@ class Deployment:
         self.config, self.config_path = config, Path(config_path)
         self.home = Path(config['home'])
         self.code = self.home / 'code'
+        self.access_path = self.home / 'access/access.json'
         self.guard = NetworkGuard(config['bind'], config['networks'], config['denied'], config['port'])
         self.bridge = None
         self.stopping = False
@@ -155,7 +158,16 @@ class Deployment:
         log_path = self.home / 'bridge.log'
         fd = os.open(str(log_path), os.O_WRONLY | os.O_CREAT | os.O_APPEND | os.O_NOFOLLOW, 0o600)
         with os.fdopen(fd, 'a') as log:
-            self.bridge = subprocess.Popen([sys.executable, '-I', str(Path(self.config['native_home']) / 'web/host_bridge.py'), '--home', self.config['native_home'], '--socket', str(self.home / 'bridge/certweb.sock'), '--task-id', '7', '--uid', '10100', '--gid', '10100', '--parent-pid', str(os.getpid()), '--management-host', self.config['hostname']], env=self.env, stdin=subprocess.DEVNULL, stdout=log, stderr=log)
+            self.bridge = subprocess.Popen([sys.executable, '-I', str(Path(self.config['native_home']) / 'web/host_bridge.py'), '--home', self.config['native_home'], '--socket', str(self.home / 'bridge/certweb.sock'), '--task-id', '7', '--uid', '10100', '--gid', '10100', '--parent-pid', str(os.getpid()), '--management-host', self.config['hostname'], '--access-policy', str(self.access_path)], env=self.env, stdin=subprocess.DEVNULL, stdout=log, stderr=log)
+
+    def apply_access_policy(self):
+        policy = read_policy(self.access_path)
+        self.guard.access_mode = policy['mode']
+        if not self.guard.valid():
+            self.stop_container()
+            self.guard.install()
+        write_applied(self.access_path, policy)
+        return policy
 
     def bridge_ready(self):
         import socket
@@ -180,9 +192,7 @@ class Deployment:
             try:
                 while not self.stopping:
                     try:
-                        if not self.guard.valid():
-                            self.stop_container()
-                            self.guard.install()
+                        policy = self.apply_access_policy()
                         try:
                             sync_tls(Path(self.config['native_home']), self.home / 'tls', self.config['hostname'])
                         except TLSBusy:
@@ -198,7 +208,7 @@ class Deployment:
                             if not item or not item.get('State', {}).get('Running'):
                                 self.compose('up', '-d', '--no-build')
                             self.started = True
-                            self.log('running', '管理服务运行中，内网访问规则已校验。')
+                            self.log('running', '管理服务运行中，访问模式：{}。'.format('仅内网' if policy['mode'] == 'lan' else '允许外网'))
                     except (OSError, ValueError, RuntimeError, GuardError, subprocess.TimeoutExpired):
                         stopped = True
                         try:
@@ -241,14 +251,23 @@ def process_matches(pid, script, config_path):
 def main(argv=None):
     parser = argparse.ArgumentParser()
     parser.add_argument('--config', type=Path, default=DEFAULT_CONFIG)
-    parser.add_argument('command', choices=['start', 'serve', 'stop', 'status'])
+    parser.add_argument('command', choices=['start', 'serve', 'stop', 'status', 'set-access-mode'])
+    parser.add_argument('--mode', choices=['lan', 'public'])
     args = parser.parse_args(argv)
+    if args.command == 'set-access-mode' and args.mode is None:
+        parser.error('set-access-mode 需要 --mode lan 或 --mode public')
     if os.geteuid() != 0:
         parser.error('必须在群晖 root 终端运行')
     os.umask(0o077)
     try:
         config = load_config(args.config)
         home = Path(config['home'])
+        if args.command == 'set-access-mode':
+            policy_path = home / 'access/access.json'
+            current = initialize_policy(policy_path)
+            updated = write_policy(policy_path, args.mode, current['revision'])
+            print(json.dumps({'access_mode': updated['mode'], 'message': '访问模式已保存，运行中的管理服务会自动应用。'}, ensure_ascii=False))
+            return 0
         script = Path(__file__).resolve()
         pid_path = home / 'supervisor.pid'
         pid = json.loads(pid_path.read_text()).get('pid') if pid_path.exists() else None

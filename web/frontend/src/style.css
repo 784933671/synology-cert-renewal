@@ -798,6 +798,18 @@ hr {
   padding-top: 25px;
   gap: 15px;
 }
+.access-policy-fields {
+  gap: 16px;
+}
+.access-mode-field {
+  max-width: 340px;
+}
+.access-policy-actions .help {
+  margin-bottom: 18px;
+}
+.access-policy-status {
+  border-top: 1px solid #e7edf2;
+}
 .empty-state {
   padding: 65px 28px;
   color: #647c90;

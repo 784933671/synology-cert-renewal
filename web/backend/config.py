@@ -6,6 +6,8 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from urllib.parse import urlsplit
 
+from ..access_policy import read_policy
+
 PRIVATE_NETWORKS = tuple(ipaddress.ip_network(value) for value in (
     "10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16",
 ))
@@ -31,9 +33,15 @@ class Config:
     bridge_timeout: float = 60
     body_timeout: float = 10
     request_timeout: float = 70
+    access_policy_file: Path | None = None
     networks: tuple = field(init=False, repr=False)
 
     def __post_init__(self):
+        if self.access_policy_file is not None:
+            path = Path(self.access_policy_file)
+            if not path.is_absolute() or '..' in path.parts:
+                raise ValueError("访问策略路径必须为绝对路径")
+            object.__setattr__(self, "access_policy_file", path)
         networks = []
         for value in self.allowed_networks:
             network = ipaddress.ip_network(value, strict=True)
@@ -68,15 +76,38 @@ class Config:
             denied_addresses=items("CERTWEB_DENIED_ADDRESSES"),
             allowed_hosts=items("CERTWEB_ALLOWED_HOSTS", "localhost:18443,127.0.0.1:18443"),
             origin=os.getenv("CERTWEB_ORIGIN", "https://localhost:18443"),
+            access_policy_file=Path(os.environ["CERTWEB_ACCESS_POLICY_FILE"]) if os.getenv("CERTWEB_ACCESS_POLICY_FILE") else None,
         )
 
+    def access_policy(self):
+        if self.access_policy_file is None:
+            return {"mode": "lan", "revision": "0" * 32}
+        return read_policy(self.access_policy_file)
+
+    def security_snapshot(self):
+        policy = self.access_policy()
+        applied = policy if self.access_policy_file is None else None
+        if self.access_policy_file is not None:
+            try:
+                applied = read_policy(self.access_policy_file.with_name("applied.json"))
+            except FileNotFoundError:
+                pass
+        return {"lan_only": policy["mode"] == "lan", "access_mode": policy["mode"],
+                "applied_mode": applied["mode"] if applied else None,
+                "revision": policy["revision"], "pending": applied != policy,
+                "allowed_networks": list(self.allowed_networks) if policy["mode"] == "lan" else ["0.0.0.0/0"],
+                "https": True, "session_idle_minutes": 30, "session_absolute_hours": 8}
+
     def allows_peer(self, value: str, path: str) -> bool:
+        policy = self.access_policy()
         try:
             address = ipaddress.ip_address(value)
         except ValueError:
             return False
         if address.version != 4:
             return False
+        if policy["mode"] == "public":
+            return not address.is_unspecified and not address.is_multicast
         if str(address) in self.denied_addresses:
             return False
         # 唯一的回环例外是健康检查，不允许回环来源操作业务 API。

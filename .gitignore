@@ -38,6 +38,7 @@ account.conf
 /web/data/
 /web/tls/
 /web/bridge/
+/web/access/
 /web/deployment-state.json
 *.sqlite3
 *.sqlite3-*

@@ -12,7 +12,7 @@ COPY requirements.txt ./requirements.txt
 RUN pip install --no-cache-dir --require-hashes -r requirements.txt
 COPY __init__.py /app/web/__init__.py
 COPY backend/ /app/web/backend/
-COPY container_entry.py healthcheck.py /app/web/
+COPY container_entry.py healthcheck.py access_policy.py /app/web/
 COPY --from=ui /build/dist/ /app/static/
 RUN chmod -R a+rX /app/web /app/static
 USER 10100:10100
