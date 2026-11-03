@@ -14,7 +14,8 @@ from web.setup_upgrade import copy_payload, regular
 
 ROOT_FILES = ('setup.sh', 'install.sh', 'certctl.py', 'run_history.py', 'failure_diagnostics.py', 'dns_cleanup.py',
               'dns_cleanup_retry.sh', 'dns_tencent_tracked.sh', 'dns-policy.example.json',
-              'README.md', 'DEPLOYMENT.md', 'INSTALL.md')
+              'README.md', 'DEPLOYMENT.md', 'INSTALL.md', 'PUBLIC-INSTALL.md', 'PRIVATE-INSTALL.md',
+              'bootstrap.sh', 'bootstrap-private.sh')
 
 
 def package(source, destination):

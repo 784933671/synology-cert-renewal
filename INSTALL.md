@@ -2,7 +2,7 @@
 
 当前入口支持 DSM 7、x86_64 群晖（包括 DS218+）。安装包包含源码，首次构建需要联网下载固定版本 acme.sh、Docker 基础镜像和依赖。
 
-保持仓库私有并使用单条在线命令时，参见[私有仓库安装入口](https://github.com/784933671/synology-cert-renewal/blob/main/PRIVATE-INSTALL.md)，它会尝试通过官方套件中心补齐依赖，再进入同一个安装器。以下为下载源码包后的操作。
+推荐使用[公开仓库单命令安装](PUBLIC-INSTALL.md)，无需 GitHub 令牌；入口尝试通过官方套件中心补齐依赖，再进入同一个安装器。以下为下载源码包后的操作。
 
 ## 准备
 
@@ -59,4 +59,4 @@ sudo cat /usr/local/share/synology-cert-web/deployment-state.json
 python3 scripts/package.py
 ```
 
-输出 `output/releases/synology-cert-manager.zip` 和同名 `.sha256` 文件，包内 `SHA256SUMS` 可核对各源码文件。已有用户可从 GitHub 下载新版源码 ZIP；私有仓库需先登录 GitHub，不要把访问令牌粘贴到 NAS 命令或聊天中。
+输出 `output/releases/synology-cert-manager.zip` 和同名 `.sha256` 文件，包内 `SHA256SUMS` 可核对各源码文件。已有用户可直接从公开 GitHub 仓库下载新版源码 ZIP，无需登录或提供 GitHub 令牌。

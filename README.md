@@ -18,11 +18,17 @@ Docker 只承载页面和管理 API；已绑定的 DSM 任务（本机原任务 
 
 ## 一键安装与升级（推荐）
 
-私有仓库可使用[单命令安装入口](https://github.com/784933671/synology-cert-renewal/blob/main/PRIVATE-INSTALL.md)：在 NAS 隐藏输入仅本仓库可读的 GitHub 令牌，自动检查或尝试补齐官方依赖、下载固定提交并进入原安装向导。首次域名、密钥、邮箱等仍需交互配置；下方保留手动下载源码的方式。
+通过 SSH 登录群晖后执行，无需 GitHub 账号或令牌：
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/784933671/synology-cert-renewal/main/bootstrap.sh | sudo sh
+```
+
+完整步骤见[单命令安装教程](PUBLIC-INSTALL.md)。入口自动检查或尝试补齐官方依赖、下载并校验固定提交，再进入原安装向导；首次域名、DNSPod 密钥、邮箱等仍需交互配置。安装中断后再次执行可复用原版本继续；已有完整安装进入保留配置升级。下方保留手动下载源码的方式。
 
 支持 DSM 7、x86_64 架构（例如 DS218+）；先在套件中心安装并启动 Docker / Container Manager，确保 Docker Compose 和 Python 3.8+ 可用，并在 DSM“控制面板 → 通知”配置、测试邮件发送。准备好 DNSPod 子账号密钥，以及 DSM 中描述唯一、DNS SAN 已包含目标域名且已绑定到待验证 HTTPS 服务的证书条目。工具沿用该条目，不自动创建域名或扩大证书覆盖范围。
 
-在浏览器登录 [GitHub 仓库](https://github.com/784933671/synology-cert-renewal)，通过“Code → Download ZIP”下载源码，将完整压缩包上传并解压到 NAS。通过 SSH 登录 NAS 后，在解压得到的项目根目录执行；以下路径按实际解压位置调整：
+在浏览器打开 [GitHub 仓库](https://github.com/784933671/synology-cert-renewal)，通过“Code → Download ZIP”下载源码，将完整压缩包上传并解压到 NAS。通过 SSH 登录 NAS 后，在解压得到的项目根目录执行；以下路径按实际解压位置调整：
 
 ```sh
 cd /volume1/docker/synology-cert-renewal-main

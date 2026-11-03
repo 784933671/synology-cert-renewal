@@ -7,7 +7,7 @@ PATH=/usr/syno/sbin:/usr/syno/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin
 export PATH
 case "${1:-}" in
   --help) printf '%s\n' '在 DSM 私有终端执行 sudo sh bootstrap-private.sh；隐藏输入 GitHub 只读令牌，自动准备依赖并进入原安装向导。'; exit 0 ;;
-  ''|--token-stdin) ;;
+  ''|--token-stdin|--public) ;;
   *) printf '%s\n' '不支持的安装参数。' >&2; exit 1 ;;
 esac
 [ "$#" -le 1 ] || exit 1
@@ -135,8 +135,8 @@ def blob_sha(data):
 
 
 class GitHub:
-    def __init__(self, token):
-        if not isinstance(token, str) or not re.fullmatch(r'[A-Za-z0-9_]{20,255}', token):
+    def __init__(self, token=None):
+        if token is not None and (not isinstance(token, str) or not re.fullmatch(r'[A-Za-z0-9_]{20,255}', token)):
             raise BootstrapError('GitHub 令牌格式无效。')
         self.token = token
         self.opener = urllib.request.build_opener(NoRedirect())
@@ -148,7 +148,7 @@ class GitHub:
                 or parts.username or parts.password or parts.fragment):
             raise BootstrapError('拒绝向非 GitHub 下载地址发送请求。')
         headers = {'User-Agent': 'synology-cert-bootstrap', 'Accept': 'application/vnd.github+json'}
-        if authenticated:
+        if authenticated and self.token is not None:
             headers['Authorization'] = 'Bearer ' + self.token
         return self.opener.open(urllib.request.Request(url, headers=headers), timeout=120)
 
@@ -376,7 +376,9 @@ class Installer:
 def main():
     os.umask(0o077)
     try:
-        if '--token-stdin' in sys.argv:
+        if '--public' in sys.argv:
+            token = None
+        elif '--token-stdin' in sys.argv:
             with os.fdopen(3, 'r') as handle:
                 token = handle.read(257).strip()
         else:
@@ -385,7 +387,10 @@ def main():
         token = None
         return Installer(client).run()
     except urllib.error.HTTPError as error:
-        print('GitHub 下载未完成（HTTP {}），请检查令牌有效期、目标仓库 Contents 只读权限及网络。'.format(error.code), file=sys.stderr)
+        if '--public' in sys.argv:
+            print('GitHub 公开下载未完成（HTTP {}），请确认仓库公开且网络正常；匿名请求受到限流时请稍后重试。'.format(error.code), file=sys.stderr)
+        else:
+            print('GitHub 下载未完成（HTTP {}），请检查令牌有效期、目标仓库 Contents 只读权限及网络。'.format(error.code), file=sys.stderr)
     except BootstrapError as error:
         print(str(error), file=sys.stderr)
     except BlockingIOError:
