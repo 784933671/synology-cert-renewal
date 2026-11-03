@@ -2,17 +2,19 @@
 
 中文 Vue 3 + Ant Design Vue 4.2.6 页面，采用蓝白侧边导航、卡片、表单、表格与移动端抽屉导航，支持管理员密码与邮箱验证码登录、证书与 DNS 凭据配置、续期计划、立即申请新证书、成功/失败通知邮箱、访问模式切换、失败归档、操作审计和密码修改。
 
+推荐从完整源码包的根目录运行 `sudo sh setup.sh`，首次安装与保留配置升级使用同一入口。详见下方[一键安装与升级](#一键安装与升级)；高级分步入口继续保留。
+
 ## 运行结构
 
 ```
 浏览器 → HTTPS 管理容器（非 root） → 受限 Unix socket
                                       ↓
-                    群晖本机桥接 → 原任务 7 / certctl
+                    群晖本机桥接 → 已绑定 DSM 任务 / certctl
                                       ↓
                     DNSPod → Let's Encrypt → DSM → 校验/通知
 ```
 
-Docker 运行前端和管理 API。证书签发、DSM 导入及通知继续使用已部署的本机执行器，保持原任务的恢复机制；容器不再建立第二套续期定时器。无需在网页保存 DSM 管理员密码，也不需要关闭 DSM 双重验证。
+Docker 运行前端和管理 API。证书签发、DSM 导入及通知继续使用本机执行器和已绑定 DSM 任务（当前 NAS 原任务 7），保持原任务的恢复机制；容器不再建立第二套续期定时器。新设备由 DSM 分配任务编号，编号存于私有部署配置；已有安装保留原绑定和检查时间。无需在网页保存 DSM 管理员密码，也不需要关闭 DSM 双重验证。
 
 ## 访问模式与边界
 
@@ -68,20 +70,51 @@ DNSPod 密钥只允许写入，GET 接口只返回是否已配置。浏览器不
 
 设计参考：[OWASP 会话管理](https://cheatsheetseries.owasp.org/cheatsheets/Session_Management_Cheat_Sheet.html)、[CSRF 防护](https://cheatsheetseries.owasp.org/cheatsheets/Cross-Site_Request_Forgery_Prevention_Cheat_Sheet.html)。
 
-## 安装
+## 一键安装与升级
 
-要求已有原证书工具配置和固定任务 7、DSM 本机 Python 3.8+、Docker/Compose、iptables/ip6tables。先在实际 NAS 备份并验证原任务，不在没有预检的设备上直接套用示例地址。
+一键入口支持 DSM 7 的 x86_64 群晖（例如 DS218+），要求 Python 3.8+、已运行的 Docker / Container Manager 与 Docker Compose、本机 iptables/ip6tables，以及已配置并测试成功的 DSM 通知邮件。准备好 DNSPod 子账号密钥，先在 DSM 中确认描述唯一的目标证书条目，其 DNS SAN 必须包含要管理的域名，并绑定到实际 HTTPS 验证服务。向导不会创建新的域名或扩展证书 SAN。
+
+在浏览器登录 [GitHub 仓库](https://github.com/784933671/synology-cert-renewal)，使用“Code → Download ZIP”下载完整源码，再上传并解压到 NAS。在私有 SSH 终端进入项目根目录执行，以下路径按解压位置调整：
+
+```sh
+cd /volume1/docker/synology-cert-renewal-main
+sudo sh setup.sh
+```
+
+按提示选择现有证书、输入密钥、确认 NAS 内网地址/网段/网关、管理域名/端口、访问模式和邮箱，再设置管理账号 `admin` 的密码。新安装默认 `lan`；本说明中的 `ttxli.cn`、`10.10.10.37` 是当前 NAS 示例，新设备填写自己的值。管理员密码和密钥不通过命令参数传递。已有原脚本配置会保留，不重新索取或覆盖原密钥。
+
+安装器自动完成镜像构建、固定登录邮箱绑定、开机启动和服务检查。所选证书若过期或自签、不能通过可信 HTTPS 检查，只有在终端明确选择后才运行原任务申请或恢复证书；拒绝后保留安装进度。需先有正确域名的证书条目，不能从不含目标域名的默认设备证书推导新证书。
+
+安装器只绑定精确指向当前原执行器 `run-task.sh` 的 root 脚本任务。没有时新建，先保持停用，待容器健康、真实 HTTPS 和证书桥接检查通过再启用；新任务默认每小时第 17 分钟。已有任务保留原编号、计划分钟、启停状态和通知设置；多个匹配或结果不明时停止，避免重复执行。任务编号由 DSM 分配，不能假定新设备仍为 7。
+
+已有完整看板时，`setup.sh` 自动进入保留配置升级；未完成安装时，使用原源码包重新运行继续。安装日志绑定源码摘要，恢复安装时不要换包。已完成安装不重复走 `install`，避免重设登录或覆盖已修改的计划。需要明确操作时：
+
+| 命令 | 行为 |
+| --- | --- |
+| `sudo sh setup.sh check` | 只读检查系统依赖及已有部署参数，不构建、启动或申请证书 |
+| `sudo sh setup.sh upgrade` | 升级已完整部署的管理层，保留配置、登录、邮箱验证和原任务 |
+| `sudo sh setup.sh recover` | 处理管理层升级中断的恢复记录，不自动宣称新版本已上线 |
+
+升级先构建新镜像，切换前保存私有备份；切换失败按恢复记录回退。安装进度在 `/usr/local/share/synology-cert-setup`，管理层升级记录和备份在 `/usr/local/share/synology-cert-web`。不要删除进度、认证数据库或任务状态来重复安装。`recover` 不处理证书签发、DNS 清理或绑定变化，这些仍按原执行器的恢复步骤处理。
+
+首次启动、升级切换或容器异常退出后，监督进程要求访问规则、HTTPS 材料、桥接等启动条件连续稳定 60 秒，才启动管理容器。升级切换后等待约 1～3 分钟属于正常过程，不包括镜像下载与构建；条件变化会重新计时，正常运行中的容器不会定期重启。持续失败时保持保护状态，查看下方启动阶段记录后处理，不要反复手动启动容器绕过监督进程。
+
+完成后按终端给出的域名入口访问，首次登录输入刚设置的密码和邮箱验证码并修改初始密码。内网 DNS / hosts、路由器映射由用户自行配置；安装器不会修改路由器。实际邮件送达、登录和证书业务验收需在目标 NAS 完成，安装脚本测试通过不代表已完成新设备实装验收。
+
+## 高级分步安装
+
+以下方式要求已有配置正确的原证书执行器和唯一对应的 DSM 任务、DSM 本机 Python 3.8+、Docker/Compose、iptables/ip6tables。先备份并验证原任务，在 `--task-id` 填写其真实编号；示例 7 仅对应当前 NAS。首次安装推荐上面的向导自动发现或创建任务。
 
 在 NAS root 终端，从上传的 `web` 源码目录执行：
 
 ```sh
-/usr/bin/python3 -I install-web.py prepare --bind 10.10.10.37 --network 10.10.10.0/24 --deny 10.10.10.1 --origin https://ttxli.cn:18443 --access-mode lan
+/usr/bin/python3 -I install-web.py prepare --bind 10.10.10.37 --network 10.10.10.0/24 --deny 10.10.10.1 --origin https://ttxli.cn:18443 --access-mode lan --task-id 7
 /usr/bin/python3 -I /usr/local/share/synology-cert-web/code/install-web.py build
 ```
 
 `--access-mode` 支持 `lan` 和 `public`，省略时默认 `lan`；需要从首次启动就允许任意 IPv4 来源时使用 `--access-mode public`。内网白名单和网关配置仍保留，供之后切回 `lan` 使用。
 
-安装位置 `/usr/local/share/synology-cert-web`。安装器拒绝覆盖已有目录；原工具只新增受限桥接文件，不重装原脚本或重新初始化密钥、证书、恢复状态。
+安装位置 `/usr/local/share/synology-cert-web`。分步 `prepare` 不覆盖已存在的完整安装；原工具只新增受限桥接文件，不重新初始化密钥、证书或恢复状态。已有管理层使用源码根目录的 `setup.sh upgrade`。
 
 在同一私有交互终端初始化管理员。以下一次性容器只挂载登录数据库，通过 `-it` 接收两次隐藏的密码输入（至少 12 个字符），不要把密码写进命令参数：
 
@@ -146,7 +179,7 @@ unset CERTWEB_LOGIN_EMAIL CERTWEB_LOGIN_VERSION
 /usr/bin/python3 -I /usr/local/share/synology-cert-web/code/install-web.py activate
 ```
 
-启动注册 `/usr/local/etc/rc.d/S99synology-cert-web.sh`。监督进程先校验访问规则、证书副本和桥接，再启动容器；Docker 的 restart 设置为 no，由监督进程管理顺序。
+启动注册 `/usr/local/etc/rc.d/S99synology-cert-web.sh`。监督进程先校验访问规则、证书副本和桥接，等待启动条件连续稳定 60 秒后再启动容器；Docker 的 restart 设置为 no，由监督进程管理顺序。
 
 ## 配置保存与故障恢复
 
@@ -167,6 +200,13 @@ unset CERTWEB_LOGIN_EMAIL CERTWEB_LOGIN_VERSION
 ```sh
 sudo /usr/local/etc/rc.d/S99synology-cert-web.sh status
 sudo docker ps --filter name=synology-cert-web
+```
+
+启动与安全停服的固定中文摘要写入 `/usr/local/share/synology-cert-web/supervisor.log`；同目录 `deployment-state.json` 保存最新 `status`、`stage`、`message`。`stage` 可定位 `policy`（访问策略/防火墙）、`tls`（HTTPS 材料）、`bridge`（群晖桥接）、`docker`、`stability`（稳定等待）或 `start`（容器启动）等环节。检查失败时会尝试停止管理容器；无法确认停止时记录相应提示，需要通过 NAS 检查，不把它视为已安全关闭。
+
+```sh
+sudo tail -n 30 /usr/local/share/synology-cert-web/supervisor.log
+sudo cat /usr/local/share/synology-cert-web/deployment-state.json
 ```
 
 停止或重新启动管理层不改变原续期任务：
@@ -192,7 +232,7 @@ sudo /usr/local/etc/rc.d/S99synology-cert-web.sh start
 - 桥接配置冲突、事务前后恢复窗口、未完成任务保护、真实 socket 协议与父进程退出测试。
 - TLS 权限、指针恢复、域名/链验证、worker 重载、访问策略修订冲突与损坏后拒绝访问、专用防火墙规则及容器停止失败测试。
 - 真实 HTTPS API + 浏览器登录/配置/失败详情/空态/移动布局验收。
-- NAS 部署验收需要另外确认真实 task7、证书指纹、容器健康、启动恢复、验证码邮件实际到达，以及 `lan` 模式的公网拒绝和 `public` 模式的 IPv4 访问；本地模拟邮件和固定 acme.sh 测试不能替代真实收信及签发验收。
+- NAS 部署验收需要另外确认实际绑定的 DSM 任务、证书指纹、容器健康、启动恢复、验证码邮件实际到达，以及 `lan` 模式的公网拒绝和 `public` 模式的 IPv4 访问；本地模拟邮件和固定 acme.sh 测试不能替代真实收信及签发验收。
 
 在 NAS 或允许的 LAN 客户端可先使用下面的命令验证 HTTPS 连通性、域名及证书链，无需先修改 DNS，也不要添加 `-k` 跳过验证：
 

@@ -1,0 +1,58 @@
+# 一键引导安装
+
+当前入口支持 DSM 7、x86_64 群晖（包括 DS218+）。安装包包含源码，首次构建需要联网下载固定版本 acme.sh、Docker 基础镜像和依赖。
+
+## 准备
+
+1. 在套件中心安装并启动 Docker / Container Manager，以及 Python 3.8 或更新版本；Docker 必须提供 `docker compose`。
+2. 在 DSM 中配置通知邮件，并确认测试邮件可收到。登录验证码复用该发信设置。
+3. 准备腾讯云 DNSPod 专用子账号密钥。DSM 中须已有覆盖业务域名、描述唯一的证书条目，并已绑定要验证的 HTTPS 服务；向导沿用其域名，不会给默认 `synology` 证书添加新域名。
+4. 将安装包解压到 NAS 的私有目录。局域网 SSH 登录后，进入包含 `setup.sh` 的目录。
+
+## 执行
+
+```sh
+sudo sh setup.sh
+```
+
+首次安装时，按提示选择证书、填写 DNSPod 密钥、确认内网 IP/网段/网关、管理域名、邮箱和密码。密钥及密码隐藏输入，不要写入命令参数。默认仅内网访问；如明确选择 `public`，仍需自行配置公网 DNS 和路由器映射。
+
+若所选证书已过期或不受信任，向导会明确询问是否先执行原签发/恢复流程。拒绝后保留进度，可准备有效证书后继续；安装器不会跳过 TLS 验证启动看板。
+
+首次没有 ACME 材料时，启用后的原续期任务会进行首次申请。新建任务先保持禁用，直到容器、可信 HTTPS 和实际证书桥接全部验证通过才启用。已有任务的启用状态、检查时间和通知配置均保留。
+
+安装完成后打开终端显示的 HTTPS 地址，以 `admin` 登录。首次设置的密码需要修改，并通过所选邮箱的验证码验证。内网访问时，将管理域名解析到 NAS 内网 IP；安装器不修改路由器或 DNS。
+
+## 检查、升级与恢复
+
+| 命令 | 用途 |
+|---|---|
+| `sudo sh setup.sh check` | 只读检查环境，显示已有部署入口与任务编号，不安装或改配置 |
+| `sudo sh setup.sh` | 新安装进入向导；未完成安装用同一安装包继续；已有完整安装进入升级 |
+| `sudo sh setup.sh upgrade` | 先构建新镜像，再备份并切换；保留密码、邮箱验证、密钥、证书及计划 |
+| `sudo sh setup.sh recover` | 恢复未完成的升级事务；不会把恢复旧版本报告为新版本上线 |
+
+首次安装中断后重新执行同一命令，使用同一份安装包；已保存的密码不会再次初始化，已创建的任务不会重复创建。更换源码包会停止恢复，避免版本混用。安装完成后更新代码应使用 `upgrade`，不要删除部署目录重装。
+
+升级中断时，`upgrade` 会先恢复旧版本，再有界地继续本次升级。恢复要求管理服务及所有写入认证数据库的容器停止；不能确认时保留备份并停止，不覆盖运行中的数据库。
+
+首次启动、升级切换或容器异常退出后，监督进程会等待访问规则、HTTPS 材料、桥接等启动条件**连续稳定 60 秒**，再启动管理容器。升级切换后约 1～3 分钟的等待属于正常启动过程，不包含此前下载依赖和构建镜像的时间；期间条件变化会重新计时，已正常运行的容器不会每分钟重启。
+
+检查失败时会尝试安全停止管理容器，并记录固定的中文阶段摘要；若无法确认停止，也会明确提示。查看 `/usr/local/share/synology-cert-web/supervisor.log` 的过程记录，以及同目录 `deployment-state.json` 中最新的 `status`、`stage`、`message`。阶段包括 `policy`（访问策略/防火墙）、`tls`（HTTPS 材料）、`bridge`（群晖桥接）、`docker`、`stability`（稳定等待）和 `start`（容器启动）：
+
+```sh
+sudo tail -n 30 /usr/local/share/synology-cert-web/supervisor.log
+sudo cat /usr/local/share/synology-cert-web/deployment-state.json
+```
+
+安装进度在 `/usr/local/share/synology-cert-setup`；管理目录在 `/usr/local/share/synology-cert-web`；原执行器在 `/usr/local/share/synology-cert-renewal`。这些目录含私有配置或认证数据，勿加入仓库或对普通用户开放权限。
+
+只有一条命令不代表不需要准备域名、权限和邮件；新机完整安装、DNSPod 签发、DSM 导入、真实邮箱和内网客户端访问仍需在目标设备验收。自动化测试与已有设备的只读检查不替代新机实际安装。
+
+在开发电脑生成不含运行数据的安装包：
+
+```sh
+python3 scripts/package.py
+```
+
+输出 `output/releases/synology-cert-manager.zip` 和同名 `.sha256` 文件，包内 `SHA256SUMS` 可核对各源码文件。已有用户可从 GitHub 下载新版源码 ZIP；私有仓库需先登录 GitHub，不要把访问令牌粘贴到 NAS 命令或聊天中。

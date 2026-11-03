@@ -813,11 +813,46 @@ class SchedulerTests(unittest.TestCase):
             scheduler.put(value)
         args = scheduler.api.call_args_list[0].args
         self.assertEqual(args[:3], ('SYNO.Core.TaskScheduler.Root', 'set', 4))
-        self.assertEqual(args[3]['real_owner'], 'tangtao')
+        self.assertEqual(args[3]['real_owner'], 'root')
         self.assertNotIn('type', args[3])
         value['extra']['script'] += '; id'
         with self.assertRaises(bridge_module.BridgeError):
             scheduler.validate(value)
+
+    def test_dynamic_identifier_reaches_get_history_run_and_cli(self):
+        home = Path('/private/cert')
+        value = dict(task(home), id=31)
+        capture = mock.Mock()
+        scheduler = bridge_module.Scheduler(home, capture, task_id=31)
+        scheduler.api = mock.Mock(return_value=value)
+        self.assertEqual(scheduler.get()['id'], 31)
+        self.assertEqual(scheduler.api.call_args.args[-1], {'id': 31})
+        scheduler.history()
+        self.assertEqual(scheduler.api.call_args.args[-1], {'id': 31})
+        with mock.patch.object(bridge_module.shutil, 'which', return_value='/usr/syno/bin/synoschedtask'):
+            scheduler.run()
+        self.assertIn('id=31', capture.call_args.args[0])
+        with mock.patch.object(bridge_module.os, 'geteuid', return_value=0), \
+             mock.patch.object(bridge_module.os, 'umask'), \
+             mock.patch.object(bridge_module.signal, 'signal'), \
+             mock.patch.dict(os.environ), mock.patch.object(bridge_module, 'serve') as serve:
+            self.assertEqual(bridge_module.main(['--management-host', 'nas.example.com', '--task-id', '31']), 0)
+            self.assertEqual(serve.call_args.args[0].scheduler.task_id, 31)
+
+    def test_foreign_id_and_invalid_identifier_are_rejected_before_actions(self):
+        for identifier in (0, -1, True, 2 ** 31, '7'):
+            with self.subTest(identifier=identifier), self.assertRaises(ValueError):
+                bridge_module.Scheduler(Path('/private/cert'), task_id=identifier)
+        scheduler = bridge_module.Scheduler(Path('/private/cert'), task_id=31)
+        with self.assertRaises(bridge_module.BridgeError):
+            scheduler.validate(task(Path('/private/cert')))
+
+    def test_real_owner_is_preserved_when_available(self):
+        value = dict(task(Path('/private/cert')), real_owner='nasoperator')
+        scheduler = bridge_module.Scheduler(Path('/private/cert'))
+        scheduler.api = mock.Mock(side_effect=[{}, value])
+        scheduler.put(value)
+        self.assertEqual(scheduler.api.call_args_list[0].args[-1]['real_owner'], 'nasoperator')
 
     def test_run_is_fixed_argv_without_shell_or_forced_renewal(self):
         capture = mock.Mock()

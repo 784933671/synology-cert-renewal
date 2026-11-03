@@ -26,6 +26,7 @@ else:
 CONTAINER = 'synology-cert-web'
 MANAGED_LABEL = 'io.github.784933671.certweb.managed'
 DEFAULT_CONFIG = Path('/usr/local/share/synology-cert-web/deployment.json')
+START_STABLE_SECONDS = 60
 
 
 def private_json(path, value):
@@ -46,7 +47,7 @@ def load_config(path):
         raise ValueError('部署配置必须仅 root 可读写')
     config = json.loads(path.read_text())
     expected = {'home', 'native_home', 'bind', 'networks', 'denied', 'port', 'origin'}
-    if set(config) != expected:
+    if set(config) - {'task_id'} != expected:
         raise ValueError('部署配置字段不正确')
     validate_network(config['bind'], config['networks'], config['denied'], config['port'])
     for key in ('home', 'native_home'):
@@ -55,8 +56,20 @@ def load_config(path):
             raise ValueError('部署目录无效')
         if item.stat().st_uid != 0 or item.stat().st_mode & 0o022:
             raise ValueError('部署目录不可由非 root 用户写入')
-    origin = urlsplit(config['origin'])
-    if origin.scheme != 'https' or not origin.hostname or origin.port != config['port'] or origin.path or origin.query or origin.fragment or origin.username:
+    config['task_id'] = validate_task_id(config.get('task_id', 7))
+    config['authority'], config['hostname'] = validate_origin(config['origin'], config['port'])
+    return config
+
+
+def validate_task_id(value):
+    if type(value) is not int or not 1 <= value <= 2147483647:
+        raise ValueError('任务 ID 必须是正整数')
+    return value
+
+
+def validate_origin(value, port):
+    origin = urlsplit(value)
+    if origin.scheme != 'https' or not origin.hostname or origin.port != port or origin.path or origin.query or origin.fragment or origin.username:
         raise ValueError('必须使用明确的 HTTPS 管理域名')
     if not re.fullmatch(r'[a-z0-9](?:[a-z0-9.-]{0,251}[a-z0-9])?', origin.hostname):
         raise ValueError('管理域名格式无效')
@@ -66,13 +79,11 @@ def load_config(path):
         pass
     else:
         raise ValueError('管理入口使用证书覆盖的域名，不使用 IP')
-    config['authority'] = origin.netloc
-    config['hostname'] = origin.hostname
-    return config
+    return origin.netloc, origin.hostname
 
 
 class Deployment:
-    def __init__(self, config, config_path):
+    def __init__(self, config, config_path, clock=None):
         self.config, self.config_path = config, Path(config_path)
         self.home = Path(config['home'])
         self.code = self.home / 'code'
@@ -83,6 +94,10 @@ class Deployment:
         self.last_message = None
         self.started = False
         self.last_container = None
+        self.clock = clock or time.monotonic
+        self.ready_since = None
+        self.last_policy = None
+        self.phase = 'initializing'
         self.env = dict(os.environ, PATH='/usr/syno/sbin:/usr/syno/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin')
 
     def command(self, args, timeout=40):
@@ -117,6 +132,7 @@ class Deployment:
             if not self.emergency_stop():
                 raise RuntimeError('无法确认管理容器已关闭')
         self.started = False
+        self.ready_since = None
 
     def emergency_stop(self):
         item = self.last_container or {}
@@ -148,25 +164,47 @@ class Deployment:
         if message != self.last_message:
             print(time.strftime('%Y-%m-%d %H:%M:%S') + ' ' + message, flush=True)
             self.last_message = message
-        private_json(self.home / 'deployment-state.json', {'status': status, 'message': message, 'at': time.time(), 'pid': os.getpid()})
+        private_json(self.home / 'deployment-state.json', {'status': status, 'stage': self.phase, 'message': message, 'at': time.time(), 'pid': os.getpid()})
+
+    def report(self, status, message):
+        try:
+            self.log(status, message)
+            return True
+        except OSError:
+            # 磁盘或日志输出故障不能阻止安全停服，也不累积启动就绪时间。
+            self.ready_since = None
+            return False
 
     def start_bridge(self):
         if self.bridge is not None and self.bridge.poll() is None:
             return
+        self.ready_since = None
+        self.phase = 'bridge'
         if self.bridge is not None:
+            self.report('stopping', '群晖桥接进程已退出，正在停止管理容器并重建桥接。')
             self.stop_container()
+        else:
+            self.report('starting', '正在启动群晖桥接，管理容器须等待环境连续稳定。')
         log_path = self.home / 'bridge.log'
         fd = os.open(str(log_path), os.O_WRONLY | os.O_CREAT | os.O_APPEND | os.O_NOFOLLOW, 0o600)
         with os.fdopen(fd, 'a') as log:
-            self.bridge = subprocess.Popen([sys.executable, '-I', str(Path(self.config['native_home']) / 'web/host_bridge.py'), '--home', self.config['native_home'], '--socket', str(self.home / 'bridge/certweb.sock'), '--task-id', '7', '--uid', '10100', '--gid', '10100', '--parent-pid', str(os.getpid()), '--management-host', self.config['hostname'], '--access-policy', str(self.access_path)], env=self.env, stdin=subprocess.DEVNULL, stdout=log, stderr=log)
+            self.bridge = subprocess.Popen([sys.executable, '-I', str(Path(self.config['native_home']) / 'web/host_bridge.py'), '--home', self.config['native_home'], '--socket', str(self.home / 'bridge/certweb.sock'), '--task-id', str(self.config.get('task_id', 7)), '--uid', '10100', '--gid', '10100', '--parent-pid', str(os.getpid()), '--management-host', self.config['hostname'], '--access-policy', str(self.access_path)], env=self.env, stdin=subprocess.DEVNULL, stdout=log, stderr=log)
 
     def apply_access_policy(self):
+        self.phase = 'policy'
         policy = read_policy(self.access_path)
+        identity = (policy['mode'], policy['revision'])
+        if self.last_policy is not None and self.last_policy != identity:
+            self.ready_since = None
+            self.report('reconfiguring', '管理入口访问策略已变化，重新检查启动条件。')
         self.guard.access_mode = policy['mode']
         if not self.guard.valid():
+            self.ready_since = None
+            self.report('stopping', '检测到管理入口防火墙规则变化，正在停止管理容器后修复规则。')
             self.stop_container()
             self.guard.install()
         write_applied(self.access_path, policy)
+        self.last_policy = identity
         return policy
 
     def bridge_ready(self):
@@ -178,6 +216,89 @@ class Deployment:
             return self.bridge.poll() is None
         except OSError:
             return False
+
+    def reconcile(self):
+        """单次检查；仅停止状态的容器需要完整稳定窗口。"""
+        if self.stopping:
+            return
+        try:
+            policy = self.apply_access_policy()
+            self.phase = 'tls'
+            tls_ready = True
+            try:
+                changed = sync_tls(Path(self.config['native_home']), self.home / 'tls', self.config['hostname'])
+                if changed:
+                    self.ready_since = None
+            except TLSBusy:
+                self.ready_since = None
+                tls_ready = False
+                if not (self.home / 'tls/current.cert').exists():
+                    raise RuntimeError('HTTPS 材料尚未就绪')
+            self.phase = 'bridge'
+            self.start_bridge()
+            bridge_ready = self.bridge_ready()
+            credentials_ready = (self.home / 'data/auth.sqlite3').exists()
+            self.phase = 'docker'
+            item = self.container()
+            running = bool(item and item.get('State', {}).get('Running') and not item['State'].get('Restarting'))
+            if running:
+                self.started = True
+                self.ready_since = None
+            elif self.started:
+                self.started = False
+                self.ready_since = None
+                self.report('waiting', '检测到管理容器已退出，等待环境连续稳定后重新启动。')
+            if not tls_ready:
+                self.phase = 'tls'
+                self.ready_since = None
+                self.report('waiting', '续期任务正在处理 HTTPS 材料，暂停管理容器启动计时。')
+                return
+            if not bridge_ready:
+                self.phase = 'bridge'
+                self.ready_since = None
+                self.report('waiting', '等待群晖桥接服务就绪，暂停管理容器启动计时。')
+                return
+            if not credentials_ready:
+                self.phase = 'credentials'
+                self.ready_since = None
+                self.report('setup', '等待管理员账号初始化。')
+                return
+            if not running:
+                self.phase = 'stability'
+                current = self.clock()
+                if self.ready_since is None or current < self.ready_since:
+                    self.ready_since = current
+                if current - self.ready_since < START_STABLE_SECONDS:
+                    self.report('stabilizing', '启动条件已就绪，等待连续稳定 60 秒后启动管理容器。')
+                    return
+                # 启动前消耗本次稳定窗口；失败或立即退出均须重新等待。
+                self.ready_since = None
+                self.phase = 'start'
+                if not self.report('starting', '环境已连续稳定 60 秒，正在启动管理容器。'):
+                    return
+                if self.stopping:
+                    return
+                self.compose('up', '-d', '--no-build')
+                item = self.container()
+                if not item or not item.get('State', {}).get('Running') or item['State'].get('Restarting'):
+                    raise RuntimeError('管理容器启动后未保持运行')
+                self.started = True
+            self.phase = 'running'
+            self.report('running', '管理服务运行中，访问模式：{}。'.format('仅内网' if policy['mode'] == 'lan' else '允许外网'))
+        except (OSError, ValueError, TypeError, KeyError, RuntimeError, GuardError, subprocess.TimeoutExpired):
+            self.ready_since = None
+            labels = {'policy': '访问策略或防火墙检查失败', 'tls': 'HTTPS 材料检查失败',
+                      'bridge': '群晖桥接检查失败', 'docker': 'Docker 状态检查失败',
+                      'start': '管理容器启动失败'}
+            reason = labels.get(self.phase, '管理服务启动条件检查失败')
+            self.report('stopping', reason + '，正在停止管理容器。')
+            stopped = True
+            try:
+                self.stop_container()
+            except (OSError, ValueError, TypeError, KeyError, RuntimeError, subprocess.TimeoutExpired):
+                stopped = False
+            self.report('blocked', reason + '，管理服务保持关闭，等待环境恢复稳定。' if stopped
+                     else reason + '，且无法确认管理容器已关闭；请通过 NAS 检查。')
 
     def serve(self):
         fd = os.open(str(self.home / 'supervisor.lock'), os.O_WRONLY | os.O_CREAT | os.O_NOFOLLOW, 0o600)
@@ -191,36 +312,14 @@ class Deployment:
                 signal.signal(sig, lambda *_: setattr(self, 'stopping', True))
             try:
                 while not self.stopping:
-                    try:
-                        policy = self.apply_access_policy()
-                        try:
-                            sync_tls(Path(self.config['native_home']), self.home / 'tls', self.config['hostname'])
-                        except TLSBusy:
-                            if not (self.home / 'tls/current.cert').exists():
-                                raise RuntimeError('续期任务正在运行，等待 TLS 材料')
-                        self.start_bridge()
-                        if not self.bridge_ready():
-                            self.log('starting', '等待群晖桥接服务就绪。')
-                        elif not (self.home / 'data/auth.sqlite3').exists():
-                            self.log('setup', '等待管理员账号初始化。')
-                        else:
-                            item = self.container()
-                            if not item or not item.get('State', {}).get('Running'):
-                                self.compose('up', '-d', '--no-build')
-                            self.started = True
-                            self.log('running', '管理服务运行中，访问模式：{}。'.format('仅内网' if policy['mode'] == 'lan' else '允许外网'))
-                    except (OSError, ValueError, RuntimeError, GuardError, subprocess.TimeoutExpired):
-                        stopped = True
-                        try:
-                            self.stop_container()
-                        except (OSError, RuntimeError, subprocess.TimeoutExpired):
-                            stopped = False
-                        self.log('blocked', '管理服务保持关闭：请检查网络规则、HTTPS 材料或 Docker 状态。' if stopped else '访问保护异常，且无法确认管理容器已关闭；请通过 NAS 检查。')
+                    self.reconcile()
                     for _ in range(10):
                         if self.stopping:
                             break
                         time.sleep(1)
             finally:
+                self.phase = 'shutdown'
+                self.report('stopping', '监督进程正在退出，停止管理容器与群晖桥接。')
                 stopped = True
                 try:
                     self.stop_container()
@@ -233,7 +332,7 @@ class Deployment:
                     except subprocess.TimeoutExpired:
                         self.bridge.kill()
                         self.bridge.wait(timeout=5)
-                self.log('stopped' if stopped else 'blocked', '管理服务已停止，原证书续期任务不受影响。' if stopped else '监督进程已退出，但无法确认管理容器已关闭；请通过 NAS 检查。')
+                self.report('stopped' if stopped else 'blocked', '管理服务已停止，原证书续期任务不受影响。' if stopped else '监督进程已退出，但无法确认管理容器已关闭；请通过 NAS 检查。')
                 (self.home / 'supervisor.pid').unlink(missing_ok=True)
         return 0 if stopped else 1
 
@@ -295,6 +394,7 @@ def main(argv=None):
                 else:
                     raise RuntimeError('管理服务尚未完成退出')
             service = Deployment(config, args.config)
+            service.phase = 'shutdown'
             service.stop_container()
             service.log('stopped', '管理服务已停止，原证书续期任务不受影响。')
             return 0

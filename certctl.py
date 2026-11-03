@@ -155,7 +155,7 @@ def validate_description(description, method):
                 or re.search(r'[\x00-\x1f\x7f-\x9f]', description)):
             raise Failure('证书描述须为 1 到 256 个字符，且不能包含控制字符。')
     elif not isinstance(description, str) or not re.fullmatch(r'[A-Za-z0-9_-]{1,80}', description):
-        raise Failure('请先在 DSM 中将证书描述改为唯一英文标识，例如 ttxli-cn-auto。')
+        raise Failure('请先在 DSM 中将证书描述改为唯一英文标识，例如 nas-cert-auto。')
 
 
 def validate_config(config):
@@ -520,14 +520,11 @@ class Controller:
             except (Failure, OSError) as error:
                 names = '不可用：{}'.format(error)
             print('{}: {}  描述={!r}  域名={}'.format(index, key, value.get('desc', ''), names))
-        selection = input('选择当前用于 ttxli.cn 的证书编号: ').strip()
+        selection = input('选择需要自动续期的证书编号: ').strip()
         if not selection.isdigit() or not 1 <= int(selection) <= len(choices):
             raise Failure('证书编号无效。')
         key, entry = choices[int(selection) - 1]
-        domains = certificate_domains(self.archive / key / 'cert.pem')
-        if 'ttxli.cn' in domains:
-            domains.remove('ttxli.cn')
-            domains.insert(0, 'ttxli.cn')
+        domains = sorted(certificate_domains(self.archive / key / 'cert.pem'), key=lambda value: value.startswith('*.'))
         name = next((x for x in domains if not x.startswith('*.')), 'nas.' + domains[0][2:])
         description = entry.get('desc', '')
         validate_description(description, method)

@@ -88,6 +88,15 @@ class ConfigureListingTests(unittest.TestCase):
         self.assertEqual(secret.call_count, 2)
         preflight.assert_called_once_with()
 
+    def test_configure_preserves_another_domain_order_without_site_specific_prompt(self):
+        domains = ['service.example.com', 'example.com']
+        with self.interaction(['5', 'operator@example.com', '', '', '', '', '', 'n']) as state, \
+             mock.patch.object(certctl, 'certificate_domains', return_value=list(domains)):
+            self.controller.configure()
+        saved = certctl.read_json(self.controller.config_file)
+        self.assertEqual(saved['domains'], domains)
+        self.assertNotIn('ttxli.cn', state[1].call_args_list[0].args[0])
+
     def assert_selected_unusable_certificate_is_rejected(self, selection):
         with self.interaction([selection]) as state:
             output, prompt, secret, preflight = state

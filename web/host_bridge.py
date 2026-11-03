@@ -123,9 +123,12 @@ def strict_json(data):
 
 class Scheduler:
     """仅允许读取、修改及触发固定的原 DSM 任务。"""
-    def __init__(self, home, capture=executor.capture):
+    def __init__(self, home, capture=executor.capture, task_id=TASK_ID):
+        if type(task_id) is not int or not 1 <= task_id <= 2147483647:
+            raise ValueError('任务 ID 必须是正整数')
         self.home = Path(home)
         self.capture = capture
+        self.task_id = task_id
 
     def api(self, api, method, version, params):
         command = shutil.which('synowebapi')
@@ -139,7 +142,7 @@ class Scheduler:
         return data.get('data', {})
 
     def validate(self, task):
-        if (not isinstance(task, dict) or task.get('id') != TASK_ID or task.get('owner') != 'root'
+        if (not isinstance(task, dict) or type(task.get('id')) is not int or task.get('id') != self.task_id or task.get('owner') != 'root'
                 or type(task.get('enable')) is not bool or not isinstance(task.get('name'), str)
                 or not isinstance(task.get('extra'), dict) or not isinstance(task.get('schedule'), dict)):
             reject('原任务结构无法识别，已停止管理操作。', 'unavailable')
@@ -148,16 +151,16 @@ class Scheduler:
         except (KeyError, TypeError, ValueError):
             reject('原任务脚本无法核验。', 'unavailable')
         if command != ['/bin/sh', str(self.home / 'run-task.sh')]:
-            reject('任务 7 已指向其他脚本，拒绝操作。', 'conflict')
+            reject('指定任务已指向其他脚本，拒绝操作。', 'conflict')
         return task
 
     def get(self):
-        return self.validate(self.api('SYNO.Core.TaskScheduler', 'get', 4, {'id': TASK_ID}))
+        return self.validate(self.api('SYNO.Core.TaskScheduler', 'get', 4, {'id': self.task_id}))
 
     def put(self, task):
         self.validate(task)
         params = {key: copy.deepcopy(task[key]) for key in ('id', 'name', 'owner', 'enable', 'schedule', 'extra')}
-        params['real_owner'] = task.get('real_owner') or 'tangtao'
+        params['real_owner'] = task.get('real_owner') or task['owner']
         self.api('SYNO.Core.TaskScheduler.Root', 'set', 4, params)
         observed = self.get()
         if any(observed.get(key) != task.get(key) for key in ('id', 'name', 'owner', 'enable', 'schedule', 'extra')):
@@ -169,10 +172,10 @@ class Scheduler:
         command = shutil.which('synoschedtask')
         if not command:
             reject('无法触发群晖原任务。', 'unavailable')
-        self.capture([command, '--run', 'id=7', 'check_time=0', 'check_status=0'], timeout=20)
+        self.capture([command, '--run', 'id=' + str(self.task_id), 'check_time=0', 'check_status=0'], timeout=20)
 
     def history(self):
-        return self.api('SYNO.Core.TaskScheduler', 'get_history_status_list', 1, {'id': TASK_ID})
+        return self.api('SYNO.Core.TaskScheduler', 'get_history_status_list', 1, {'id': self.task_id})
 
 
 def read_schedule(task):
@@ -430,11 +433,9 @@ class Bridge:
         if self.management_host is not None and executor.certificate_expiry(controller.archive / identifier / 'cert.pem') <= time.time():
             reject('所选证书已过期，管理页面必须使用有效且可信的 HTTPS 证书。')
         config = copy.deepcopy(controller.config)
-        domains = selected['domains']
+        domains = sorted(selected['domains'], key=lambda value: value.startswith('*.'))
         if identifier == config['certificate_id'] and set(domains) == set(config['domains']):
             domains = config['domains']
-        elif 'ttxli.cn' in domains:
-            domains = ['ttxli.cn'] + [domain for domain in domains if domain != 'ttxli.cn']
         config.update(certificate_id=identifier, certificate_description=selected['description'], domains=domains,
                       email=params['email'], renew_before_days=params['renew_before_days'], probes=params['probes'])
         secrets = [params.get(key, '') for key in ('secret_id', 'secret_key')]
@@ -1053,7 +1054,7 @@ def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--home', type=Path, default=executor.DEFAULT_HOME)
     parser.add_argument('--socket', type=Path)
-    parser.add_argument('--task-id', type=int, choices=(TASK_ID,), default=TASK_ID)
+    parser.add_argument('--task-id', type=int, default=TASK_ID)
     parser.add_argument('--uid', type=int, default=10100)
     parser.add_argument('--gid', type=int, default=10100)
     parser.add_argument('--parent-pid', type=int)
@@ -1071,7 +1072,7 @@ def main(argv=None):
     try:
         if args.access_policy is not None and (not args.access_policy.is_absolute() or str(args.access_policy) != str(args.access_policy.resolve())):
             raise ValueError('访问策略路径必须是无符号链接的绝对路径')
-        serve(Bridge(args.home, management_host=args.management_host, access_policy_path=args.access_policy, policy_gid=args.gid), args.socket or args.home / 'web-run/certweb.sock', args.uid, args.gid, stop, args.parent_pid)
+        serve(Bridge(args.home, scheduler=Scheduler(args.home, task_id=args.task_id), management_host=args.management_host, access_policy_path=args.access_policy, policy_gid=args.gid), args.socket or args.home / 'web-run/certweb.sock', args.uid, args.gid, stop, args.parent_pid)
     except Exception:
         print('桥接启动失败，请核查私有目录、进程锁及未完成事务。', file=sys.stderr)
         return 1

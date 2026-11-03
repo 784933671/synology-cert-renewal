@@ -201,6 +201,49 @@ class DeploymentRecoveryTests(unittest.TestCase):
         self.config={'home':str(self.home),'native_home':str(self.home/'native'),'bind':'10.10.10.37','networks':['10.10.10.0/24'],'denied':['10.10.10.1'],'port':18443,'origin':'https://ttxli.cn:18443','hostname':'ttxli.cn'}
         self.service=deployment.Deployment(self.config,self.home/'deployment.json')
 
+    def test_bridge_receives_configured_task_id_and_legacy_defaults_to_seven(self):
+        for configured, expected in ((None, '7'), (31, '31')):
+            if configured is None:
+                self.service.config.pop('task_id', None)
+            else:
+                self.service.config['task_id'] = configured
+            self.service.bridge = None
+            with patch('web.deployment.subprocess.Popen') as spawn:
+                self.service.start_bridge()
+            command = spawn.call_args.args[0]
+            self.assertEqual(command[command.index('--task-id') + 1], expected)
+
+    def test_deployment_config_accepts_dynamic_id_and_defaults_legacy_to_seven(self):
+        home = self.home.resolve();native = home / 'native';native.mkdir(mode=0o700)
+        path = home / 'deployment.json'
+        config = {key: value for key, value in self.config.items() if key != 'hostname'}
+        config.update(home=str(home), native_home=str(native))
+        original_stat = Path.stat
+        def root_stat(path, **kwargs):
+            value = list(original_stat(path, **kwargs));value[4] = 0
+            return os.stat_result(value)
+        for identifier, expected in ((None, 7), (31, 31), (False, None), (0, None)):
+            if identifier is None:config.pop('task_id', None)
+            else:config['task_id'] = identifier
+            path.write_text(json.dumps(config));path.chmod(0o600)
+            with patch.object(Path, 'stat', autospec=True, side_effect=root_stat):
+                if expected is None:
+                    with self.assertRaises(ValueError):deployment.load_config(path)
+                else:
+                    self.assertEqual(deployment.load_config(path)['task_id'], expected)
+
+    def test_task_identifier_and_management_origin_are_validated(self):
+        self.assertEqual(deployment.validate_task_id(31), 31)
+        for value in (0, -1, True, '31', 1.1, 2 ** 31):
+            with self.subTest(value=value), self.assertRaises(ValueError):
+                deployment.validate_task_id(value)
+        self.assertEqual(deployment.validate_origin('https://nas.example.com:18443', 18443),
+                         ('nas.example.com:18443', 'nas.example.com'))
+        for value in ('http://nas.example.com:18443', 'https://10.0.0.1:18443',
+                      'https://nas.example.com:18443/path', 'https://user@nas.example.com:18443'):
+            with self.subTest(value=value), self.assertRaises(ValueError):
+                deployment.validate_origin(value, 18443)
+
     def test_failed_docker_stop_requires_verified_emergency_shutdown(self):
         self.service.container=Mock(return_value={'State':{'Running':True}})
         self.service.command=Mock(side_effect=RuntimeError('failed'))
@@ -275,6 +318,207 @@ class DeploymentRecoveryTests(unittest.TestCase):
         kill.assert_called_once_with(23456,deployment.signal.SIGTERM)
         self.service.stop_container.assert_called_once()
         self.service.log.assert_not_called()
+
+
+class StartupStabilityTests(unittest.TestCase):
+    def setUp(self):
+        temporary = tempfile.TemporaryDirectory();self.addCleanup(temporary.cleanup)
+        self.home = Path(temporary.name).resolve()
+        (self.home / 'data').mkdir();(self.home / 'data/auth.sqlite3').write_bytes(b'configured')
+        (self.home / 'tls').mkdir();(self.home / 'tls/current.cert').write_bytes(b'previously-validated')
+        self.now, self.running = 0, False
+        config = {'home': str(self.home), 'native_home': str(self.home / 'native'), 'bind': '10.10.10.37',
+                  'networks': ['10.10.10.0/24'], 'denied': ['10.10.10.1'], 'port': 18443,
+                  'origin': 'https://nas.example.com:18443', 'hostname': 'nas.example.com'}
+        self.service = deployment.Deployment(config, self.home / 'deployment.json', clock=lambda: self.now)
+        self.service.guard.valid = Mock(return_value=True)
+        self.service.guard.install = Mock(side_effect=lambda: setattr(self.service.guard.valid, 'return_value', True))
+        self.service.start_bridge = Mock()
+        self.service.bridge_ready = Mock(return_value=True)
+        self.service.container = Mock(side_effect=lambda: {'State': {'Running': self.running, 'Restarting': False}})
+        self.service.compose = Mock(side_effect=lambda *_: setattr(self, 'running', True))
+        def stop():
+            self.running = False;self.service.started = False;self.service.ready_since = None
+        self.service.stop_container = Mock(side_effect=stop)
+        self.events = []
+        original_log = self.service.log
+        def log(status, message):
+            self.events.append((self.service.phase, status, message));original_log(status, message)
+        self.service.log = log
+        self.policy = {'mode': 'lan', 'revision': 'a' * 32}
+        self.sync = Mock(return_value=False)
+        for patcher in (patch('web.deployment.read_policy', side_effect=lambda _: dict(self.policy)),
+                        patch('web.deployment.write_applied'), patch('web.deployment.sync_tls', self.sync),
+                        patch('builtins.print')):
+            patcher.start();self.addCleanup(patcher.stop)
+
+    def tick(self, when):
+        self.now = when;self.service.reconcile()
+
+    def test_start_requires_full_continuous_sixty_seconds(self):
+        self.tick(0);self.tick(59)
+        self.service.compose.assert_not_called()
+        self.tick(60)
+        self.service.compose.assert_called_once_with('up', '-d', '--no-build')
+        self.assertTrue(self.running)
+        self.assertEqual(json.loads((self.home / 'deployment-state.json').read_text())['stage'], 'running')
+
+    def test_rule_repair_resets_window_and_records_stop_reason(self):
+        self.tick(0)
+        self.service.guard.valid.return_value = False
+        self.tick(50)
+        self.assertEqual(self.service.ready_since, 50)
+        self.service.stop_container.assert_called_once()
+        self.assertTrue(any(stage == 'policy' and status == 'stopping' and '防火墙规则变化' in message
+                            for stage, status, message in self.events))
+        self.tick(100);self.service.compose.assert_not_called()
+        self.tick(110);self.service.compose.assert_called_once()
+
+    def test_revision_change_restarts_wait_without_stopping_an_already_running_service(self):
+        self.tick(0);self.policy['revision'] = 'b' * 32;self.tick(40)
+        self.tick(99);self.service.compose.assert_not_called()
+        self.tick(100);self.assertTrue(self.running)
+        self.policy['revision'] = 'c' * 32;self.tick(110)
+        self.service.stop_container.assert_not_called()
+        self.assertTrue(self.running)
+        self.assertEqual(self.service.compose.call_count, 1)
+
+    def test_bridge_flapping_cannot_accumulate_short_ready_periods(self):
+        self.tick(0);self.service.bridge_ready.return_value = False;self.tick(50)
+        self.assertIsNone(self.service.ready_since)
+        self.service.bridge_ready.return_value = True;self.tick(70);self.tick(120)
+        self.service.compose.assert_not_called()
+        self.tick(130);self.service.compose.assert_called_once()
+
+    def test_bridge_rebuild_resets_window_and_logs_why_container_is_stopped(self):
+        self.tick(0)
+        previous = Mock();previous.poll.return_value = 1
+        replacement = Mock();replacement.poll.return_value = None
+        self.service.bridge = previous
+        self.service.start_bridge = deployment.Deployment.start_bridge.__get__(self.service)
+        with patch('web.deployment.subprocess.Popen', return_value=replacement):
+            self.tick(50)
+        self.assertEqual(self.service.ready_since, 50)
+        self.service.stop_container.assert_called_once()
+        self.assertTrue(any(stage == 'bridge' and '桥接进程已退出' in message for stage, _, message in self.events))
+        self.tick(100);self.service.compose.assert_not_called()
+        self.tick(110);self.service.compose.assert_called_once()
+
+    def test_tls_busy_blocks_start_clock_but_does_not_interrupt_existing_container(self):
+        self.tick(0);self.sync.side_effect = deployment.TLSBusy;self.tick(50)
+        self.assertIsNone(self.service.ready_since)
+        self.sync.side_effect = None;self.tick(60);self.tick(119)
+        self.service.compose.assert_not_called()
+        self.tick(120);self.assertTrue(self.running)
+        self.sync.side_effect = deployment.TLSBusy;self.tick(130)
+        self.assertTrue(self.running);self.service.stop_container.assert_not_called()
+
+    def test_tls_material_change_resets_the_window(self):
+        self.tick(0);self.sync.return_value = True;self.tick(50)
+        self.sync.return_value = False;self.tick(100)
+        self.service.compose.assert_not_called()
+        self.tick(110);self.service.compose.assert_called_once()
+
+    def test_existing_running_container_is_not_restarted_for_stability_wait(self):
+        self.running = True;self.tick(0);self.tick(10)
+        self.service.stop_container.assert_not_called();self.service.compose.assert_not_called()
+        self.assertTrue(self.service.started)
+        self.assertIsNone(self.service.ready_since)
+
+    def test_start_failure_consumes_window_and_errors_are_fixed_safe_text(self):
+        self.tick(0)
+        self.service.compose.side_effect = RuntimeError('DO_NOT_LOG_PASSWORD')
+        self.tick(60)
+        self.assertIsNone(self.service.ready_since)
+        state = json.loads((self.home / 'deployment-state.json').read_text())
+        self.assertEqual((state['status'], state['stage']), ('blocked', 'start'))
+        self.assertNotIn('DO_NOT_LOG_PASSWORD', str(self.events) + str(state))
+        self.service.compose.side_effect = lambda *_: setattr(self, 'running', True)
+        self.tick(70);self.tick(129)
+        self.assertEqual(self.service.compose.call_count, 1)
+        self.tick(130);self.assertEqual(self.service.compose.call_count, 2)
+
+    def test_immediate_exit_after_compose_is_not_reported_running_or_immediately_restarted(self):
+        self.service.compose.side_effect = None
+        self.tick(0);self.tick(60)
+        self.assertFalse(self.running)
+        self.assertEqual(json.loads((self.home / 'deployment-state.json').read_text())['status'], 'blocked')
+        self.tick(70);self.tick(129)
+        self.assertEqual(self.service.compose.call_count, 1)
+
+    def test_docker_failure_resets_ready_time_and_records_stage(self):
+        self.tick(0)
+        self.service.container.side_effect = RuntimeError('DO_NOT_LOG_DOCKER_DETAIL')
+        self.tick(50)
+        state = json.loads((self.home / 'deployment-state.json').read_text())
+        self.assertEqual((state['stage'], state['status']), ('docker', 'blocked'))
+        self.assertNotIn('DO_NOT_LOG_DOCKER_DETAIL', str(self.events) + str(state))
+        self.service.container.side_effect = lambda: {'State': {'Running': self.running, 'Restarting': False}}
+        self.tick(60);self.tick(119);self.service.compose.assert_not_called()
+        self.tick(120);self.service.compose.assert_called_once()
+
+    def test_observed_container_exit_requires_a_new_full_window(self):
+        self.tick(0);self.tick(60);self.tick(70)
+        self.running = False;self.tick(100);self.tick(159)
+        self.assertEqual(self.service.compose.call_count, 1)
+        self.assertTrue(any('管理容器已退出' in message for _, _, message in self.events))
+        self.tick(160);self.assertEqual(self.service.compose.call_count, 2)
+
+    def test_log_state_write_failure_cannot_prevent_firewall_safety_stop(self):
+        self.running = True;self.service.guard.valid.return_value = False
+        with patch('web.deployment.private_json', side_effect=OSError('disk-full-detail')):
+            self.tick(0)
+        self.service.stop_container.assert_called_once()
+        self.assertFalse(self.running);self.assertIsNone(self.service.ready_since)
+        self.service.compose.assert_not_called()
+        self.assertNotIn('disk-full-detail', str(self.events))
+
+    def test_broken_logging_does_not_skip_exception_or_shutdown_stop(self):
+        self.service.log = Mock(side_effect=BrokenPipeError('closed-output-detail'))
+        self.service.guard.valid.side_effect = GuardError('private-error-detail')
+        self.tick(0)
+        self.service.stop_container.assert_called_once()
+        self.service.stop_container.reset_mock();self.service.stopping = True
+        with patch('web.deployment.signal.signal'):
+            self.assertEqual(self.service.serve(), 0)
+        self.service.stop_container.assert_called_once()
+        self.assertFalse((self.home / 'supervisor.pid').exists())
+
+    def test_bridge_rebuild_stops_even_if_reason_cannot_be_logged(self):
+        self.service.log = Mock(side_effect=OSError('disk full'))
+        previous = Mock();previous.poll.return_value = 1
+        replacement = Mock();replacement.poll.return_value = None
+        self.service.bridge = previous
+        with patch('web.deployment.subprocess.Popen', return_value=replacement):
+            deployment.Deployment.start_bridge(self.service)
+        self.service.stop_container.assert_called_once()
+        self.assertIs(self.service.bridge, replacement)
+
+    def test_shutdown_requested_during_checks_never_starts_container(self):
+        self.tick(0)
+        def stop_requested():
+            self.service.stopping = True
+            return {'State': {'Running': False, 'Restarting': False}}
+        self.service.container.side_effect = stop_requested
+        self.tick(60)
+        self.service.compose.assert_not_called()
+
+    def test_cannot_start_if_starting_log_fails(self):
+        self.tick(0)
+        self.service.log = Mock(side_effect=OSError('disk full'))
+        self.tick(60)
+        self.service.compose.assert_not_called();self.assertIsNone(self.service.ready_since)
+
+    def test_waiting_loop_keeps_polling_delay(self):
+        calls = []
+        def reconcile():
+            calls.append(True)
+            if len(calls) == 2:self.service.stopping = True
+        self.service.reconcile = reconcile
+        with patch('web.deployment.signal.signal'), patch('web.deployment.time.sleep') as sleep:
+            self.assertEqual(self.service.serve(), 0)
+        self.assertEqual(len(calls), 2)
+        self.assertEqual(sleep.call_count, 10)
 
 
 class ContainerTLSReloadTests(unittest.TestCase):
