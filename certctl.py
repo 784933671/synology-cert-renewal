@@ -36,6 +36,7 @@ SHORT_RECOVERY_INTERVAL = 6 * 60 * 60
 RECOVERY_LIMIT = 3
 MANUAL_RENEWAL_TTL = 10 * 60
 MANUAL_RENEWAL_COOLDOWN = 60 * 60
+RUN_LOCK_WAIT_SECONDS = 60
 MANUAL_RENEWAL_STATES = ('queued', 'running', 'succeeded', 'failed', 'expired')
 RENEWAL_PROTECTION_FILES = ('deployment-active.json', 'pending.json', 'run-baseline.json',
                             'import-bindings.json', 'recovery.json', 'web-transaction.json')
@@ -448,7 +449,7 @@ class Controller:
             self.diagnostic_directory = None
 
     @contextlib.contextmanager
-    def locked(self):
+    def locked(self, wait_seconds=0):
         private(self.home, directory=True)
         self.state.mkdir(mode=0o700, exist_ok=True)
         private(self.state, directory=True)
@@ -456,10 +457,16 @@ class Controller:
         fd = os.open(str(lock), os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW, 0o600)
         with os.fdopen(fd, 'a') as handle:
             private(lock)
-            try:
-                fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
-            except BlockingIOError:
-                raise Busy('已有任务运行，本次跳过。')
+            deadline = time.monotonic() + wait_seconds if wait_seconds > 0 else None
+            while True:
+                try:
+                    fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    break
+                except BlockingIOError:
+                    remaining = deadline - time.monotonic() if deadline is not None else 0
+                    if remaining <= 0:
+                        raise Busy('已有任务运行，本次跳过。')
+                    time.sleep(min(0.2, remaining))
             yield
 
     def log(self, message):
@@ -1686,7 +1693,8 @@ def main(argv=None):
     signal.signal(signal.SIGTERM, interrupted)
     controller = Controller(args.home)
     try:
-        with controller.locked():
+        # 定时执行容忍状态探测和 TLS 同步的短锁；其他入口继续立即返回。
+        with controller.locked(wait_seconds=RUN_LOCK_WAIT_SECONDS if args.command == 'run' else 0):
             if args.command == 'configure':
                 controller.assert_manual_idle()
                 if controller.config_file.exists():
@@ -1730,8 +1738,7 @@ def main(argv=None):
         print(str(error))
         return 0
     except (Failure, OSError, KeyboardInterrupt, InterruptedError) as error:
-        if args.command == 'run':
-            return controller.report_failure(error)
+        # 尚未取得锁或已离开执行区间，不能覆盖其他任务的失败记录与恢复状态。
         message = str(error) if isinstance(error, Failure) else '系统操作失败或被中断，请检查文件权限、网络及本机日志。'
         print('失败：' + diagnostics.sanitize(message, secrets=controller.diagnostic_secrets()), file=sys.stderr)
         return 1

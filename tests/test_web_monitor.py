@@ -316,6 +316,93 @@ class MonitorTests(unittest.TestCase):
         self.now -= 86400; self.service.tick()
         self.assertNotIn('clock_anomaly', self.codes(self.advance(900)))
 
+    def test_restart_restores_full_clock_observation_before_one_recovery(self):
+        self.source.data['expires_at'] = self.now + 23 * 3600
+        expiry = self.source.data['expires_at']
+        self.service.tick()
+        self.now -= 7200; self.source.data['last_completed'] = self.now
+        self.assertIn('clock_anomaly', self.codes(self.service.tick()))
+        event = monitor.read_json(self.service.path, uid=self.uid)['incidents']['certificate_expiry']
+        self.advance(600)
+        self.service = self.make_monitor()
+        self.assertIn('clock_anomaly', self.codes(self.service.tick()))
+        self.assertIn('clock_anomaly', self.codes(self.advance(899)))
+        self.source.deliver.assert_called_once()
+        stored = monitor.read_json(self.service.path, uid=self.uid)['incidents']['certificate_expiry']
+        self.assertEqual((stored['id'], stored['notified']), (event['id'], True))
+        self.assertNotIn('clock_anomaly', self.codes(self.advance(1)))
+        self.assertEqual(self.source.deliver.call_count, 2)
+        self.assertTrue(self.source.deliver.call_args.kwargs['recovered'])
+        self.assertEqual(self.source.data['expires_at'], expiry)
+        self.service = self.make_monitor(); self.advance(60)
+        self.assertEqual(self.source.deliver.call_count, 2)
+
+    def test_pending_alert_waits_after_restart_then_retries_without_duplicate(self):
+        self.source.data['expires_at'] = self.now + 3600
+        self.source.deliver.side_effect = RuntimeError('mail unavailable')
+        self.service.tick()
+        event = monitor.read_json(self.service.path, uid=self.uid)['incidents']['certificate_expiry']
+        self.now -= 7200; self.source.data['last_completed'] = self.now
+        self.service.tick()
+        self.source.deliver.side_effect = None
+        self.service = self.make_monitor(); self.service.tick()
+        self.advance(899)
+        self.assertEqual(self.source.deliver.call_count, 1)
+        self.advance(1)
+        self.assertEqual(self.source.deliver.call_count, 2)
+        self.assertFalse(self.source.deliver.call_args.kwargs['recovered'])
+        stored = monitor.read_json(self.service.path, uid=self.uid)['incidents']['certificate_expiry']
+        self.assertEqual(stored['id'], event['id'])
+        self.service = self.make_monitor(); self.advance(60)
+        self.assertEqual(self.source.deliver.call_count, 2)
+
+    def test_disabled_monitor_persists_clock_event_and_restart_uses_current_grace(self):
+        self.source.data['expires_at'] = self.now + 23 * 3600
+        self.service.tick(); self.settings(enabled=False)
+        self.now -= 7200; self.source.data['last_completed'] = self.now
+        self.assertEqual(self.service.tick()['status'], 'disabled')
+        stored = monitor.read_json(self.service.path, uid=self.uid)
+        self.assertTrue(stored['incidents']['clock_anomaly']['active'])
+        self.settings(enabled=True, grace_minutes=30)
+        self.service = self.make_monitor()
+        self.assertIn('clock_anomaly', self.codes(self.service.tick()))
+        self.assertIn('clock_anomaly', self.codes(self.advance(1799)))
+        self.source.deliver.assert_called_once()
+        self.assertNotIn('clock_anomaly', self.codes(self.advance(1)))
+        self.assertEqual(self.source.deliver.call_count, 2)
+        self.assertTrue(self.source.deliver.call_args.kwargs['recovered'])
+
+    def test_clock_jump_is_persisted_before_source_collection_failure(self):
+        self.source.data['expires_at'] = self.now + 23 * 3600
+        self.service.tick()
+        self.now -= 7200; self.source.data['last_completed'] = self.now
+        with patch.object(self.source, 'collect', side_effect=RuntimeError('source unavailable')):
+            with self.assertRaises(RuntimeError):
+                self.service.tick()
+        stored = monitor.read_json(self.service.path, uid=self.uid)
+        self.assertTrue(stored['incidents']['clock_anomaly']['active'])
+        self.source.data['completion_ok'] = False
+        self.service = self.make_monitor()
+        self.assertIn('clock_anomaly', self.codes(self.service.tick()))
+        self.assertIn('clock_anomaly', self.codes(self.advance(899)))
+        self.source.deliver.assert_called_once()
+        self.assertNotIn('clock_anomaly', self.codes(self.advance(1)))
+        self.assertEqual(self.source.deliver.call_count, 2)
+        self.assertTrue(self.source.deliver.call_args.kwargs['recovered'])
+
+    def test_future_completion_keeps_clock_anomaly_after_restored_observation(self):
+        self.source.data['expires_at'] = self.now + 23 * 3600
+        self.service.tick()
+        self.now -= 7200
+        self.service.tick()
+        self.service = self.make_monitor(); self.service.tick()
+        self.assertIn('clock_anomaly', self.codes(self.advance(900)))
+        self.source.deliver.assert_called_once()
+        self.source.data['last_completed'] = self.now
+        self.assertNotIn('clock_anomaly', self.codes(self.advance(60)))
+        self.assertEqual(self.source.deliver.call_count, 2)
+        self.assertTrue(self.source.deliver.call_args.kwargs['recovered'])
+
     def test_running_task_has_bounded_grace(self):
         self.service.tick(); self.source.data['running'] = True
         self.assertNotIn('task_missed', self.codes(self.advance(7200)))

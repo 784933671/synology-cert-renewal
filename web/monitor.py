@@ -306,15 +306,24 @@ class Monitor:
         now, monotonic = self.clock(), self.monotonic()
         settings = load_settings(self.native_home, self.uid)
         state = self.state(now)
-        data = self.source.collect()
         grace = settings['grace_minutes'] * 60
         previous = self.previous_clock
         self.previous_clock = (now, monotonic)
-        if ((previous and abs((now - previous[0]) - (monotonic - previous[1])) > 300)
-                or state['anchor'] > now + 300):
+        clock_event = state['incidents'].get('clock_anomaly', {})
+        resumed = previous is None and clock_event.get('active') is True
+        jumped = ((previous is not None and abs((now - previous[0]) - (monotonic - previous[1])) > 300)
+                  or state['anchor'] > now + 300)
+        if resumed or jumped:
+            # 重启只恢复一次完整观察期；后续正常轮次不能不断推迟截止时间。
             self.clock_hold_until = monotonic + grace
+        if jumped:
             state['anchor'] = now
             state['running_since'] = None
+        if monotonic < self.clock_hold_until and clock_event.get('active') is not True:
+            self.incident(state, 'clock_anomaly', True, now)
+            # 先保存安全标记，采集异常或监测开关不能使重启绕过观察期。
+            write_json(self.path, state, self.uid)
+        data = self.source.collect()
         completed = data['last_completed']
         clock_bad = (monotonic < self.clock_hold_until or (completed is not None and completed > now + 300)
                      or state['anchor'] > now + 300)
@@ -360,9 +369,9 @@ class Monitor:
             # 暂停任务只取消漏跑事件，不发送“已恢复”邮件；证书告警仍独立判断。
             state['incidents'].pop('task_missed', None)
             state['running_since'] = None
+        self.incident(state, 'clock_anomaly', clock_bad, now)
         if settings['enabled']:
             self.incident(state, 'source_unavailable', not complete, now)
-            self.incident(state, 'clock_anomaly', clock_bad, now)
             self.incident(state, 'task_missed', missed_decision, now)
             self.incident(state, 'certificate_expiry', remaining <= settings['expiry_hours'] * 3600
                           if remaining is not None and not clock_bad else None, now)
