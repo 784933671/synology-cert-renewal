@@ -33,7 +33,7 @@ class SecurityWorkflowTests(unittest.TestCase):
     def test_audits_cover_all_dependencies_and_fail_on_findings(self):
         npm = next(line.strip() for line in self.commands.splitlines() if line.strip().startswith('npm audit '))
         tokens = shlex.split(npm)
-        self.assertTrue({'--include=dev', '--include=optional', '--include=peer', '--audit-level=high'}.issubset(tokens))
+        self.assertTrue({'--include=dev', '--include=optional', '--include=peer', '--audit-level=moderate'}.issubset(tokens))
         python = next(line.strip() for line in self.commands.splitlines() if line.strip().startswith('python -m pip_audit '))
         tokens = shlex.split(python)
         self.assertIn('--strict', tokens)

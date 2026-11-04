@@ -292,11 +292,11 @@ sudo /usr/local/etc/rc.d/S99synology-cert-web.sh start
 
 最终镜像还在非 root、只读根目录、无外网、移除 capability 和 384 MiB 内存限制下运行真实 HTTPS 验收，检查 SQLite/FTS5、scrypt、邮箱登录、密码修改、防护设置授权、429、封禁持久化与自助解封。使用临时测试证书和伪邮件桥接，不连接 NAS、DNSPod 或真实邮箱。Trivy 从官方 GitHub 发布包下载并校验固定 SHA-256，下载或校验失败直接阻断。
 
-npm 报告所有严重级别，高危或严重漏洞导致失败；Python 运行依赖发现任何已知漏洞即失败；镜像检查操作系统和语言依赖，高危或严重漏洞即失败，包括尚无补丁的漏洞。扫描失败、数据源不可用也不会报告通过。GitHub Actions 保留作业日志，JSON 报告以 `npm-audit-report`、`python-audit-report`、`container-audit-report` 附件保留 14 天；扫描失败时仍上传已生成的报告。失败后应先检查具体公告、修复依赖与锁文件、重新验证，再按原安装流程升级 NAS。
+npm 报告所有严重级别，中危及以上漏洞导致失败；Python 运行依赖发现任何已知漏洞即失败；镜像检查操作系统和语言依赖，高危或严重漏洞即失败，包括尚无补丁的漏洞。扫描失败、数据源不可用也不会报告通过。GitHub Actions 保留作业日志，JSON 报告以 `npm-audit-report`、`python-audit-report`、`container-audit-report` 附件保留 14 天；扫描失败时仍上传已生成的报告。失败后应先检查具体公告、修复依赖与锁文件、重新验证，再按原安装流程升级 NAS。
 
 工作流只授予仓库读取权限，Action 使用完整提交摘要，Python 扫描工具和项目依赖使用哈希锁文件；不读取 NAS 凭据、不连接 NAS、不自动部署、不自动申请证书。Dependabot 每周检查 npm、Python、Docker 基础镜像及 Actions 更新并创建更新请求，不自动合并。Python `.in` 和带哈希 `.txt` 应同步生成并验证；无法生成正确哈希的更新不能合并。
 
-当前前端测试工具链有 `glob` 与 `minimatch` 中等级别公告（含传递依赖共 5 项 npm 条目），生产 npm 依赖扫描未发现漏洞。上游约束尚无兼容补丁，本次不强制跨主版本覆盖；保留在扫描报告中，等待兼容更新或经完整验证的工具迁移。依据：[glob 公告](https://github.com/advisories/GHSA-3g3m-2fjr-6pw4)、[minimatch 公告](https://github.com/advisories/GHSA-g3hv-75wg-m249)。扫描结果只反映所用漏洞数据库当时的已知问题，不保证不存在未披露漏洞。
+前端测试工具链的两个中危漏洞曾传播为 5 项 npm 审计条目。修复限定在 `@vue/test-utils@2.5.1 → js-beautify@2.0.3`：使用 `glob@14.0.3`，并将该 glob 与 `editorconfig@3.0.2` 消费的 minimatch 固定为 `11.0.4`；不覆盖其他依赖链。跨主版本兼容性由取消扫描、复杂模式匹配、EditorConfig/格式化 CLI 和 Vue 组件交互回归验证。版本限定的 override 需在上游工具更新时重新评估，兼容版本已包含修复后应移除并重跑全部检查。最终运行镜像只包含构建后的静态页面和 Python API，不包含这些 Node 测试工具。依据：[glob 公告](https://github.com/advisories/GHSA-3g3m-2fjr-6pw4)、[minimatch 公告](https://github.com/advisories/GHSA-g3hv-75wg-m249)。扫描结果只反映所用漏洞数据库当时的已知问题，不保证不存在未披露漏洞。
 
 以下本机验证不连接真实 DNSPod 或证书机构：
 

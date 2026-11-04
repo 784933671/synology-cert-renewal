@@ -37,10 +37,10 @@ jobs:
       - name: 按锁文件安装全部依赖
         id: frontend-install
         run: npm ci --include=dev --include=optional --include=peer --no-audit --no-fund
-      - name: 审计全部依赖，阻断高危和严重漏洞
+      - name: 审计全部依赖，阻断中危及以上漏洞
         run: |
           mkdir -p "$GITHUB_WORKSPACE/reports"
-          npm audit --include=dev --include=optional --include=peer --audit-level=high --json \
+          npm audit --include=dev --include=optional --include=peer --audit-level=moderate --json \
             > "$GITHUB_WORKSPACE/reports/npm-audit.json"
       - name: 前端交互回归
         if: ${{ !cancelled() && steps.frontend-install.outcome == 'success' }}
