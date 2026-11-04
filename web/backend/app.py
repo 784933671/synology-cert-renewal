@@ -149,7 +149,7 @@ class SecurityBoundary:
             request_headers[key] = value.decode("latin1")
         method = scope.get("method", "GET")
         if method in ("POST", "PUT", "PATCH", "DELETE"):
-            if request_headers.get(b"origin") != self.config.origin or request_headers.get(b"sec-fetch-site") == "cross-site":
+            if request_headers.get(b"origin") != "https://" + hosts[0] or request_headers.get(b"sec-fetch-site") == "cross-site":
                 raise ApiError(403, "origin_forbidden", "请求来源校验失败，请从管理页面重新操作")
             content_type = request_headers.get(b"content-type", "").lower().replace(" ", "")
             if content_type not in ("application/json", "application/json;charset=utf-8"):
