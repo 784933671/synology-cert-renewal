@@ -12,8 +12,8 @@ Python 3.12，单个 Uvicorn worker。依赖安装使用 `pip install --require-
 | `CERTWEB_ALLOWED_NETWORKS` | 仅内网模式的精确 RFC1918 IPv4 CIDR，逗号分隔；内网模式未设置时拒绝所有业务访问 |
 | `CERTWEB_DENIED_ADDRESSES` | 仅内网模式的局域网 IPv4 拒绝列表，应填写网关及转发代理地址；优先于允许网段 |
 | `CERTWEB_ACCESS_POLICY_FILE` | 主机共享的只读策略文件，部署值 `/access/access.json`；未设置时沿用仅内网模式，设置后缺失或损坏会拒绝请求 |
-| `CERTWEB_ALLOWED_HOSTS` | 精确的 HTTP Host authority，包含非标准端口；不支持通配符。默认 `localhost:18443,127.0.0.1:18443` |
-| `CERTWEB_ORIGIN` | 单一 HTTPS 来源，必须对应 Host 白名单；默认 `https://localhost:18443` |
+| `CERTWEB_ALLOWED_HOSTS` | 精确的 HTTP Host authority，包含非标准端口；不支持通配符。默认 `localhost:18443,127.0.0.1:18443`；Compose 额外加入配置的 `CERTWEB_BIND:CERTWEB_PORT` 作为 IP 入口 |
+| `CERTWEB_ORIGIN` | 规范 HTTPS 域名入口，必须对应 Host 白名单，用于部署证书验证和健康检查；默认 `https://localhost:18443`。写请求按当前已验证 Host 精确校验同源 |
 | `CERTWEB_BIND` | 必填，明确的 NAS 局域网 IPv4；禁止绑定 `0.0.0.0`、公网、回环、IPv6或拒绝列表地址 |
 | `CERTWEB_PORT` | 默认 `18443`，仅允许 1024–65535 |
 | `CERTWEB_TLS_CERT` | 只读证书副本，默认 `/tls/current.cert` |
@@ -46,7 +46,7 @@ python -m web.backend reset-password --username admin
 
 会话闲置 30 分钟、绝对有效期 8 小时。`GET /api/status` 与 `GET /api/security` 定时轮询不刷新闲置时间；用户读取配置等操作会刷新。登出使当前服务器会话失效，改密撤销全部会话并签发新会话。Cookie 使用 `__Host-` 前缀、HttpOnly、Secure、SameSite=Strict。登录和改密分别使用持久的 15 分钟限流窗口：同 IP+账户 5 次、同 IP 15 次、全局 40 次；计数在尝试前预留，重启不清零，窗口到期自动恢复。
 
-所有写请求要求精确同源 Origin 和 JSON；除登录外还要求 X-CSRF-Token。请求正文最多 128 KiB、读取最多 10 秒；桥接请求最多 64 KiB、响应最多 2 MiB、最多 60 秒。桥接错误只映射固定中文摘要。SQLite 审计仅保存固定动作及安全摘要，不保存参数、口令、密钥或请求正文。
+所有写请求要求 Origin 精确等于 `https://` 加当前已通过白名单验证的 Host，并要求 JSON；域名 Origin 与 IP Host 之间不能交叉使用。除登录外还要求 X-CSRF-Token。请求正文最多 128 KiB、读取最多 10 秒；桥接请求最多 64 KiB、响应最多 2 MiB、最多 60 秒。桥接错误只映射固定中文摘要。SQLite 审计仅保存固定动作及安全摘要，不保存参数、口令、密钥或请求正文。
 
 ## 本机验证
 
