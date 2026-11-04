@@ -22,6 +22,7 @@ from web.backend.config import Config
 from web.backend.mfa import CODE_SECONDS, MfaError, valid_email
 
 ORIGIN = "https://ttxli.cn:18443"
+LAN_ORIGIN = "https://10.10.10.37:18443"
 PASSWORD = "fixture-initial-password-42"
 NEW_PASSWORD = "fixture-new-password-99"
 EMAIL = "owner@example.com"
@@ -116,6 +117,32 @@ class EmailLoginTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(response.status_code, 401)
         self.assertEqual(self.bridge.calls, [])
         self.assertEqual(self.count("login_challenges"), 0)
+
+    async def test_email_login_completes_on_each_exact_host(self):
+        app = create_app(replace(self.config, allowed_hosts=("ttxli.cn:18443", "10.10.10.37:18443")),
+                         self.store, self.bridge)
+        for origin in (ORIGIN, LAN_ORIGIN):
+            with self.subTest(origin=origin):
+                async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app, client=(IP, 43210)),
+                                             base_url=origin) as client:
+                    login = await client.post("/api/login", json={"username": "admin", "password": PASSWORD},
+                                              headers={"Origin": origin})
+                    self.assertEqual(login.status_code, 202, login.text)
+                    self.assertIsNotNone(client.cookies.get(CHALLENGE_COOKIE))
+                    self.assertIsNone(client.cookies.get(COOKIE))
+                    verified = await client.post("/api/login/verify", json={"code": self.bridge.code},
+                                                 headers={"Origin": origin})
+                    self.assertEqual(verified.status_code, 200, verified.text)
+                    self.assertTrue(verified.json()["email_verification_enabled"])
+                    self.assertIsNone(client.cookies.get(CHALLENGE_COOKIE))
+                    self.assertIsNotNone(client.cookies.get(COOKIE))
+                    self.assertEqual((await client.get("/api/session")).status_code, 200)
+                    cookie = next(value for value in verified.headers.get_list("set-cookie")
+                                  if value.startswith(COOKIE + "="))
+                    for attribute in ("Secure", "HttpOnly", "SameSite=strict", "Path=/"):
+                        self.assertIn(attribute, cookie)
+                    self.assertNotIn("Domain=", cookie)
+            self.now[0] += 61
 
     async def test_get_challenge_recovers_without_send_and_cancel_revokes(self):
         self.assertEqual((await self.client.get("/api/login/challenge")).json(), {"verification_required": False})
