@@ -13,6 +13,7 @@ from contextlib import contextmanager
 from pathlib import Path
 
 from .mfa import EmailLoginMixin, MfaError, masked_email
+from .security import SecurityMixin
 
 IDLE_SECONDS = 30 * 60
 ABSOLUTE_SECONDS = 8 * 60 * 60
@@ -51,7 +52,7 @@ def token_hash(value):
     return hashlib.sha256(value.encode("utf-8")).hexdigest()
 
 
-class AuthStore(EmailLoginMixin):
+class AuthStore(SecurityMixin, EmailLoginMixin):
     def __init__(self, directory: Path, clock=time.time):
         self.clock = clock
         self.lock = threading.RLock()
@@ -84,6 +85,7 @@ class AuthStore(EmailLoginMixin):
                     action TEXT NOT NULL, success INTEGER NOT NULL, message TEXT NOT NULL);
             """)
             self._email_schema(connection)
+            self._security_schema(connection)
         self.dummy_hash = password_hash(secrets.token_urlsafe(32))
 
     @contextmanager
@@ -165,8 +167,10 @@ class AuthStore(EmailLoginMixin):
         connection.execute("DELETE FROM sessions WHERE created<=? OR last_seen<=?", (now - ABSOLUTE_SECONDS, now - IDLE_SECONDS))
         token = secrets.token_urlsafe(32)
         csrf = secrets.token_urlsafe(32)
-        connection.execute("INSERT INTO sessions(token_hash,username,csrf,created,last_seen,auth_version,auth_level,policy_version) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
-                           (token_hash(token), username, csrf, now, now, user["auth_version"], auth_level, policy_version))
+        connection.execute("INSERT INTO sessions(token_hash,username,csrf,created,last_seen,auth_version,auth_level,policy_version,session_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                           (token_hash(token), username, csrf, now, now, user["auth_version"], auth_level, policy_version, secrets.token_hex(16)))
+        connection.execute("DELETE FROM sessions WHERE username=? AND token_hash NOT IN (SELECT token_hash FROM sessions WHERE username=? ORDER BY created DESC,rowid DESC LIMIT 20)", (username, username))
+        connection.execute("DELETE FROM stepup_challenges WHERE session_hash NOT IN (SELECT token_hash FROM sessions)")
         return token, self._session_data(username, csrf, user["must_change"], policy)
 
     def _session_data(self, username, csrf, must_change, policy):
@@ -179,28 +183,37 @@ class AuthStore(EmailLoginMixin):
         with self.transaction() as connection:
             return self._new_session(connection, username)
 
-    def session(self, token, touch=True):
-        if not isinstance(token, str) or not re.fullmatch(r"[A-Za-z0-9_-]{43}", token):
-            return None
+    def _session_row(self, connection, token, hashed=None):
+        if hashed is None:
+            if not isinstance(token, str) or not re.fullmatch(r"[A-Za-z0-9_-]{43}", token):
+                return None, None
+            hashed = token_hash(token)
+        row = connection.execute("SELECT sessions.*, users.must_change,users.auth_version AS current_version FROM sessions JOIN users USING(username) WHERE token_hash=?", (hashed,)).fetchone()
+        if not row:
+            return None, None
         now = self.clock()
-        hashed = token_hash(token)
+        policy = self._email_policy(connection, row["username"])
+        if (now - row["created"] >= ABSOLUTE_SECONDS or now - row["last_seen"] >= IDLE_SECONDS or now < row["created"]
+                or row["auth_version"] != row["current_version"]
+                or (policy and (row["auth_level"] != 2 or row["policy_version"] != policy["policy_version"]))):
+            connection.execute("DELETE FROM sessions WHERE token_hash=?", (hashed,))
+            connection.execute("DELETE FROM stepup_challenges WHERE session_hash=?", (hashed,))
+            return None, None
+        return row, policy
+
+    def session(self, token, touch=True):
         with self.transaction() as connection:
-            row = connection.execute("SELECT sessions.*, users.must_change,users.auth_version AS current_version FROM sessions JOIN users USING(username) WHERE token_hash=?", (hashed,)).fetchone()
-            if not row:
-                return None
-            policy = self._email_policy(connection, row["username"])
-            if (now - row["created"] >= ABSOLUTE_SECONDS or now - row["last_seen"] >= IDLE_SECONDS or now < row["created"]
-                    or row["auth_version"] != row["current_version"]
-                    or (policy and (row["auth_level"] != 2 or row["policy_version"] != policy["policy_version"]))):
-                connection.execute("DELETE FROM sessions WHERE token_hash=?", (hashed,))
+            row, policy = self._session_row(connection, token)
+            if row is None:
                 return None
             if touch:
-                connection.execute("UPDATE sessions SET last_seen=? WHERE token_hash=?", (now, hashed))
+                connection.execute("UPDATE sessions SET last_seen=? WHERE token_hash=?", (self.clock(), token_hash(token)))
         return self._session_data(row["username"], row["csrf"], row["must_change"], policy)
 
     def logout(self, token):
         with self.transaction() as connection:
             connection.execute("DELETE FROM sessions WHERE token_hash=?", (token_hash(token),))
+            connection.execute("DELETE FROM stepup_challenges WHERE session_hash=?", (token_hash(token),))
 
     def change_password(self, username, old_password, new_password, session_token=None):
         if not valid_password(new_password) or hmac.compare_digest(old_password.encode(), new_password.encode()):

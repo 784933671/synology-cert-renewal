@@ -1072,11 +1072,14 @@ class Bridge:
                        'security.update': self.security_update, 'health': self.health,
                        'monitor.get': self.monitor_get, 'monitor.update': self.monitor_update,
                        'runs.list': self.runs_list, 'runs.get': self.runs_get}
-            if method == 'auth.code.send':
+            mail_methods = {'auth.code.send': self.login_mail.send,
+                            'auth.stepup.send': self.login_mail.send_stepup,
+                            'auth.security.send': self.login_mail.send_security}
+            if method in mail_methods:
                 try:
-                    data = self.login_mail.send(params)
+                    data = mail_methods[method](params)
                 except login_mail.MailError:
-                    reject('登录验证码暂时无法发送，请稍后重试。', 'unavailable')
+                    reject('安全验证或提醒邮件暂时无法发送，请稍后重试。', 'unavailable')
             elif method == 'failures.get':
                 if set(params) != {'id'}:
                     reject('失败记录请求字段无效。', 'invalid_request')

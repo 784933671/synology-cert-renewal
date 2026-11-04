@@ -33,6 +33,19 @@ def settings_payload():
             "notifications": {"success_enabled": True, "success_email": "owner@example.com", "failure_enabled": True, "failure_email": "owner@example.com"}}
 
 
+def operation_headers(store, client, headers, method, path, body, ip="10.10.10.24"):
+    """为原有业务回归建立已验证邮箱会话，并走真实授权状态机。"""
+    with store.transaction() as connection:
+        connection.execute("INSERT OR IGNORE INTO login_security VALUES('admin','owner@example.com',?,1,1)", ('a' * 32,))
+        connection.execute("UPDATE users SET email_login_required=1")
+        connection.execute("UPDATE sessions SET auth_level=2,policy_version=?", ('a' * 32,))
+    token = client.cookies.get(COOKIE)
+    delivery = store.start_stepup(token, ip, method, path, body)
+    store.finish_stepup(token, ip, delivery, True)
+    proof = store.verify_stepup(token, ip, delivery.challenge_id, delivery.code)
+    return {**headers, 'X-Step-Up-Token': proof['token']}
+
+
 class FixtureBridge:
     def __init__(self):
         self.calls = []
@@ -94,6 +107,12 @@ class WebApiTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(response.status_code, 200, response.text)
         self.csrf = response.json()["csrf_token"]
         return {"Origin": ORIGIN, "X-CSRF-Token": self.csrf}
+
+    async def authorized_put(self, path, json, headers, client=None, ip="10.10.10.24"):
+        self.now[0] += 61
+        client = client or self.client
+        granted = operation_headers(self.store, client, headers, 'PUT', path, json, ip)
+        return await client.put(path, json=json, headers=granted)
 
     async def test_business_requires_authentication(self):
         for route in ("status", "settings", "failures", "failures/id", "security", "audit", "session", "health", "monitor", "runs", "runs/id"):
@@ -218,7 +237,7 @@ class WebApiTests(unittest.IsolatedAsyncioTestCase):
                 result = await self.client.put('/api/monitor', json={**value, key: invalid}, headers=headers)
                 self.assertEqual(result.status_code, 400)
         self.assertEqual(self.bridge.calls, [])
-        result = await self.client.put('/api/monitor', json=value, headers=headers)
+        result = await self.authorized_put('/api/monitor', json=value, headers=headers)
         self.assertEqual(result.status_code, 200)
         self.assertEqual(self.bridge.calls[-1], ('monitor.update', value))
         audit = (await self.client.get('/api/audit')).json()
@@ -454,7 +473,7 @@ class WebApiTests(unittest.IsolatedAsyncioTestCase):
         for action in ("run", "check"):
             self.assertEqual((await self.client.post("/api/actions/" + action, json={}, headers=headers)).status_code, 200)
             self.assertEqual(self.bridge.calls[-1], (action, None))
-        response = await self.client.put("/api/settings", json=settings_payload(), headers=headers)
+        response = await self.authorized_put("/api/settings", json=settings_payload(), headers=headers)
         self.assertEqual(response.status_code, 200, response.text)
         self.assertEqual(self.bridge.calls[-1], ("settings.update", settings_payload()))
         audit = (await self.client.get("/api/audit")).json()
@@ -472,7 +491,7 @@ class WebApiTests(unittest.IsolatedAsyncioTestCase):
         headers = await self.ready()
         data = settings_payload()
         data.update(secret_id="fixtureSecretId", secret_key="fixtureSecretKey")
-        response = await self.client.put("/api/settings", json=data, headers=headers)
+        response = await self.authorized_put("/api/settings", json=data, headers=headers)
         self.assertEqual(response.status_code, 200)
         self.assertEqual(self.bridge.calls[-1][1]["secret_key"], "fixtureSecretKey")
         self.assertNotIn("fixtureSecret", response.text)
@@ -493,7 +512,7 @@ class WebApiTests(unittest.IsolatedAsyncioTestCase):
         response = await self.client.put("/api/settings", json=data, headers={"Origin": ORIGIN})
         self.assertEqual(response.status_code, 403)
         self.assertEqual(self.bridge.calls, [])
-        response = await self.client.put("/api/settings", json=data, headers=headers)
+        response = await self.authorized_put("/api/settings", json=data, headers=headers)
         self.assertEqual(response.status_code, 200, response.text)
         self.assertEqual(self.bridge.calls, [("settings.update", data)])
         audit = (await self.client.get("/api/audit")).json()
@@ -510,7 +529,7 @@ class WebApiTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.bridge.calls, [])
         data = settings_payload()
         data["schedule"].update(mode="adaptive", hour=3, minute=18, interval_hours=1)
-        self.assertEqual((await self.client.put("/api/settings", json=data, headers=headers)).status_code, 200)
+        self.assertEqual((await self.authorized_put("/api/settings", json=data, headers=headers)).status_code, 200)
         self.assertEqual(self.bridge.calls, [("settings.update", data)])
 
     async def test_adaptive_settings_rejects_display_fields_and_arbitrary_options(self):
@@ -543,7 +562,7 @@ class WebApiTests(unittest.IsolatedAsyncioTestCase):
         headers = await self.ready()
         data = settings_payload()
         data["notifications"].update(success_enabled=False, success_email="", failure_enabled=False, failure_email="")
-        self.assertEqual((await self.client.put("/api/settings", json=data, headers=headers)).status_code, 200)
+        self.assertEqual((await self.authorized_put("/api/settings", json=data, headers=headers)).status_code, 200)
         data["notifications"]["success_email"] = "invalid"
         self.assertEqual((await self.client.put("/api/settings", json=data, headers=headers)).status_code, 400)
         data["notifications"]["success_email"] = "-owner@example.com"
@@ -640,7 +659,7 @@ class WebApiTests(unittest.IsolatedAsyncioTestCase):
         access_policy.write_applied(self.policy_path, value, os.getuid(), os.getgid())
         headers = await self.ready()
         body = {"access_mode": "public", "revision": value["revision"]}
-        response = await self.client.put("/api/security", json=body, headers=headers)
+        response = await self.authorized_put("/api/security", json=body, headers=headers)
         self.assertEqual(response.status_code, 200)
         saved = response.json()
         self.assertEqual(saved["access_mode"], "public")
@@ -654,7 +673,7 @@ class WebApiTests(unittest.IsolatedAsyncioTestCase):
         applied = (await self.client.get("/api/security")).json()
         self.assertEqual(applied["applied_mode"], "public")
         self.assertFalse(applied["pending"])
-        stale = await self.client.put("/api/security", json=body, headers=headers)
+        stale = await self.authorized_put("/api/security", json=body, headers=headers)
         self.assertEqual(stale.status_code, 409)
         audit = (await self.client.get("/api/audit")).json()["items"]
         updates = [entry for entry in audit if entry["action"] == "security.update"]
@@ -663,7 +682,7 @@ class WebApiTests(unittest.IsolatedAsyncioTestCase):
     async def test_security_can_close_public_access_without_skipping_save_response(self):
         value = await self.configure_access_policy("public", peer="203.0.113.8")
         headers = await self.ready()
-        response = await self.client.put("/api/security", json={"access_mode": "lan", "revision": value["revision"]}, headers=headers)
+        response = await self.authorized_put("/api/security", json={"access_mode": "lan", "revision": value["revision"]}, headers=headers, ip="203.0.113.8")
         self.assertEqual(response.status_code, 200)
         self.assertEqual(response.json()["access_mode"], "lan")
         self.assertEqual((await self.client.get("/api/security")).status_code, 403)
@@ -749,6 +768,7 @@ class BridgeProtocolTests(unittest.IsolatedAsyncioTestCase):
             payload = settings_payload()
             payload.update(secret_id="fixture-secret-id", secret_key="fixture-secret-key")
             self.response = json.dumps({"ok": True, "data": payload}).encode() + b"\n"
+            headers = operation_headers(store, client, headers, "PUT", "/api/settings", payload)
             updated = await client.put("/api/settings", json=payload, headers=headers)
             self.assertEqual(updated.status_code, 200)
             self.assertEqual(self.requests[-1], {"method": "settings.update", "params": payload})
@@ -772,6 +792,7 @@ class BridgeProtocolTests(unittest.IsolatedAsyncioTestCase):
             saved = copy.deepcopy(payload)
             saved["schedule"].update(active_mode="daily", editable=True, message="当前每天检查")
             self.response = json.dumps({"ok": True, "data": saved}).encode() + b"\n"
+            headers = operation_headers(store, client, headers, "PUT", "/api/settings", payload)
             response = await client.put("/api/settings", json=payload, headers=headers)
             self.assertEqual(response.status_code, 200, response.text)
             self.assertEqual(response.json()["schedule"]["mode"], "adaptive")

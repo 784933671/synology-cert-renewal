@@ -3,6 +3,8 @@ import { computed, onUnmounted, reactive, shallowRef, watch } from 'vue'
 import { Button as AButton, Card as ACard, Form as AForm, Input as AInput, Tag as ATag } from 'ant-design-vue'
 import { api, ApiError, errorText, isAborted } from '../lib/api'
 import type { Session } from '../types'
+import SessionsPanel from '../components/SessionsPanel.vue'
+import SecurityAlertsPanel from '../components/SecurityAlertsPanel.vue'
 import NoticeBar from '../components/NoticeBar.vue'
 import '../styles/shell.css'
 const AFormItem = AForm.Item
@@ -16,11 +18,13 @@ const emit = defineEmits<{
   changed: [session: Session]
   busy: [value: boolean]
   relogin: []
+  revoked: []
 }>()
 const form = reactive({ current: '', next: '', confirm: '' })
 const busy = shallowRef(false), error = shallowRef(''), success = shallowRef('')
 const uncertain = shallowRef(false), recovering = shallowRef(false)
-const locked = computed(() => busy.value || uncertain.value)
+const sessionsBusy = shallowRef(false)
+const locked = computed(() => busy.value || uncertain.value || sessionsBusy.value)
 const controller = new AbortController()
 let disposed = false, previousCsrf = ''
 watch(locked, (value) => emit('busy', value), { flush: 'sync' })
@@ -93,7 +97,7 @@ onUnmounted(() => {
   <div class="page-heading">
     <div>
       <h1>{{ session.must_change_password ? '设置专用登录密码' : '账户设置' }}</h1>
-      <p>管理账号 {{ session.username }} 的登录密码。</p>
+      <p>管理账号 {{ session.username }} 的登录密码、会话与安全提醒。</p>
     </div>
     <ATag color="blue">管理员账户</ATag>
   </div>
@@ -128,4 +132,8 @@ onUnmounted(() => {
       </div>
     </AForm>
   </ACard>
+  <template v-if="!session.must_change_password">
+    <SessionsPanel :key="`sessions-${session.csrf_token}`" :disabled="busy || uncertain || sessionBusy" @busy="sessionsBusy = $event" @revoked="emit('revoked')" />
+    <SecurityAlertsPanel :key="`alerts-${session.csrf_token}`" :enabled="!!session.email_verification_enabled" :email="session.login_email_masked" />
+  </template>
 </template>

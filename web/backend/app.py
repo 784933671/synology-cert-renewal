@@ -2,9 +2,11 @@ from __future__ import annotations
 
 import asyncio
 import hmac
+import logging
 import json
 import re
 import secrets
+from contextlib import asynccontextmanager, suppress
 from pathlib import Path
 from urllib.parse import unquote
 
@@ -19,6 +21,7 @@ from .auth import ABSOLUTE_SECONDS, AuthStore, valid_password
 from .bridge import BridgeClient, BridgeError
 from .config import Config
 from .mfa import CHALLENGE_SECONDS, EmailDelivery, MfaError
+from .security import StepupDelivery, security_alert_worker
 
 COOKIE = "__Host-certweb_session"
 CHALLENGE_COOKIE = "__Host-certweb_challenge"
@@ -137,7 +140,7 @@ class SecurityBoundary:
         request_headers = {}
         for key, value in headers:
             key = key.lower()
-            if key in (b"origin", b"content-type", b"content-length", b"x-csrf-token", b"cookie") and key in request_headers:
+            if key in (b"origin", b"content-type", b"content-length", b"x-csrf-token", b"x-step-up-token", b"cookie") and key in request_headers:
                 raise ApiError(400, "invalid_request", "请求头不正确")
             request_headers[key] = value.decode("latin1")
         method = scope.get("method", "GET")
@@ -184,7 +187,17 @@ def create_app(config=None, store=None, bridge=None):
     config = config or Config.from_env()
     store = store or AuthStore(config.data_dir)
     bridge = bridge or BridgeClient(config.bridge_socket, config.bridge_timeout)
-    app = FastAPI(openapi_url=None, docs_url=None, redoc_url=None, redirect_slashes=False)
+    @asynccontextmanager
+    async def lifespan(_app):
+        worker = asyncio.create_task(security_alert_worker(store, bridge))
+        try:
+            yield
+        finally:
+            worker.cancel()
+            with suppress(asyncio.CancelledError):
+                await worker
+
+    app = FastAPI(openapi_url=None, docs_url=None, redoc_url=None, redirect_slashes=False, lifespan=lifespan)
     app.state.store, app.state.bridge, app.state.config = store, bridge, config
     password_slot = asyncio.Semaphore(1)
 
@@ -218,7 +231,7 @@ def create_app(config=None, store=None, bridge=None):
 
     async def session(request, write=False, allow_change=False):
         token = request.cookies.get(COOKIE, "")
-        polling = request.method == "GET" and (request.url.path in ("/api/status", "/api/security", "/api/health", "/api/monitor", "/api/runs")
+        polling = request.method == "GET" and (request.url.path in ("/api/status", "/api/security", "/api/health", "/api/monitor", "/api/runs", "/api/sessions", "/api/security-alerts", "/api/stepup/challenge")
                                                 or request.url.path.startswith("/api/runs/"))
         current = await run_in_threadpool(store.session, token, not polling)
         if not current:
@@ -230,6 +243,21 @@ def create_app(config=None, store=None, bridge=None):
         if current["must_change_password"] and not allow_change:
             raise ApiError(403, "password_change_required", "首次登录请先修改管理员密码")
         return current
+
+    async def security_record(function, *args):
+        try:
+            await run_in_threadpool(function, *args)
+        except Exception:
+            # 提醒或元数据故障不把已经完成的登录、配置更新报告为失败。
+            logging.getLogger(__name__).error("安全提醒或会话元数据保存失败，请检查认证数据库")
+
+    async def protect(request, data):
+        await run_in_threadpool(store.consume_stepup, request.cookies.get(COOKIE, ''), request.client.host,
+                                request.method, request.url.path, data, request.headers.get('x-step-up-token', ''))
+
+    async def changed_security(request):
+        await security_record(store.record_security_change, request.cookies.get(COOKIE, ''),
+                              request.client.host, request.headers.get('user-agent', ''))
 
     def authenticated_response(result):
         token, current = result
@@ -300,10 +328,12 @@ def create_app(config=None, store=None, bridge=None):
         result = await password_work(store.login, data["username"], data["password"], request.client.host)
         await run_in_threadpool(store.audit, "login", bool(result), "密码校验通过，等待邮箱验证" if isinstance(result, EmailDelivery) else "管理员登录成功" if result else "账号或密码不正确")
         if not result:
+            await security_record(store.record_login_failure, data["username"], request.client.host, request.headers.get("user-agent", ""))
             raise ApiError(401, "invalid_credentials", "账号或密码不正确")
         if isinstance(result, EmailDelivery):
             await run_in_threadpool(store.logout, request.cookies.get(COOKIE, ""))
             return await deliver_code(result, request, initial=True)
+        await security_record(store.record_login, result[0], request.client.host, request.headers.get("user-agent", ""))
         return authenticated_response(result)
 
     @app.get("/api/login/challenge")
@@ -319,7 +349,8 @@ def create_app(config=None, store=None, bridge=None):
         data = await json_body(request)
         if set(data) != {"code"}:
             raise ApiError(400, "invalid_request", "请仅提交邮箱验证码")
-        result = await run_in_threadpool(store.verify_challenge, request.cookies.get(CHALLENGE_COOKIE, ""), request.client.host, data["code"])
+        result = await run_in_threadpool(store.verify_challenge, request.cookies.get(CHALLENGE_COOKIE, ""), request.client.host, data["code"], request.headers.get("user-agent", ""))
+        await security_record(store.record_login, result[0], request.client.host, request.headers.get("user-agent", ""))
         return authenticated_response(result)
 
     @app.post("/api/login/resend")
@@ -364,13 +395,108 @@ def create_app(config=None, store=None, bridge=None):
             data["current_password"].encode("utf-8")
         except ValueError:
             raise ApiError(400, "invalid_password", "新密码须为 12 至 128 个字符，并且不同于旧密码") from None
+        if not current["must_change_password"]:
+            await protect(request, data)
         if not await run_in_threadpool(store.allow_attempt, request.client.host, current["username"], "password"):
             raise ApiError(429, "rate_limited", "密码校验过于频繁，请在 15 分钟后重试")
         result = await password_work(store.change_password, current["username"], data["current_password"], data["new_password"], request.cookies.get(COOKIE, ""))
         await run_in_threadpool(store.audit, "password", bool(result), "管理员密码已更新，旧会话已撤销" if result else "密码校验失败")
         if not result:
             raise ApiError(400, "invalid_password", "旧密码不正确，或新密码与旧密码相同")
+        await security_record(store.record_login, result[0], request.client.host, request.headers.get("user-agent", ""), False)
+        await security_record(store.record_security_change, result[0], request.client.host, request.headers.get("user-agent", ""))
         return authenticated_response(result)
+
+    async def deliver_stepup(request, delivery):
+        token = request.cookies.get(COOKIE, '')
+        if not isinstance(delivery, StepupDelivery):
+            return delivery
+        try:
+            try:
+                result = await asyncio.wait_for(bridge.call('auth.stepup.send', {
+                    'code': delivery.code, 'policy_version': delivery.policy_version, 'operation': delivery.operation}),
+                    min(config.bridge_timeout, max(0.01, config.request_timeout - 1), 50))
+                if not isinstance(result, dict) or result.get('accepted') is not True:
+                    raise ValueError()
+            except Exception:
+                await run_in_threadpool(store.finish_stepup, token, request.client.host, delivery, False)
+                raise ApiError(503, 'mail_unavailable', '操作验证码发送未完成，请重新确认验证状态或稍后重试') from None
+            return await run_in_threadpool(store.finish_stepup, token, request.client.host, delivery, True)
+        except asyncio.CancelledError:
+            store.invalidate_stepup(token, delivery)
+            raise
+
+    @app.post('/api/stepup/start')
+    async def stepup_start(request: Request):
+        await session(request, write=True)
+        data = await json_body(request)
+        if set(data) != {'method', 'path', 'body'} or not isinstance(data['method'], str) or not isinstance(data['path'], str):
+            raise ApiError(400, 'invalid_request', '请提交需要验证的操作内容')
+        delivery = await run_in_threadpool(store.start_stepup, request.cookies.get(COOKIE, ''), request.client.host,
+                                          data['method'], data['path'], data['body'])
+        return await deliver_stepup(request, delivery)
+
+    @app.get('/api/stepup/challenge')
+    async def stepup_challenge(request: Request):
+        await session(request)
+        return await run_in_threadpool(store.stepup_status, request.cookies.get(COOKIE, ''), request.client.host)
+
+    @app.post('/api/stepup/resend')
+    async def stepup_resend(request: Request):
+        await session(request, write=True)
+        data = await json_body(request)
+        if set(data) != {'challenge_id'}:
+            raise ApiError(400, 'invalid_request', '验证请求格式不正确')
+        delivery = await run_in_threadpool(store.resend_stepup, request.cookies.get(COOKIE, ''), request.client.host, data['challenge_id'])
+        return await deliver_stepup(request, delivery)
+
+    @app.post('/api/stepup/verify')
+    async def stepup_verify(request: Request):
+        await session(request, write=True)
+        data = await json_body(request)
+        if set(data) != {'challenge_id', 'code'}:
+            raise ApiError(400, 'invalid_request', '验证请求格式不正确')
+        return await run_in_threadpool(store.verify_stepup, request.cookies.get(COOKIE, ''), request.client.host, data['challenge_id'], data['code'])
+
+    @app.post('/api/stepup/cancel')
+    async def stepup_cancel(request: Request):
+        await session(request, write=True)
+        data = await json_body(request)
+        if set(data) != {'challenge_id'} or not isinstance(data['challenge_id'], str):
+            raise ApiError(400, 'invalid_request', '验证请求格式不正确')
+        await run_in_threadpool(store.cancel_stepup, request.cookies.get(COOKIE, ''), data['challenge_id'])
+        return {'ok': True}
+
+    @app.get('/api/sessions')
+    async def sessions(request: Request):
+        await session(request)
+        return await run_in_threadpool(store.sessions_list, request.cookies.get(COOKIE, ''))
+
+    async def revoke_sessions(request, others=False):
+        await session(request, write=True)
+        data = await json_body(request)
+        if ((others and data != {}) or (not others and (set(data) != {'id'} or not isinstance(data['id'], str)
+                                                        or not re.fullmatch(r'[0-9a-f]{32}', data['id'])))):
+            raise ApiError(400, 'invalid_request', '会话撤销请求不正确')
+        result = await run_in_threadpool(store.revoke_sessions, request.cookies.get(COOKIE, ''), request.client.host,
+                                        request.method, request.url.path, data, request.headers.get('x-step-up-token', ''))
+        response = JSONResponse(result)
+        if result['current_revoked']:
+            response.delete_cookie(COOKIE, secure=True, httponly=True, samesite='strict', path='/')
+        return response
+
+    @app.post('/api/sessions/revoke')
+    async def revoke_session(request: Request):
+        return await revoke_sessions(request)
+
+    @app.post('/api/sessions/revoke-others')
+    async def revoke_other_sessions(request: Request):
+        return await revoke_sessions(request, True)
+
+    @app.get('/api/security-alerts')
+    async def security_alerts(request: Request):
+        await session(request)
+        return await run_in_threadpool(store.alerts_list, request.cookies.get(COOKIE, ''))
 
     @app.get("/api/status")
     async def status(request: Request):
@@ -400,7 +526,10 @@ def create_app(config=None, store=None, bridge=None):
             validation.monitor(data)
         except ValueError:
             raise ApiError(400, "validation", "预警设置不符合要求，请检查填写项") from None
-        return await call_bridge("monitor.update", data, "monitor.update")
+        await protect(request, data)
+        result = await call_bridge("monitor.update", data, "monitor.update")
+        await changed_security(request)
+        return result
 
     @app.get("/api/runs")
     async def runs(request: Request):
@@ -431,12 +560,17 @@ def create_app(config=None, store=None, bridge=None):
             validation.settings(data)
         except ValueError:
             raise ApiError(400, "validation", "配置内容不符合要求，请检查填写项") from None
-        return await call_bridge("settings.update", data, "settings.update")
+        await protect(request, data)
+        result = await call_bridge("settings.update", data, "settings.update")
+        await changed_security(request)
+        return result
 
     async def action(request, method):
         await session(request, write=True)
         if await json_body(request) != {}:
             raise ApiError(400, "invalid_request", "此操作不接受额外参数")
+        if method == "renew":
+            await protect(request, {})
         return await call_bridge(method, audit=method)
 
     @app.post("/api/actions/run")
@@ -485,7 +619,9 @@ def create_app(config=None, store=None, bridge=None):
             raise ApiError(400, "validation", "访问范围配置不符合要求") from None
         if config.access_policy_file is None:
             raise ApiError(503, "unavailable", "访问范围配置尚未启用")
+        await protect(request, data)
         await call_bridge("security.update", data, "security.update")
+        await changed_security(request)
         return await run_in_threadpool(config.security_snapshot)
 
     @app.api_route("/{path:path}", methods=["GET", "HEAD"])

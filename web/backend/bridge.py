@@ -4,7 +4,7 @@ import asyncio
 import json
 import re
 
-METHODS = frozenset({"status", "settings.get", "settings.update", "security.update", "run", "renew", "check", "failures.list", "failures.get", "auth.code.send", "health", "monitor.get", "monitor.update", "runs.list", "runs.get"})
+METHODS = frozenset({"status", "settings.get", "settings.update", "security.update", "run", "renew", "check", "failures.list", "failures.get", "auth.code.send", "auth.stepup.send", "auth.security.send", "health", "monitor.get", "monitor.update", "runs.list", "runs.get"})
 ERRORS = {
     "validation": (400, "配置内容不符合要求，请检查填写项"),
     "invalid_request": (400, "请求格式不正确"),

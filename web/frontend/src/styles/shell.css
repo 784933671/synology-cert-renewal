@@ -64,3 +64,10 @@
 .cert-login-countdown { margin: -4px 0 16px; color: #595959; font-size: 13px; }
 .cert-login-secondary { display: flex; justify-content: space-between; margin-top: 16px; }
 .cert-login-verification.ant-card { margin-bottom: 24px; }
+.cert-security-card { margin-top: 24px; }
+.cert-security-actions { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; }
+.cert-stepup-cancel { display: flex; justify-content: flex-end; margin-top: 24px; }
+@media (max-width: 640px) {
+  .cert-security-card .ant-card-head-wrapper { align-items: flex-start; flex-direction: column; gap: 12px; padding: 12px 0; }
+  .cert-security-card .ant-card-extra { margin-inline-start: 0; }
+}

@@ -195,7 +195,7 @@ class EmailLoginMixin:
             with self.transaction() as connection:
                 connection.execute("DELETE FROM login_challenges WHERE token_hash=? AND ip_hash=?", (digest(token), digest(ip)))
 
-    def verify_challenge(self, token, ip, code):
+    def verify_challenge(self, token, ip, code, agent=""):
         error, result = None, None
         with self.transaction() as connection:
             row, policy = self._challenge(connection, token, ip)
@@ -205,6 +205,7 @@ class EmailLoginMixin:
                 error = MfaError(400, "code_expired", "验证码已失效，请重新发送")
             elif (not isinstance(code, str) or not re.fullmatch(r"[0-9]{6}", code)
                   or not hmac.compare_digest(row["code_mac"], self._code_mac(token, row["generation"], code))):
+                self._record_login_failure(connection, row["username"], ip, agent)
                 connection.execute("UPDATE login_challenges SET attempts=attempts+1 WHERE token_hash=?", (digest(token),))
                 if row["attempts"] + 1 >= MAX_CODE_ATTEMPTS:
                     connection.execute("DELETE FROM login_challenges WHERE token_hash=?", (digest(token),))

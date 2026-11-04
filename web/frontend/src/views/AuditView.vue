@@ -13,6 +13,9 @@ const actions: Record<string, string> = {
   initialize: '初始化管理员', password_reset: '重置管理员密码', login: '登录', logout: '退出登录',
   password: '修改密码', 'password.change': '修改密码', 'settings.update': '更新配置',
   'monitor.update': '修改预警设置',
+  'stepup.send': '发送操作验证码', 'stepup.verify': '敏感操作二次验证',
+  'sessions.revoke': '撤销登录会话', 'sessions.revoke_others': '退出其他登录会话',
+  'actions.renew': '立即申请并替换证书',
   'security.update': '修改访问模式', run: '手动运行任务', check: '手动检查',
   'actions.run': '手动运行任务', 'actions.check': '手动检查',
 }

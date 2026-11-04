@@ -492,6 +492,12 @@ class EmailLoginTests(unittest.IsolatedAsyncioTestCase):
         with self.store.transaction() as connection:
             connection.execute("UPDATE users SET must_change=0")
         self.assertEqual((await self.client.post("/api/actions/renew", json={"force": True}, headers=headers)).status_code, 400)
+        self.assertEqual((await self.client.post("/api/actions/renew", json={}, headers=headers)).status_code, 428)
+        token = self.client.cookies.get(COOKIE)
+        delivery = self.store.start_stepup(token, IP, 'POST', '/api/actions/renew', {})
+        self.store.finish_stepup(token, IP, delivery, True)
+        grant = self.store.verify_stepup(token, IP, delivery.challenge_id, delivery.code)
+        headers['X-Step-Up-Token'] = grant['token']
         self.assertEqual((await self.client.post("/api/actions/renew", json={}, headers=headers)).status_code, 200)
         self.assertEqual(self.bridge.calls[-1], ("renew", {}))
 

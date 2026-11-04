@@ -3,6 +3,8 @@ import { computed, onMounted, onUnmounted, shallowRef, watch } from 'vue'
 import { ConfigProvider as AConfigProvider, Spin as ASpin } from 'ant-design-vue'
 import zhCN from 'ant-design-vue/es/locale/zh_CN'
 import { useSession } from './composables/useSession'
+import { useStepUp } from './composables/useStepUp'
+import StepUpDialog from './components/StepUpDialog.vue'
 import type { Page, SettingsPage } from './types'
 import AppShell from './components/AppShell.vue'
 import NoticeBar from './components/NoticeBar.vue'
@@ -24,6 +26,8 @@ const theme = {
   },
 }
 const { session, challenge, recoveryRequired, expiresIn, resendAfter, ready, busy, error, accept, login, verify, resend, cancel, logout, restore } = useSession()
+const stepUp = useStepUp()
+watch(() => session.value?.csrf_token, () => stepUp.cancel(false), { flush: 'sync' })
 const pages: Page[] = [
   'overview',
   'health',
@@ -53,7 +57,7 @@ const settingsSection = computed(() =>
     : null,
 )
 function canLeave() {
-  if (working.value) {
+  if (working.value || stepUp.open.value) {
     notice.value = '当前操作尚未完成，请先确认操作结果。'
     return false
   }
@@ -83,7 +87,7 @@ async function signOut() {
   await logout()
 }
 function beforeUnload(event: BeforeUnloadEvent) {
-  if (dirty.value || working.value) {
+  if (dirty.value || working.value || stepUp.open.value) {
     event.preventDefault()
     event.returnValue = ''
   }
@@ -154,7 +158,12 @@ onUnmounted(() => {
       @changed="accept"
       @busy="working = $event"
       @relogin="logout"
+      @revoked="accept(null)"
     />
   </AppShell>
+  <StepUpDialog :open="stepUp.open.value" :busy="stepUp.busy.value" :error="stepUp.error.value"
+    :operation="stepUp.operation.value" :challenge="stepUp.challenge.value" :expires-in="stepUp.expiresIn.value"
+    :resend-after="stepUp.resendAfter.value" :recover-send="stepUp.recoverSend.value" :verify-unknown="stepUp.verifyUnknown.value"
+    @send="stepUp.send()" @resend="stepUp.send(true)" @verify="stepUp.verify" @cancel="stepUp.cancel()" />
   </AConfigProvider>
 </template>

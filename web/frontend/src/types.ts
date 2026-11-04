@@ -248,3 +248,29 @@ export interface RunPage {
   limit: number
   warning?: string | null
 }
+
+export interface StepUpChallenge {
+  challenge_id: string
+  email_masked: string
+  expires_in: number
+  resend_after: number
+  operation: string
+}
+export type SecurityDevice = 'desktop' | 'mobile' | 'tablet' | 'other' | 'unknown'
+export interface LoginSession {
+  id: string
+  ip: string
+  device: SecurityDevice
+  created_at: string
+  last_seen: string
+  current: boolean
+}
+export interface SecurityAlert {
+  id: string
+  event_type: 'new_login' | 'login_failures' | 'security_change'
+  at: string
+  source_ip: string
+  device: SecurityDevice
+  status: 'pending' | 'sending' | 'sent' | 'failed'
+  attempts: number
+}
