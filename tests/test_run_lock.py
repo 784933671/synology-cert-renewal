@@ -188,43 +188,54 @@ class ConcurrentRenewalTests(unittest.TestCase):
         self.addCleanup(self.fixture.doCleanups)
         self.fixture.setUp()
         self.controller = self.fixture.controller
+        # 并发用例保留真实系统时钟，避免夹具的全局 sleep Mock 让争锁线程空转。
+        self.fixture.fixture.sleep_patch.stop()
 
     def test_waiting_second_run_remains_exclusive_and_does_not_replay_force(self):
         self.fixture.request()
         issuing, waiting, release = threading.Event(), threading.Event(), threading.Event()
+        finished = [threading.Event(), threading.Event()]
         errors, results = [], []
         def issue_and_deploy(arguments):
             if arguments[0] in ('--renew', '--issue'):
                 issuing.set()
-                if not release.wait(3):
+                if not release.wait(10):
                     raise AssertionError('issuer not released')
             return self.fixture.issue_and_deploy(arguments)
         self.controller.invoke_acme = mock.Mock(side_effect=issue_and_deploy)
         real_run = self.controller.run
         self.controller.run = mock.Mock(wraps=real_run)
-        original_sleep = time.sleep
-        def retry_sleep(seconds):
+        def retry_sleep(_seconds):
+            self.assertIs(threading.current_thread(), second)
             waiting.set()
-            original_sleep(min(seconds, 0.02))
-        def run():
+            self.assertTrue(finished[0].wait(10), 'first run did not release its lock')
+        def run(index):
             try:
                 results.append(certctl.main(['--home', str(self.controller.home), 'run']))
             except BaseException as error:
                 errors.append(error)
-        first, second = threading.Thread(target=run), threading.Thread(target=run)
-        with cli(self.controller), mock.patch.object(certctl.time, 'sleep', side_effect=retry_sleep):
+            finally:
+                finished[index].set()
+        first, second = threading.Thread(target=run, args=(0,)), threading.Thread(target=run, args=(1,))
+        clock = types.SimpleNamespace(**vars(time))
+        clock.sleep = mock.Mock(side_effect=retry_sleep)
+        # 仅接管执行器的锁重试，不改变 subprocess 等模块使用的真实 time.sleep。
+        with cli(self.controller), mock.patch.object(certctl, 'time', clock):
             try:
-                first.start(); self.assertTrue(issuing.wait(3))
-                second.start(); self.assertTrue(waiting.wait(2))
+                first.start(); self.assertTrue(issuing.wait(10), 'first run did not reach issuance')
+                second.start(); self.assertTrue(waiting.wait(10), 'second run did not wait for the lock')
                 self.controller.run.assert_called_once()
+                self.assertFalse(any(event.is_set() for event in finished))
                 release.set()
-                first.join(3); second.join(3)
+                for event in finished:
+                    self.assertTrue(event.wait(10), 'renewal run did not finish')
             finally:
                 release.set()
-                first.join(3)
-                if second.ident is not None: second.join(3)
+                first.join(10)
+                if second.ident is not None: second.join(10)
         self.assertFalse(first.is_alive() or second.is_alive())
         self.assertFalse(errors, errors)
+        clock.sleep.assert_called_once()
         self.assertEqual(results, [0, 0])
         self.assertEqual(self.controller.run.call_count, 2)
         self.assertEqual([call.args[0][0] for call in self.controller.invoke_acme.call_args_list], ['--renew', '--deploy'])

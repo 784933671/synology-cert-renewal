@@ -128,12 +128,33 @@ jobs:
         run: |
           mkdir -p reports
           docker build --pull --no-cache --file web/Dockerfile --tag synology-cert-web:security-ci web
+      - name: 下载并校验 Trivy 官方发布包
+        id: trivy-install
+        timeout-minutes: 6
+        env:
+          TRIVY_VERSION: 0.76.1
+          TRIVY_SHA256: c7cbe3137fb8a48a17574bede3dd6beb16742d1e9772929940fc90082c39d9c0
+        run: |
+          trivy_archive="$RUNNER_TEMP/trivy-$TRIVY_VERSION.tar.gz"
+          trivy_directory="$RUNNER_TEMP/trivy-$TRIVY_VERSION"
+          curl --proto '=https' --tlsv1.2 --fail --silent --show-error --location \
+            --retry 4 --retry-all-errors --retry-delay 3 --retry-max-time 180 \
+            --connect-timeout 15 --max-time 120 \
+            "https://github.com/aquasecurity/trivy/releases/download/v$TRIVY_VERSION/trivy_${TRIVY_VERSION}_Linux-64bit.tar.gz" \
+            --output "$trivy_archive"
+          printf '%s  %s\n' "$TRIVY_SHA256" "$trivy_archive" | sha256sum --check --strict
+          mkdir -m 700 "$trivy_directory"
+          tar -xzf "$trivy_archive" --no-same-owner -C "$trivy_directory" trivy
+          "$trivy_directory/trivy" --version
+          printf 'binary=%s\n' "$trivy_directory/trivy" >> "$GITHUB_OUTPUT"
       - name: 扫描最终镜像，未修复的高危和严重漏洞同样阻断
         uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
         env:
+          TRIVY_CMD: ${{ steps.trivy-install.outputs.binary }}
           TRIVY_IGNOREFILE: /dev/null
           TRIVY_IGNORE_UNFIXED: 'false'
         with:
+          skip-setup-trivy: 'true'
           version: v0.76.1
           scan-type: image
           image-ref: synology-cert-web:security-ci

@@ -1,7 +1,11 @@
 """安全 CI 的不可放宽约束；YAML 语法另由 actionlint 校验。"""
 from pathlib import Path
+import os
 import re
 import shlex
+import subprocess
+import tempfile
+import textwrap
 import unittest
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -55,6 +59,44 @@ class SecurityWorkflowTests(unittest.TestCase):
         self.assertIn('sha256sum --check --strict', self.workflow)
         self.assertIn('807da6498377ee5e0cf43a78091f46f12dc59a89', self.workflow)
         self.assertIn('ddbe1bcbd1a44a2623a2af167ebdc678669e6e2eb396742f2d1d28e02dc14220', self.workflow)
+
+    def test_trivy_install_uses_verified_official_release_and_bounded_retries(self):
+        installer = self.workflow.split('        id: trivy-install\n', 1)[1].split('      - name:', 1)[0]
+        self.assertIn('https://github.com/aquasecurity/trivy/releases/download/', installer)
+        self.assertNotIn('get.trivy.dev', self.workflow)
+        self.assertRegex(installer, r'(?m)^          TRIVY_SHA256: [0-9a-f]{64}$')
+        for option in ('--fail', '--retry 4', '--retry-all-errors', '--retry-max-time 180',
+                       '--connect-timeout 15', '--max-time 120', 'sha256sum --check --strict'):
+            self.assertIn(option, installer)
+        self.assertLess(installer.index('sha256sum --check --strict'), installer.index('tar -xzf'))
+        self.assertIn("skip-setup-trivy: 'true'", self.workflow)
+        self.assertIn('TRIVY_CMD: ${{ steps.trivy-install.outputs.binary }}', self.workflow)
+
+    def test_trivy_download_or_checksum_failure_never_extracts_or_publishes_binary(self):
+        installer = self.workflow.split('        id: trivy-install\n', 1)[1].split('      - name:', 1)[0]
+        script = textwrap.dedent(installer.split('        run: |\n', 1)[1])
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            commands = root / 'bin'
+            commands.mkdir()
+            for name, content in {
+                'curl': '#!/bin/sh\nexit "$CURL_STATUS"\n',
+                'sha256sum': '#!/bin/sh\ncat >/dev/null\nexit "$SHA_STATUS"\n',
+                'tar': '#!/bin/sh\ntouch "$RUNNER_TEMP/extracted"\nexit 99\n',
+            }.items():
+                path = commands / name
+                path.write_text(content)
+                path.chmod(0o700)
+            for download_status, checksum_status in (('6', '0'), ('0', '1')):
+                with self.subTest(download=download_status, checksum=checksum_status):
+                    environment = dict(os.environ, PATH=str(commands) + os.pathsep + os.environ.get('PATH', ''),
+                        RUNNER_TEMP=str(root), TRIVY_VERSION='0.76.1', TRIVY_SHA256='0' * 64,
+                        GITHUB_OUTPUT=str(root / 'outputs'), CURL_STATUS=download_status, SHA_STATUS=checksum_status)
+                    result = subprocess.run(['bash', '-euo', 'pipefail', '-c', script], env=environment,
+                                            cwd=root, capture_output=True, text=True, timeout=5)
+                    self.assertNotEqual(result.returncode, 0)
+                    self.assertFalse((root / 'extracted').exists())
+                    self.assertFalse((root / 'outputs').exists())
 
     def test_dependabot_covers_every_ecosystem_weekly_without_automatic_merge(self):
         config = (ROOT / '.github/dependabot.yml').read_text()
