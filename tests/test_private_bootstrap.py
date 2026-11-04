@@ -44,6 +44,9 @@ def archive(path, files=FILES, extra=None):
 
 class PrivateBootstrapTests(unittest.TestCase):
     def setUp(self):
+        # 单测直接调用安装器时也采用正式入口的私有权限掩码。
+        previous_umask = os.umask(0o077)
+        self.addCleanup(os.umask, previous_umask)
         temporary = tempfile.TemporaryDirectory()
         self.addCleanup(temporary.cleanup)
         self.root = Path(temporary.name).resolve()
@@ -74,6 +77,31 @@ class PrivateBootstrapTests(unittest.TestCase):
             self.assertEqual((source / name).read_bytes(), data)
             self.assertEqual((source / name).stat().st_mode & 0o777, 0o600)
 
+    def test_main_secures_nested_cache_under_permissive_inherited_umask(self):
+        files = dict(FILES, **{'web/frontend/tests/fixtures/dependencies/probe.ts': b'export {}\n'})
+        self.client.manifest.return_value = manifest(files)
+        self.client.archive.side_effect = lambda sha, path: archive(path, files)
+        for inherited_umask in (0o022, 0o000):
+            with self.subTest(umask=oct(inherited_umask)):
+                installer = boot.Installer(self.client, self.root / ('mask-' + str(inherited_umask)), self.install_state)
+
+                def verify_cache():
+                    with installer.locked():
+                        source = installer.source()
+                        self.assertEqual(installer.source(), source)
+                        for path in [source] + list(source.rglob('*')):
+                            self.assertEqual(path.stat().st_mode & 0o777, 0o700 if path.is_dir() else 0o600)
+                    return 0
+
+                os.umask(inherited_umask)
+                with patch.object(boot.sys, 'argv', ['bootstrap-private', '--public']), \
+                     patch.object(boot, 'GitHub', return_value=self.client), \
+                     patch.object(boot, 'Installer', return_value=installer), \
+                     patch.object(installer, 'run', side_effect=verify_cache) as run:
+                    self.assertEqual(boot.main(), 0)
+                    run.assert_called_once_with()
+                self.assertEqual(os.umask(0o077), 0o077)
+
     def test_interrupted_install_reuses_same_source_even_if_main_moves(self):
         first = self.source()
         self.client.revision.side_effect = AssertionError('must not fetch new version')
@@ -84,6 +112,19 @@ class PrivateBootstrapTests(unittest.TestCase):
         source = self.source()
         (source / 'setup.sh').write_text('malicious')
         with self.assertRaises(boot.BootstrapError): self.source()
+
+    def test_cache_with_widened_directory_or_file_permissions_is_rejected(self):
+        source = self.source()
+        for relative in ('.', 'web', 'setup.sh', 'web/setup.py'):
+            with self.subTest(path=relative):
+                path = source / relative
+                original_mode = path.stat().st_mode & 0o777
+                try:
+                    path.chmod(0o755 if path.is_dir() else 0o644)
+                    with self.assertRaises(boot.BootstrapError): self.source()
+                finally:
+                    path.chmod(original_mode)
+        self.assertEqual(self.source(), source)
 
     def test_missing_or_extra_cached_file_is_rejected(self):
         source = self.source()
