@@ -39,14 +39,18 @@ ALLOWED_ASSETS = frozenset({".js", ".css", ".svg", ".png", ".jpg", ".jpeg", ".we
 
 
 class ApiError(Exception):
-    def __init__(self, status, code, message):
+    def __init__(self, status, code, message, retry_after=None):
         self.status, self.code, self.message = status, code, message
+        self.retry_after = retry_after
 
 
-def error_response(status, code, message):
-    response = JSONResponse({"error": {"code": code, "message": message}}, status_code=status)
+def error_response(status, code, message, retry_after=None):
+    error = {"code": code, "message": message}
+    if retry_after is not None:
+        error['retry_after'] = retry_after
+    response = JSONResponse({"error": error}, status_code=status)
     if status == 429:
-        response.headers["Retry-After"] = "900"
+        response.headers["Retry-After"] = str(retry_after if retry_after is not None else 900)
     return response
 
 
@@ -71,8 +75,8 @@ async def json_body(request):
 
 
 class SecurityBoundary:
-    def __init__(self, app, config):
-        self.app, self.config = app, config
+    def __init__(self, app, config, store):
+        self.app, self.config, self.store = app, config, store
 
     async def __call__(self, scope, receive, send):
         if scope["type"] != "http":
@@ -102,7 +106,7 @@ class SecurityBoundary:
             await self.handle(scope, receive, secure_send)
         except ApiError as error:
             if not started:
-                await error_response(error.status, error.code, error.message)(scope, receive, secure_send)
+                await error_response(error.status, error.code, error.message, error.retry_after)(scope, receive, secure_send)
         except asyncio.TimeoutError:
             if not started:
                 await error_response(503, "timeout", "操作超时，请稍后重试")(scope, receive, secure_send)
@@ -153,6 +157,14 @@ class SecurityBoundary:
         length = request_headers.get(b"content-length")
         if length is not None and (not length.isdecimal() or int(length) > BODY_LIMIT):
             raise ApiError(413, "body_too_large", "请求内容过大")
+
+        if path.startswith('/api/'):
+            token = Request(scope).cookies.get(COOKIE, '')
+            limited = await run_in_threadpool(self.store.check_abuse, peer[0], token, method, path)
+            if limited:
+                message = ('当前 IP 已被临时限制，请稍后重试或在接口防护页面验证解封'
+                           if limited.code == 'ip_temporarily_blocked' else '接口请求过于频繁，请稍后重试')
+                raise ApiError(429, limited.code, message, limited.retry_after)
 
         async def read_body():
             chunks, size = [], 0
@@ -208,7 +220,7 @@ def create_app(config=None, store=None, bridge=None):
 
     @app.exception_handler(ApiError)
     async def api_error(_request, error):
-        return error_response(error.status, error.code, error.message)
+        return error_response(error.status, error.code, error.message, error.retry_after)
 
     @app.exception_handler(MfaError)
     async def mfa_error(_request, error):
@@ -231,7 +243,7 @@ def create_app(config=None, store=None, bridge=None):
 
     async def session(request, write=False, allow_change=False):
         token = request.cookies.get(COOKIE, "")
-        polling = request.method == "GET" and (request.url.path in ("/api/status", "/api/security", "/api/health", "/api/monitor", "/api/runs", "/api/sessions", "/api/security-alerts", "/api/stepup/challenge")
+        polling = request.method == "GET" and (request.url.path in ("/api/status", "/api/security", "/api/health", "/api/monitor", "/api/runs", "/api/sessions", "/api/security-alerts", "/api/stepup/challenge", "/api/abuse", "/api/abuse/blocks")
                                                 or request.url.path.startswith("/api/runs/"))
         current = await run_in_threadpool(store.session, token, not polling)
         if not current:
@@ -498,6 +510,34 @@ def create_app(config=None, store=None, bridge=None):
         await session(request)
         return await run_in_threadpool(store.alerts_list, request.cookies.get(COOKIE, ''))
 
+    @app.get('/api/abuse')
+    async def abuse_settings(request: Request):
+        await session(request)
+        return await run_in_threadpool(store.abuse_settings)
+
+    @app.get('/api/abuse/blocks')
+    async def abuse_blocks(request: Request):
+        await session(request)
+        return await run_in_threadpool(store.abuse_blocks, request.client.host)
+
+    @app.put('/api/abuse')
+    async def update_abuse(request: Request):
+        await session(request, write=True)
+        data = await json_body(request)
+        result = await run_in_threadpool(store.update_abuse, request.cookies.get(COOKIE, ''), request.client.host,
+                                        data, request.headers.get('x-step-up-token', ''))
+        await changed_security(request)
+        return result
+
+    @app.post('/api/abuse/unblock')
+    async def unblock_abuse(request: Request):
+        await session(request, write=True)
+        data = await json_body(request)
+        result = await run_in_threadpool(store.unblock_abuse, request.cookies.get(COOKIE, ''), request.client.host,
+                                        data, request.headers.get('x-step-up-token', ''))
+        await changed_security(request)
+        return result
+
     @app.get("/api/status")
     async def status(request: Request):
         await session(request)
@@ -652,6 +692,6 @@ def create_app(config=None, store=None, bridge=None):
             return response
         return FileResponse(target)
 
-    secured = SecurityBoundary(app, config)
+    secured = SecurityBoundary(app, config, store)
     secured.state = app.state
     return secured

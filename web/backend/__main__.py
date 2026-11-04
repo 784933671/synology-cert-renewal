@@ -8,12 +8,15 @@ from pathlib import Path
 
 from .auth import AuthStore
 from .config import Config, private_ipv4
+from .mfa import MfaError
 
 
 def main(argv=None):
     parser = argparse.ArgumentParser(description="证书管家局域网管理服务")
     subparsers = parser.add_subparsers(dest="command", required=True)
     subparsers.add_parser("serve")
+    rescue_parser = subparsers.add_parser('clear-abuse-blocks', help='清除 Web 接口临时封禁和额度计数')
+    rescue_parser.add_argument('--ip', help='仅解除指定 IPv4；省略时清除全部临时限制')
     for command in ("init", "reset-password"):
         command_parser = subparsers.add_parser(command)
         command_parser.add_argument("--username", default="admin")
@@ -27,6 +30,11 @@ def main(argv=None):
     args = parser.parse_args(argv)
     os.umask(0o077)
     try:
+        if args.command == 'clear-abuse-blocks':
+            store = AuthStore(Path(os.getenv('CERTWEB_DATA_DIR', '/data')))
+            count = store.clear_abuse_blocks(args.ip)
+            print(f'已解除 {count} 个临时 IP 封禁，并清除对应接口额度计数。')
+            return 0
         if args.command in ("enable-email-login", "disable-email-login"):
             store = AuthStore(Path(os.getenv("CERTWEB_DATA_DIR", "/data")))
             enabled = args.command == "enable-email-login"
@@ -64,7 +72,7 @@ def main(argv=None):
                     timeout_graceful_shutdown=15, h11_max_incomplete_event_size=16384,
                     ssl_certfile=cert, ssl_keyfile=key)
         return 0
-    except (ValueError, OSError):
+    except (ValueError, OSError, MfaError):
         print("操作未完成：请检查私有目录权限、管理员输入及局域网/HTTPS 配置。", file=sys.stderr)
         return 1
 

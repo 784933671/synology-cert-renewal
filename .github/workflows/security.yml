@@ -1,0 +1,156 @@
+name: 安全检查与回归
+
+on:
+  push:
+  pull_request:
+  schedule:
+    - cron: '23 2 * * 1'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: security-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  frontend:
+    name: 前端全量依赖审计与回归
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    defaults:
+      run:
+        working-directory: web/frontend
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: '22'
+          package-manager-cache: false
+      - name: 按锁文件安装全部依赖
+        id: frontend-install
+        run: npm ci --include=dev --include=optional --include=peer --no-audit --no-fund
+      - name: 审计全部依赖，阻断高危和严重漏洞
+        run: |
+          mkdir -p "$GITHUB_WORKSPACE/reports"
+          npm audit --include=dev --include=optional --include=peer --audit-level=high --json \
+            > "$GITHUB_WORKSPACE/reports/npm-audit.json"
+      - name: 前端交互回归
+        if: ${{ !cancelled() && steps.frontend-install.outcome == 'success' }}
+        run: npm test
+      - name: 类型检查与生产构建
+        if: ${{ !cancelled() && steps.frontend-install.outcome == 'success' }}
+        run: npm run build
+      - name: 保留前端审计报告
+        if: ${{ always() }}
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: npm-audit-report
+          path: reports/npm-audit.json
+          retention-days: 14
+          if-no-files-found: warn
+
+  python-audit:
+    name: Python 运行依赖审计
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
+        with:
+          python-version: '3.12'
+      - name: 校验哈希并安装固定版本扫描工具
+        run: |
+          python -m pip install --require-hashes --only-binary=:all: -r .github/requirements-security.txt
+      - name: 审计全部运行依赖，任何已知漏洞均阻断
+        run: |
+          mkdir -p reports
+          python -m pip_audit --strict --require-hashes --progress-spinner=off \
+            -r web/requirements.txt --format=json --output=reports/python-audit.json
+      - name: 保留 Python 审计报告
+        if: ${{ always() }}
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: python-audit-report
+          path: reports/python-audit.json
+          retention-days: 14
+          if-no-files-found: warn
+
+  python-tests:
+    name: Python 全量回归与 ACME 离线集成
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
+        with:
+          python-version: '3.12'
+      - name: 校验哈希并安装测试依赖
+        run: |
+          python -m pip install --require-hashes --only-binary=:all: -r web/requirements-test.txt
+      - name: 下载并校验固定版本 ACME 测试源码
+        env:
+          ACME_COMMIT: 807da6498377ee5e0cf43a78091f46f12dc59a89
+          ACME_SHA256: ddbe1bcbd1a44a2623a2af167ebdc678669e6e2eb396742f2d1d28e02dc14220
+        run: |
+          acme_archive="$RUNNER_TEMP/acme-source.tar.gz"
+          acme_source="$RUNNER_TEMP/acme-source"
+          curl --fail --silent --show-error --location --retry 3 --connect-timeout 15 --max-time 120 \
+            "https://codeload.github.com/acmesh-official/acme.sh/tar.gz/$ACME_COMMIT" --output "$acme_archive"
+          printf '%s  %s\n' "$ACME_SHA256" "$acme_archive" | sha256sum --check --strict
+          mkdir -m 700 "$acme_source"
+          tar -xzf "$acme_archive" --strip-components=1 --no-same-owner -C "$acme_source"
+          test -f "$acme_source/acme.sh"
+          printf 'ACME_TEST_SOURCE=%s\n' "$acme_source" >> "$GITHUB_ENV"
+      - name: 全量测试，包含真实 ACME 客户端离线集成
+        run: python -m unittest discover -s tests -p 'test_*.py'
+
+  container-audit:
+    name: 最终容器镜像漏洞审计
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: 从当前源码构建最终运行镜像
+        run: |
+          mkdir -p reports
+          docker build --pull --no-cache --file web/Dockerfile --tag synology-cert-web:security-ci web
+      - name: 扫描最终镜像，未修复的高危和严重漏洞同样阻断
+        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
+        env:
+          TRIVY_IGNOREFILE: /dev/null
+          TRIVY_IGNORE_UNFIXED: 'false'
+        with:
+          version: v0.76.1
+          scan-type: image
+          image-ref: synology-cert-web:security-ci
+          scanners: vuln
+          vuln-type: os,library
+          severity: HIGH,CRITICAL
+          ignore-unfixed: false
+          exit-code: '1'
+          format: json
+          output: reports/trivy-image.json
+          timeout: 10m0s
+          cache: false
+      - name: 保留最终镜像审计报告
+        if: ${{ always() }}
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: container-audit-report
+          path: reports/trivy-image.json
+          retention-days: 14
+          if-no-files-found: warn

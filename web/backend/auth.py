@@ -12,6 +12,7 @@ import time
 from contextlib import contextmanager
 from pathlib import Path
 
+from .abuse import AbuseMixin
 from .mfa import EmailLoginMixin, MfaError, masked_email
 from .security import SecurityMixin
 
@@ -52,7 +53,7 @@ def token_hash(value):
     return hashlib.sha256(value.encode("utf-8")).hexdigest()
 
 
-class AuthStore(SecurityMixin, EmailLoginMixin):
+class AuthStore(AbuseMixin, SecurityMixin, EmailLoginMixin):
     def __init__(self, directory: Path, clock=time.time):
         self.clock = clock
         self.lock = threading.RLock()
@@ -86,6 +87,7 @@ class AuthStore(SecurityMixin, EmailLoginMixin):
             """)
             self._email_schema(connection)
             self._security_schema(connection)
+            self._abuse_schema(connection)
         self.dummy_hash = password_hash(secrets.token_urlsafe(32))
 
     @contextmanager

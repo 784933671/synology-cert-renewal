@@ -26,6 +26,8 @@ OPERATIONS = {
     'password.change': '修改管理员登录密码',
     'sessions.revoke': '撤销指定登录会话',
     'sessions.revoke_others': '退出其他登录设备',
+    'abuse.update': '修改接口防护额度与临时封禁设置',
+    'abuse.unblock': '解除来源 IP 的临时封禁',
 }
 SECURITY_EVENTS = {
     'new_login': '新的登录来源',

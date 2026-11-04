@@ -17,6 +17,7 @@ import SecurityView from './views/SecurityView.vue'
 import AccountView from './views/AccountView.vue'
 import HealthView from './views/HealthView.vue'
 import RunsView from './views/RunsView.vue'
+import AbuseView from './views/AbuseView.vue'
 const nonce = document.querySelector<HTMLMetaElement>('meta[name="csp-nonce"]')?.content || ''
 const theme = {
   token: {
@@ -39,6 +40,7 @@ const pages: Page[] = [
   'audit',
   'security',
   'account',
+  'abuse',
 ]
 const fromHash = () => {
   const value = location.hash.slice(1) as Page
@@ -103,7 +105,7 @@ watch(
   [page, session],
   ([value, currentSession]) => {
     window.scrollTo(0, 0)
-    document.title = currentSession ? `${{ overview: '运行概览', health: '运行健康', runs: '执行记录', certificate: '证书管理', renewal: '续期计划', notifications: '邮件通知', failures: '失败记录', audit: '操作审计', security: '访问安全', account: '账户设置' }[value]} · 证书管家` : '登录 · 证书管家'
+    document.title = currentSession ? `${{ overview: '运行概览', health: '运行健康', runs: '执行记录', certificate: '证书管理', renewal: '续期计划', notifications: '邮件通知', failures: '失败记录', audit: '操作审计', security: '访问安全', account: '账户设置', abuse: '接口防护' }[value]} · 证书管家` : '登录 · 证书管家'
   },
   { immediate: true },
 )
@@ -150,6 +152,7 @@ onUnmounted(() => {
       @dirty="dirty = $event"
       @busy="working = $event"
     />
+    <AbuseView v-else-if="page === 'abuse'" :key="session.csrf_token" @dirty="dirty = $event" @busy="working = $event" />
     <AccountView
       v-else
       :session="session"

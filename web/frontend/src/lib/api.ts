@@ -1,5 +1,5 @@
 export class ApiError extends Error {
-  constructor(message: string, public status = 0, public code = '') {
+  constructor(message: string, public status = 0, public code = '', public retryAfter = 0) {
     super(message)
     this.name = 'ApiError'
   }
@@ -24,7 +24,11 @@ export function onStepUpRequired(callback: StepUpHandler) {
   return () => { if (stepUpHandler === callback) stepUpHandler = undefined }
 }
 export function errorText(error: unknown) {
-  return error instanceof ApiError ? error.message : '操作未完成，请稍后重试。'
+  if (!(error instanceof ApiError)) return '操作未完成，请稍后重试。'
+  return error.status === 429 && error.retryAfter > 0 ? `${error.message} 请在 ${error.retryAfter} 秒后重试。` : error.message
+}
+export function isUnknownResult(error: unknown) {
+  return !(error instanceof ApiError) || !error.status || error.status >= 500 || error.code === 'invalid_response'
 }
 export function isAborted(error: unknown) {
   return error instanceof DOMException && error.name === 'AbortError'
@@ -65,7 +69,8 @@ export async function api<T>(path: string, options: {
           if (response.status === 401 && !preLogin && path !== '/api/session') authFailure?.('expired')
           if (data?.error?.code === 'password_change_required') authFailure?.('password')
         }
-        throw new ApiError(typeof data?.error?.message === 'string' ? data.error.message : '请求未完成，请稍后重试。', response.status, data?.error?.code || '')
+        const retryAfter = Number(data?.error?.retry_after ?? response.headers.get('Retry-After'))
+        throw new ApiError(typeof data?.error?.message === 'string' ? data.error.message : '请求未完成，请稍后重试。', response.status, data?.error?.code || '', Number.isFinite(retryAfter) ? Math.max(0, Math.ceil(retryAfter)) : 0)
       }
       return data as T
     } catch (error) {

@@ -169,6 +169,7 @@ export type Page =
   | 'audit'
   | 'security'
   | 'account'
+  | 'abuse'
 export type SettingsPage = 'certificate' | 'renewal' | 'notifications'
 
 export type HealthState = 'ok' | 'warning' | 'error' | 'unknown'
@@ -273,4 +274,20 @@ export interface SecurityAlert {
   device: SecurityDevice
   status: 'pending' | 'sending' | 'sent' | 'failed'
   attempts: number
+}
+
+export interface AbuseLimits {
+  ip_requests_per_minute: number
+  session_requests_per_minute: number
+  block_after_violations: number
+  block_seconds: number
+}
+export interface AbusePolicy { revision: string; limits: AbuseLimits }
+export interface AbuseBlock {
+  ip: string
+  blocked_at: string
+  expires_at: string
+  retry_after: number
+  reason: string
+  current: boolean
 }

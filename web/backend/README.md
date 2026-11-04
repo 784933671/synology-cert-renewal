@@ -50,6 +50,16 @@ python -m web.backend reset-password --username admin
 
 ## 本机验证
 
+接口防刷策略使用管理层 `auth.sqlite3` 中独立的 `abuse_policy`、`abuse_buckets`、`abuse_blocks` 表；迁移不修改已有用户、会话、登录限流或主机续期状态。`SecurityBoundary` 完成来源、HTTPS、Host、Origin 和正文长度检查后，在读取正文前对 `/api/` 计数。`/healthz` 与静态资源不参与计数；Unix socket 和 DSM 任务不经过这层。
+
+- `GET /api/abuse` 返回 `{revision,limits}`；`PUT /api/abuse` 使用相同结构进行版本校验。
+- `GET /api/abuse/blocks` 返回临时封禁列表；`POST /api/abuse/unblock` 只接收 `{ip}`。
+- 两个写接口的授权消费和数据库修改在同一事务中，要求邮箱二次验证，记录审计及安全配置提醒。所有读取仍要求完整登录；列表轮询不刷新闲置期限。
+- 429 返回 `error.code`（`rate_limited` 或 `ip_temporarily_blocked`）、正整数 `error.retry_after` 以及相同的 `Retry-After` 响应头。封禁无法绕过现有来源或认证限制。
+- 登录、会话、退出、改密、二次验证和接口防护路由保留独立恢复额度；固定列表见 `abuse.py`，未知路由不享受例外。普通计数桶最多 3072 个，恢复桶预留 1024 个，封禁最多 1024 个。
+
+私有容器终端可运行 `python -m web.backend clear-abuse-blocks [--ip IPv4]`。它仅清除接口临时计数与封禁，不触及原登录、验证码和续期保护。完整使用说明及默认值见 [接口防护说明](../README.md#接口防护与临时解封)。
+
 ```sh
 pip install --require-hashes -r web/requirements-test.txt
 python -m unittest discover -s tests -p 'test_web_api*.py' -v

@@ -22,6 +22,8 @@ OPERATIONS = {
     ('POST', '/api/password'): 'password.change',
     ('POST', '/api/sessions/revoke'): 'sessions.revoke',
     ('POST', '/api/sessions/revoke-others'): 'sessions.revoke_others',
+    ('PUT', '/api/abuse'): 'abuse.update',
+    ('POST', '/api/abuse/unblock'): 'abuse.unblock',
 }
 CODE_TTL = 300
 GRANT_TTL = 120

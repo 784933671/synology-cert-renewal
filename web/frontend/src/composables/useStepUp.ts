@@ -3,6 +3,7 @@ import { api, ApiError, errorText, isAborted, onStepUpRequired, type StepUpReque
 import type { StepUpChallenge } from '../types'
 
 const operations: Record<string, string> = {
+  '/api/abuse': '保存接口防护设置', '/api/abuse/unblock': '解除 IP 临时封禁',
   '/api/settings': '保存证书、续期或通知配置', '/api/security': '修改访问安全设置',
   '/api/password': '修改管理员密码', '/api/monitor': '修改预警配置', '/api/actions/renew': '立即申请并替换证书',
   '/api/sessions/revoke': '撤销登录会话', '/api/sessions/revoke-others': '退出其他登录会话',

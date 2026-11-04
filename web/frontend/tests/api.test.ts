@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, it, vi } from 'vitest'
-import { api, ApiError, onAuthFailure, setCsrf } from '../src/lib/api'
+import { api, ApiError, errorText, onAuthFailure, setCsrf } from '../src/lib/api'
 afterEach(() => {
   setCsrf('')
   onAuthFailure(undefined)
@@ -104,4 +104,15 @@ describe('同源会话请求', () => {
     await rejected
     expect(notify).not.toHaveBeenCalled()
   })
+  it.each(['rate_limited', 'ip_temporarily_blocked'])('429 %s显示等待时间，保留会话且不自动重试', async code => {
+    const notify = vi.fn(), fetcher = vi.fn().mockResolvedValue(new Response(JSON.stringify({ error: { code, message: '请求过于频繁', retry_after: 12 } }), { status: 429, headers: { 'Retry-After': '12' } }))
+    onAuthFailure(notify); vi.stubGlobal('fetch', fetcher)
+    let failure: unknown
+    try { await api('/api/abuse') } catch (cause) { failure = cause }
+    expect(failure).toMatchObject({ status: 429, code, retryAfter: 12 })
+    expect(errorText(failure)).toBe('请求过于频繁 请在 12 秒后重试。')
+    expect(notify).not.toHaveBeenCalled()
+    expect(fetcher).toHaveBeenCalledOnce()
+  })
+
 })

@@ -81,6 +81,8 @@ class SecurityMailTests(unittest.TestCase):
 
     def test_all_supported_operations_have_fixed_human_readable_names(self):
         self.assertEqual(login_mail.OPERATIONS['password.change'], '修改管理员登录密码')
+        self.assertEqual(login_mail.OPERATIONS['abuse.update'], '修改接口防护额度与临时封禁设置')
+        self.assertEqual(login_mail.OPERATIONS['abuse.unblock'], '解除来源 IP 的临时封禁')
         for operation, label in login_mail.OPERATIONS.items():
             with self.subTest(operation=operation):
                 self.now += 901
