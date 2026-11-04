@@ -75,7 +75,7 @@ class NetworkBoundaryTests(unittest.TestCase):
 
     def test_dsm_hook_precedes_existing_accept_and_removes_legacy_jump(self):
         self.firewall.rules[4] += [['-A','INPUT_FIREWALL','-j','ACCEPT'],['-N','DEFAULT_INPUT'],
-                                  ['-A','INPUT','-j','DEFAULT_INPUT'],['-A','DEFAULT_INPUT','-p','tcp','-j','CERTWEB_INPUT']]
+                                  ['-A','INPUT','-j','DEFAULT_INPUT'],self.guard.desired(4, 'DEFAULT_INPUT')[1]]
         self.guard.install()
         self.assertTrue(self.guard.valid())
         hook=[r for r in self.firewall.rules[4] if r[:2]==['-A','INPUT_FIREWALL']]
@@ -404,6 +404,280 @@ class DeploymentRecoveryTests(unittest.TestCase):
         self.service.phase = 'policy'
         with patch('builtins.print'):
             self.assertTrue(self.service.report('stopping', '固定安全摘要'))
+
+
+class FirewallEvidenceTests(unittest.TestCase):
+    def setUp(self):
+        temporary = tempfile.TemporaryDirectory(); self.addCleanup(temporary.cleanup)
+        self.home = Path(temporary.name)
+        config = {'home': str(self.home), 'native_home': str(self.home / 'native'), 'bind': '10.10.10.37',
+                  'networks': ['10.10.10.0/24'], 'denied': ['10.10.10.1'], 'port': 18443,
+                  'origin': 'https://nas.example.com:18443', 'hostname': 'nas.example.com'}
+        self.service = deployment.Deployment(config, self.home / 'deployment.json')
+        self.service.report = Mock(return_value=True)
+        self.service.stop_container = Mock()
+        self.service.guard.install = Mock()
+        self.service.guard.repair_live = Mock(return_value=False)
+        self.service.compose = Mock()
+        self.diagnostic = {'version': 1, 'reason': 'jump_reordered', 'family': 4, 'hook': 'INPUT_FIREWALL',
+                           'jump_position': 1, 'reference_count': 1, 'chain_exists': True,
+                           'fingerprints': {key: 'a' * 64 for key in ('entry', 'hook', 'owned_chain', 'references', 'expected')}}
+        def invalid():
+            self.service.guard.last_diagnostic = copy.deepcopy(self.diagnostic)
+            return False
+        self.service.guard.valid = Mock(side_effect=invalid)
+        for patcher in (patch('web.deployment.read_policy', return_value={'mode': 'lan', 'revision': 'a' * 32}),
+                        patch('web.deployment.write_applied')):
+            patcher.start(); self.addCleanup(patcher.stop)
+
+    def evidence(self):
+        return json.loads((self.home / 'firewall-events.json').read_text())['items']
+
+    def test_snapshot_saved_after_stop_before_repair_without_raw_rules(self):
+        events = []
+        def stop():
+            self.assertFalse((self.home / 'firewall-events.json').exists())
+            events.append('stop')
+        def repair():
+            self.assertEqual(self.evidence()[0]['diagnostic'], self.diagnostic)
+            self.service.guard.last_diagnostic = None
+            events.append('repair')
+        self.service.stop_container.side_effect = stop
+        self.service.guard.install.side_effect = repair
+        self.service.apply_access_policy()
+        self.assertEqual(events, ['stop', 'repair'])
+        self.assertEqual((self.home / 'firewall-events.json').stat().st_mode & 0o777, 0o600)
+        self.assertEqual(set(self.evidence()[0]), {'at', 'diagnostic'})
+        self.assertIn('IPv4：管理端口的保护跳转顺序变化', self.service.report.call_args.args[1])
+        self.assertNotIn('10.10.10.', (self.home / 'firewall-events.json').read_text())
+
+    def test_stop_failure_retains_evidence_and_never_repairs(self):
+        self.service.stop_container.side_effect = RuntimeError('stop failed')
+        with self.assertRaises(RuntimeError):
+            self.service.apply_access_policy()
+        self.service.guard.install.assert_not_called()
+        self.assertEqual(self.evidence()[0]['diagnostic'], self.diagnostic)
+
+    def test_query_error_keeps_failure_semantics_and_records_after_stop(self):
+        self.diagnostic.update(reason='query_failed', family=6, hook='unknown', jump_position=-1,
+                               reference_count=0, chain_exists=False)
+        def failed_query():
+            self.service.guard.last_diagnostic = copy.deepcopy(self.diagnostic)
+            raise GuardError('PRIVATE QUERY STDERR')
+        self.service.guard.valid.side_effect = failed_query
+        self.service.stop_container.side_effect = lambda: self.assertFalse((self.home / 'firewall-events.json').exists())
+        self.service.reconcile()
+        self.service.stop_container.assert_called_once()
+        self.service.guard.install.assert_not_called()
+        self.service.compose.assert_not_called()
+        self.assertEqual(self.evidence()[0]['diagnostic'], self.diagnostic)
+        messages = ' '.join(call.args[1] for call in self.service.report.call_args_list)
+        self.assertIn('IPv6：无法读取防火墙规则', messages)
+        self.assertNotIn('防火墙规则变化', messages)
+        self.assertNotIn('PRIVATE QUERY STDERR', messages)
+
+    def test_stale_diagnostic_is_cleared_before_mocked_check(self):
+        self.service.guard.last_diagnostic = copy.deepcopy(self.diagnostic)
+        self.service.guard.valid = Mock(return_value=False)
+        self.service.apply_access_policy()
+        self.assertFalse((self.home / 'firewall-events.json').exists())
+        self.service.stop_container.assert_called_once()
+        self.service.guard.install.assert_called_once()
+        self.assertNotIn('IPv4', self.service.report.call_args.args[1])
+
+    def test_evidence_timestamp_failure_cannot_prevent_stop_or_repair(self):
+        with patch('web.deployment.health_monitor.utc', side_effect=OverflowError('clock invalid')):
+            self.service.apply_access_policy()
+        self.service.stop_container.assert_called_once()
+        self.service.guard.install.assert_called_once()
+        self.assertFalse((self.home / 'firewall-events.json').exists())
+
+    def test_invalid_diagnostic_cannot_save_or_log_untrusted_fields(self):
+        variants = [dict(self.diagnostic, raw_rules='PRIVATE RULE'),
+                    dict(self.diagnostic, reason='PRIVATE REASON'),
+                    dict(self.diagnostic, fingerprints=dict(self.diagnostic['fingerprints'], entry='PRIVATE RULE')),
+                    dict(self.diagnostic, family=True), dict(self.diagnostic, reference_count=-1)]
+        for value in variants:
+            with self.subTest(value=value):
+                self.diagnostic = value
+                self.service.apply_access_policy()
+                self.assertFalse((self.home / 'firewall-events.json').exists())
+        self.assertEqual(self.service.stop_container.call_count, len(variants))
+        self.assertEqual(self.service.guard.install.call_count, len(variants))
+        self.assertNotIn('PRIVATE', str(self.service.report.call_args_list))
+
+    def test_archive_is_bounded_to_latest_thirty_two(self):
+        for index in range(35):
+            self.diagnostic['jump_position'] = index
+            self.service.apply_access_policy()
+        items = self.evidence()
+        self.assertEqual(len(items), 32)
+        self.assertEqual([item['diagnostic']['jump_position'] for item in items], list(range(34, 2, -1)))
+
+    def test_busy_archive_lock_never_blocks_stop_or_repair(self):
+        with deployment.health_monitor.locked(self.home / 'firewall-events.lock', os.geteuid()):
+            self.service.apply_access_policy()
+        self.service.stop_container.assert_called_once()
+        self.service.guard.install.assert_called_once()
+        self.assertFalse((self.home / 'firewall-events.json').exists())
+
+    def test_corrupt_archive_and_write_errors_never_block_stop_or_repair(self):
+        path = self.home / 'firewall-events.json'
+        path.write_text('{bad'); path.chmod(0o600)
+        self.service.apply_access_policy()
+        self.assertEqual(path.read_text(), '{bad')
+        path.unlink()
+        with patch('web.deployment.health_monitor.write_json', side_effect=OSError('disk full')):
+            self.service.apply_access_policy()
+        self.assertEqual(self.service.stop_container.call_count, 2)
+        self.assertEqual(self.service.guard.install.call_count, 2)
+
+    def test_symlink_archive_is_not_followed_and_does_not_prevent_safety(self):
+        target = self.home / 'unrelated'; target.write_text('untouched')
+        (self.home / 'firewall-events.json').symlink_to(target)
+        self.service.apply_access_policy()
+        self.assertEqual(target.read_text(), 'untouched')
+        self.service.stop_container.assert_called_once()
+        self.service.guard.install.assert_called_once()
+
+    def test_live_repair_keeps_running_state_and_records_original_evidence(self):
+        self.service.started = True; self.service.ready_since = 45
+        generation = ('a' * 64, '2026-11-03T08:00:00+00:00')
+        self.service.startup_requested_generation = self.service.startup_generation = generation
+        self.service.guard.repair_live.return_value = True
+        self.service.apply_access_policy()
+        self.service.guard.repair_live.assert_called_once()
+        self.service.stop_container.assert_not_called()
+        self.service.guard.install.assert_not_called()
+        self.assertTrue(self.service.started)
+        self.assertEqual(self.service.ready_since, 45)
+        self.assertEqual(self.service.startup_requested_generation, generation)
+        self.assertEqual(self.service.startup_generation, generation)
+        self.assertEqual(self.evidence()[0]['diagnostic'], self.diagnostic)
+        self.assertEqual(self.evidence()[0]['repair'], 'succeeded')
+        self.assertEqual(self.service.report.call_args.args[0], 'repaired')
+
+    def test_partial_live_failure_stops_before_cold_repair_and_retains_both_causes(self):
+        self.service.started = True
+        events = []
+        repair_diagnostic = dict(self.diagnostic, reason='query_failed', family=6, hook='unknown')
+        def partial():
+            events.append('live')
+            self.service.guard.last_diagnostic = repair_diagnostic
+            raise GuardError('PRIVATE PARTIAL FAILURE')
+        def stop():
+            events.append('stop')
+            self.assertFalse((self.home / 'firewall-events.json').exists())
+        def cold():
+            events.append('cold')
+            self.assertEqual(self.evidence()[0]['diagnostic'], repair_diagnostic)
+            self.assertEqual(self.evidence()[1]['diagnostic'], self.diagnostic)
+            self.assertEqual(self.evidence()[1]['repair'], 'failed')
+        self.service.guard.repair_live.side_effect = partial
+        self.service.stop_container.side_effect = stop
+        self.service.guard.install.side_effect = cold
+        self.service.apply_access_policy()
+        self.assertEqual(events, ['live', 'stop', 'cold'])
+        messages = str(self.service.report.call_args_list)
+        self.assertIn('原子修复未确认', messages)
+        self.assertIn('IPv6：无法读取防火墙规则', messages)
+        self.assertNotIn('PRIVATE PARTIAL FAILURE', messages)
+        self.assertNotIn("call('repaired'", messages)
+
+    def test_uncertain_live_return_requires_stop_and_cold_repair(self):
+        self.service.started = True
+        for result in (False, None, 1):
+            with self.subTest(result=result):
+                self.service.guard.repair_live.return_value = result
+                self.service.apply_access_policy()
+                self.assertEqual(self.evidence()[0]['repair'], 'failed')
+        self.assertEqual(self.service.stop_container.call_count, 3)
+        self.assertEqual(self.service.guard.install.call_count, 3)
+        self.assertNotIn('repaired', [call.args[0] for call in self.service.report.call_args_list])
+
+    def test_unknown_entry_or_query_cannot_attempt_live_repair(self):
+        self.service.started = True
+        for reason in ('entry_order_unknown', 'query_failed'):
+            self.diagnostic['reason'] = reason
+            self.service.apply_access_policy()
+        self.service.guard.repair_live.assert_not_called()
+        self.assertEqual(self.service.stop_container.call_count, 2)
+
+    def test_live_success_archive_failure_does_not_restart_container(self):
+        self.service.started = True; self.service.ready_since = 15
+        self.service.guard.repair_live.return_value = True
+        with patch('web.deployment.health_monitor.write_json', side_effect=OSError('disk full')):
+            self.service.apply_access_policy()
+        self.service.stop_container.assert_not_called()
+        self.service.guard.install.assert_not_called()
+        self.assertTrue(self.service.started)
+        self.assertEqual(self.service.ready_since, 15)
+
+    def test_live_success_log_write_failure_preserves_existing_start_state(self):
+        self.service.started = True; self.service.ready_since = 25
+        self.service.guard.repair_live.return_value = True
+        self.service.report = deployment.Deployment.report.__get__(self.service)
+        with patch('web.deployment.private_json', side_effect=OSError('state write failed')), patch('builtins.print'):
+            self.service.apply_access_policy()
+        self.service.stop_container.assert_not_called()
+        self.assertTrue(self.service.started)
+        self.assertEqual(self.service.ready_since, 25)
+
+    def test_failed_live_and_cold_repair_never_claim_healthy_or_start(self):
+        self.service.started = True
+        self.service.guard.repair_live.side_effect = subprocess.TimeoutExpired('restore', 15)
+        self.service.guard.install.side_effect = GuardError('cold failed')
+        self.service.reconcile()
+        self.service.stop_container.assert_called()
+        self.service.compose.assert_not_called()
+        self.assertEqual(self.service.health['access'], 'error')
+        self.assertEqual(self.service.report.call_args.args[0], 'blocked')
+        self.assertNotIn('repaired', [call.args[0] for call in self.service.report.call_args_list])
+        self.assertEqual(self.evidence()[0]['repair'], 'failed')
+
+    def test_successful_reconcile_keeps_startup_generation_and_renewal_files(self):
+        for directory in ('data', 'tls', 'native/state'):
+            (self.home / directory).mkdir(parents=True)
+        (self.home / 'data/auth.sqlite3').write_bytes(b'configured')
+        (self.home / 'tls/current.cert').write_bytes(b'validated')
+        native_files = {'native/config.json': b'{"renew_before_days":2}',
+                        'native/state/web-preferences.json': b'{"adaptive_schedule":{"hour":3,"minute":18}}',
+                        'native/state/last-result.json': b'{"success":true}',
+                        'native/state/deploy-pending.json': b'pending unchanged'}
+        for name, value in native_files.items():
+            (self.home / name).write_bytes(value)
+        began = '2026-11-03T08:00:00+00:00'; identifier = 'c' * 64
+        generation = ('a' * 64, began)
+        self.service.started = self.service.startup_done = True
+        self.service.startup_requested_generation = self.service.startup_generation = generation
+        self.service.startup_container_generation = (identifier, began)
+        self.service.start_bridge = Mock(); self.service.bridge_ready = Mock(return_value=True)
+        self.service.container = Mock(return_value={'Id': identifier, 'State': {'Running': True, 'StartedAt': began}})
+        checks = [False, True, True]
+        def valid():
+            result = checks.pop(0)
+            self.service.guard.last_diagnostic = copy.deepcopy(self.diagnostic) if not result else None
+            return result
+        self.service.guard.valid.side_effect = valid
+        self.service.guard.repair_live.return_value = True
+        with deployment.health_monitor.locked(self.home / 'native/state/run.lock', os.geteuid()), \
+                patch('web.deployment.sync_tls', return_value=False), patch('web.deployment.subprocess.Popen') as spawn:
+            for _ in range(3):
+                self.service.reconcile(); self.service.start_startup_check()
+            spawn.assert_not_called()
+        self.service.guard.repair_live.assert_called_once()
+        self.service.stop_container.assert_not_called(); self.service.compose.assert_not_called()
+        self.assertEqual(self.service.startup_generation, generation)
+        self.assertEqual(self.service.startup_container_generation, (identifier, began))
+        self.assertTrue(self.service.startup_done)
+        for name, value in native_files.items():
+            self.assertEqual((self.home / name).read_bytes(), value)
+
+    def test_live_repair_log_is_categorized_as_recovery(self):
+        self.service.phase = 'policy'
+        self.service.record_event('repaired', '管理入口防火墙规则已原子修复并验证，管理容器保持运行。')
+        events = json.loads((self.home / 'deployment-events.json').read_text())['items']
+        self.assertEqual(events[0]['category'], 'recovery')
 
 
 class StartupStabilityTests(unittest.TestCase):

@@ -34,6 +34,35 @@ START_STABLE_SECONDS = 60
 STARTUP_CHECK_RETRY_SECONDS = 60
 SCHEDULE_SYNC_SECONDS = 60
 SCHEDULE_SYNC_TIMEOUT = 120
+FIREWALL_REASONS = {
+    'entry_order_unknown': 'DSM 防火墙入口顺序不符合预期',
+    'jump_missing': '管理端口的保护跳转缺失',
+    'jump_reordered': '管理端口的保护跳转顺序变化',
+    'reference_mismatch': '专用保护链的引用不符合预期',
+    'chain_mismatch': '专用保护链规则不符合预期',
+    'query_failed': '无法读取防火墙规则',
+}
+
+
+def firewall_diagnostic(value):
+    fields = {'version', 'reason', 'family', 'hook', 'jump_position', 'reference_count',
+              'chain_exists', 'fingerprints'}
+    if (not isinstance(value, dict) or set(value) != fields
+            or type(value['version']) is not int or value['version'] != 1
+            or not isinstance(value['reason'], str) or value['reason'] not in FIREWALL_REASONS
+            or type(value['family']) is not int or value['family'] not in (4, 6)
+            or not isinstance(value['hook'], str) or value['hook'] not in ('INPUT', 'INPUT_FIREWALL', 'unknown')
+            or type(value['jump_position']) is not int or not -1 <= value['jump_position'] <= 1000000
+            or type(value['reference_count']) is not int or not 0 <= value['reference_count'] <= 1000000
+            or type(value['chain_exists']) is not bool):
+        return None
+    fingerprints = value['fingerprints']
+    if (not isinstance(fingerprints, dict)
+            or set(fingerprints) != {'entry', 'hook', 'owned_chain', 'references', 'expected'}
+            or any(not isinstance(item, str) or not re.fullmatch(r'[0-9a-f]{64}', item)
+                   for item in fingerprints.values())):
+        return None
+    return dict(value, fingerprints=dict(fingerprints))
 
 
 def private_json(path, value):
@@ -207,7 +236,8 @@ class Deployment:
                     return
                 if items and (items[0].get('status'), items[0].get('stage'), items[0].get('message')) == (status, self.phase, message):
                     return
-                category = ('fault' if status == 'blocked' or (self.phase in ('docker', 'bridge', 'policy') and status in ('waiting', 'stopping'))
+                category = ('recovery' if self.phase == 'policy' and status == 'repaired'
+                            else 'fault' if status == 'blocked' or (self.phase in ('docker', 'bridge', 'policy') and status in ('waiting', 'stopping'))
                             else 'recovery' if status == 'running' and items and any(item.get('category') == 'fault' for item in items[:5])
                             else 'info')
                 try:
@@ -443,8 +473,47 @@ class Deployment:
         with os.fdopen(fd, 'a') as log:
             self.bridge = subprocess.Popen([sys.executable, '-I', str(Path(self.config['native_home']) / 'web/host_bridge.py'), '--home', self.config['native_home'], '--socket', str(self.home / 'bridge/certweb.sock'), '--task-id', str(self.config.get('task_id', 7)), '--uid', '10100', '--gid', '10100', '--parent-pid', str(os.getpid()), '--management-host', self.config['hostname'], '--access-policy', str(self.access_path)], env=self.env, stdin=subprocess.DEVNULL, stdout=log, stderr=log)
 
+    def take_firewall_failure(self):
+        diagnostic = firewall_diagnostic(getattr(self.guard, 'last_diagnostic', None))
+        self.guard.last_diagnostic = None
+        try:
+            return {'at': health_monitor.utc(), 'diagnostic': diagnostic} if diagnostic else None
+        except (OSError, ValueError, OverflowError):
+            return None
+
+    @staticmethod
+    def firewall_detail(event):
+        if event is None:
+            return ''
+        diagnostic = event['diagnostic']
+        return '（IPv{}：{}）'.format(diagnostic['family'], FIREWALL_REASONS[diagnostic['reason']])
+
+    def record_firewall_failure(self, event):
+        if event is None:
+            return
+        uid = os.geteuid()
+        try:
+            with health_monitor.locked(self.home / 'firewall-events.lock', uid):
+                path = self.home / 'firewall-events.json'
+                previous = health_monitor.read_json(path, {'version': 1, 'items': []}, uid, limit=64 * 1024)
+                if (not isinstance(previous, dict) or set(previous) != {'version', 'items'}
+                        or type(previous['version']) is not int or previous['version'] != 1 or not isinstance(previous['items'], list)
+                        or len(previous['items']) > 32):
+                    return
+                for item in previous['items']:
+                    if (not isinstance(item, dict) or set(item) not in ({'at', 'diagnostic'}, {'at', 'diagnostic', 'repair'})
+                            or not isinstance(item['at'], str) or len(item['at']) > 40
+                            or firewall_diagnostic(item['diagnostic']) is None
+                            or ('repair' in item and item['repair'] not in ('succeeded', 'failed'))):
+                        return
+                    health_monitor.timestamp(item['at'])
+                health_monitor.write_json(path, {'version': 1, 'items': [event] + previous['items'][:31]}, uid)
+        except (OSError, ValueError, TypeError, KeyError, OverflowError):
+            pass
+
     def apply_access_policy(self):
         self.phase = 'policy'
+        self.guard.last_diagnostic = None
         policy = read_policy(self.access_path)
         identity = (policy['mode'], policy['revision'])
         if self.last_policy is not None and self.last_policy != identity:
@@ -452,10 +521,33 @@ class Deployment:
             self.report('reconfiguring', '管理入口访问策略已变化，重新检查启动条件。')
         self.guard.access_mode = policy['mode']
         if not self.guard.valid():
-            self.ready_since = None
-            self.report('stopping', '检测到管理入口防火墙规则变化，正在停止管理容器后修复规则。')
-            self.stop_container()
-            self.guard.install()
+            failure = self.take_firewall_failure()
+            repaired, repair_failure = False, None
+            attempted = bool(self.started and failure and failure['diagnostic']['reason'] not in ('entry_order_unknown', 'query_failed'))
+            ready_before_repair = self.ready_since
+            if attempted:
+                self.report('repairing', '检测到管理入口防火墙规则变化' + self.firewall_detail(failure) + '，正在原子修复本服务规则。')
+                try:
+                    repaired = self.guard.repair_live() is True
+                except (OSError, ValueError, TypeError, KeyError, RuntimeError, GuardError, subprocess.TimeoutExpired):
+                    pass
+                repair_failure = self.take_firewall_failure()
+                failure['repair'] = 'succeeded' if repaired else 'failed'
+            if repaired:
+                self.record_firewall_failure(failure)
+                self.report('repaired', '管理入口防火墙规则已原子修复并验证，管理容器保持运行。')
+                self.ready_since = ready_before_repair
+            else:
+                self.ready_since = None
+                reason = '防火墙原子修复未确认' if attempted else '检测到管理入口防火墙规则变化'
+                self.report('stopping', reason + self.firewall_detail(repair_failure or failure) + '，正在停止管理容器后修复规则。')
+                try:
+                    self.stop_container()
+                finally:
+                    # 保留修复前证据；归档失败不能妨碍关闭不安全的入口。
+                    self.record_firewall_failure(failure)
+                    self.record_firewall_failure(repair_failure)
+                self.guard.install()
         write_applied(self.access_path, policy)
         self.last_policy = identity
         return policy
@@ -549,6 +641,7 @@ class Deployment:
             self.report('running', '管理服务运行中，访问模式：{}。'.format('仅内网' if policy['mode'] == 'lan' else '允许外网'))
         except (OSError, ValueError, TypeError, KeyError, RuntimeError, GuardError, subprocess.TimeoutExpired):
             self.ready_since = None
+            firewall_failure = self.take_firewall_failure() if self.phase == 'policy' else None
             key = {'policy': 'access', 'tls': 'tls', 'bridge': 'bridge'}.get(self.phase)
             if key:
                 self.health[key] = 'error'
@@ -556,13 +649,15 @@ class Deployment:
             labels = {'policy': '访问策略或防火墙检查失败', 'tls': 'HTTPS 材料检查失败',
                       'bridge': '群晖桥接检查失败', 'docker': 'Docker 状态检查失败',
                       'start': '管理容器启动失败'}
-            reason = labels.get(self.phase, '管理服务启动条件检查失败')
+            reason = labels.get(self.phase, '管理服务启动条件检查失败') + self.firewall_detail(firewall_failure)
             self.report('stopping', reason + '，正在停止管理容器。')
             stopped = True
             try:
                 self.stop_container()
             except (OSError, ValueError, TypeError, KeyError, RuntimeError, subprocess.TimeoutExpired):
                 stopped = False
+            finally:
+                self.record_firewall_failure(firewall_failure)
             self.report('blocked', reason + '，管理服务保持关闭，等待环境恢复稳定。' if stopped
                      else reason + '，且无法确认管理容器已关闭；请通过 NAS 检查。')
         finally:

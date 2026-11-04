@@ -21,6 +21,7 @@ Docker 运行前端和管理 API。证书签发、DSM 导入及通知继续使�
 - 管理入口使用 `https://ttxli.cn:18443`，两种模式都只绑定 NAS 的 `10.10.10.37`，只监听 IPv4；IPv6 的管理端口始终拒绝。
 - `lan` 模式仅允许 `10.10.10.0/24`，单独排除网关 `10.10.10.1`，避免公网转发经路由器 SNAT 后以网关来源进入。`public` 模式允许任意 IPv4 来源，包括网关。两种模式都要求登录。
 - 容器使用 host 网络，不创建 Docker 发布端口；NAS 原生监督进程维护只针对管理端口的专用链。DSM 会把针对内置 `INPUT` 的写操作重定向到较晚执行的 `DEFAULT_INPUT`，因此本项目把专用跳转置于 `INPUT_FIREWALL` 首条，并核验真实 `INPUT` 的第一条规则无条件跳入 `INPUT_FIREWALL`。只修改本服务的链与跳转，保留其他 DSM/Docker 规则；无法确认顺序时停止管理服务。普通 Linux 则直接使用 `INPUT` 首条。IPv6 的该管理端口单独拒绝，服务本身只监听指定 IPv4。
+- DSM 重载完成后可能移除手动加入的管理端口跳转。容器已运行且入口明确时，监督程序使用每个协议族一次 `iptables-restore --noflush` 原子更新本项目专用链和精确跳转，回读通过即可继续运行，不重启容器、不新增启动检查。事务不声明系统链或刷新整张表；活动重载、未知引用、命令失败及回读不一致仍停止管理容器。IPv4/IPv6 分别提交，不承诺任意外部规则写入都不会引发保护性停服。
 - API 按访问模式校验实际 TCP 来源；`public` 只放开 IPv4 来源限制，不关闭 HTTPS、登录、精确 Host、Origin、CSRF、会话和登录限流。两种模式均拒绝 `Forwarded`、`X-Forwarded-*`、`X-Real-IP`，不采用 HTTP 反向代理或 QuickConnect 转发方案。
 - `public` 模式不会创建路由器映射。需要公网访问时，将 TCP 18443 映射到 `10.10.10.37:18443`，并让公网域名解析到路由器的可达公网地址；`lan` 模式不提供公网来源访问。路由器、DNS 和客户端配置由用户管理。
 - NAS 本机通过自身 LAN 地址访问始终允许；管理员 SSH 隧道也属于受信管理路径。`lan` 模式仅 `/healthz` 额外允许真实回环来源，业务 API 不允许回环来源。
@@ -223,6 +224,8 @@ sudo docker ps --filter name=synology-cert-web
 ```
 
 启动与安全停服的固定中文摘要写入 `/usr/local/share/synology-cert-web/supervisor.log`；同目录 `deployment-state.json` 保存最新 `status`、`stage`、`message`。`stage` 可定位 `policy`（访问策略/防火墙）、`tls`（HTTPS 材料）、`bridge`（群晖桥接）、`docker`、`stability`（稳定等待）或 `start`（容器启动）等环节。检查失败时会尝试停止管理容器；无法确认停止时记录相应提示，需要通过 NAS 检查，不把它视为已安全关闭。
+
+防火墙差异另存于同目录的 `firewall-events.json`，仅 root 可访问，最多保留最近 32 条。记录固定失败分类、协议族、跳转位置、引用数量和规则摘要；热修复还记录成功或失败。不会保存完整防火墙规则、其他服务地址、注释或命令错误原文。查询失败与实际规则变化分别记录；归档失败不阻断安全停服。查看时可运行 `sudo cat /usr/local/share/synology-cert-web/firewall-events.json`。管理层规则恢复不改变原 DSM 续期任务、检查计划、证书或通知配置。
 
 ```sh
 sudo tail -n 30 /usr/local/share/synology-cert-web/supervisor.log
