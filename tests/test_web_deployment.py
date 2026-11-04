@@ -1128,6 +1128,123 @@ class AdaptiveScheduleProcessTests(unittest.TestCase):
         self.assertEqual([x.kwargs['timeout'] for x in self.child.wait.call_args_list], [5, 5])
 
 
+class StartupScheduleCoordinationTests(unittest.TestCase):
+    def setUp(self):
+        temporary = tempfile.TemporaryDirectory(); self.addCleanup(temporary.cleanup)
+        self.home = Path(temporary.name).resolve()
+        code = self.home / 'code'; code.mkdir()
+        for name in ('startup_check.py', 'adaptive_schedule.py'):
+            (code / name).write_text('')
+        self.now = 0
+        config = {'home': str(self.home), 'native_home': str(self.home / 'native'), 'task_id': 31,
+                  'bind': '10.10.10.37', 'networks': ['10.10.10.0/24'], 'denied': ['10.10.10.1'], 'port': 18443}
+        self.service = deployment.Deployment(config, self.home / 'deployment.json', clock=lambda: self.now)
+        self.service.startup_requested_generation = ('c' * 64, '2026-11-03T07:00:00Z')
+        self.item = {'Id': 'a' * 64, 'State': {'Running': True, 'Restarting': False,
+                     'StartedAt': '2026-11-03T07:01:00Z'}}
+        self.service.observed_container = self.item
+        self.children = {'startup_check.py': [], 'adaptive_schedule.py': []}
+        def spawn(command, **kwargs):
+            child = Mock(); child.poll.return_value = None
+            self.children[Path(command[2]).name].append(child)
+            return child
+        patcher = patch('web.deployment.subprocess.Popen', side_effect=spawn)
+        self.spawn = patcher.start(); self.addCleanup(patcher.stop)
+        patcher = patch('builtins.print'); patcher.start(); self.addCleanup(patcher.stop)
+
+    def tick(self, when, startup_first=False):
+        self.now = when
+        workers = (self.service.start_startup_check, self.service.start_schedule_sync)
+        for worker in workers if startup_first else reversed(workers):
+            worker()
+
+    def test_same_minute_sync_finishes_before_startup_without_consuming_retry(self):
+        self.tick(0)
+        self.assertEqual(len(self.children['adaptive_schedule.py']), 1)
+        self.assertEqual(self.children['startup_check.py'], [])
+        self.assertIsNone(self.service.startup_attempted_at)
+        sync = self.children['adaptive_schedule.py'][0]
+        sync.poll.return_value = 0
+        self.tick(10)
+        self.assertEqual(len(self.children['startup_check.py']), 1)
+        startup = self.children['startup_check.py'][0]
+        self.tick(60); self.tick(120)
+        self.assertEqual(len(self.children['adaptive_schedule.py']), 1)
+        self.assertEqual(self.service.schedule_attempted_at, 0)
+        startup.poll.return_value = 0
+        self.tick(130); self.tick(140)
+        self.assertEqual(len(self.children['adaptive_schedule.py']), 2)
+        self.assertEqual(len(self.children['startup_check.py']), 1)
+        self.assertTrue(self.service.startup_done)
+
+    def test_startup_first_defers_sync_without_consuming_its_attempt(self):
+        self.tick(0, startup_first=True)
+        self.assertEqual(len(self.children['startup_check.py']), 1)
+        self.assertEqual(self.children['adaptive_schedule.py'], [])
+        self.assertIsNone(self.service.schedule_attempted_at)
+        self.children['startup_check.py'][0].poll.return_value = 0
+        self.tick(10, startup_first=True)
+        self.assertEqual(len(self.children['adaptive_schedule.py']), 1)
+        self.assertTrue(self.service.startup_done)
+
+    def test_slow_sync_gives_pending_startup_a_turn_before_next_sync(self):
+        self.tick(0)
+        sync = self.children['adaptive_schedule.py'][0]
+        self.tick(60)
+        self.assertEqual(self.children['startup_check.py'], [])
+        sync.poll.return_value = 0
+        self.tick(70)
+        self.assertEqual(len(self.children['adaptive_schedule.py']), 1)
+        self.assertEqual(len(self.children['startup_check.py']), 1)
+
+    def test_sync_timeout_cleanup_and_startup_resume_do_not_block(self):
+        self.tick(0)
+        sync = self.children['adaptive_schedule.py'][0]
+        self.tick(120); sync.terminate.assert_called_once()
+        self.tick(125); sync.kill.assert_called_once()
+        self.assertEqual(self.children['startup_check.py'], [])
+        sync.poll.return_value = -9
+        self.tick(130)
+        self.assertEqual(len(self.children['startup_check.py']), 1)
+        self.assertEqual(len(self.children['adaptive_schedule.py']), 1)
+        sync.wait.assert_not_called(); sync.communicate.assert_not_called()
+
+    def test_retryable_startup_allows_sync_then_retries_without_overlap(self):
+        self.tick(0, startup_first=True)
+        self.children['startup_check.py'][0].poll.return_value = 75
+        self.tick(10, startup_first=True)
+        self.assertEqual(len(self.children['adaptive_schedule.py']), 1)
+        self.tick(60)
+        self.assertEqual(len(self.children['startup_check.py']), 1)
+        self.assertEqual(self.service.startup_attempted_at, 0)
+        self.children['adaptive_schedule.py'][0].poll.return_value = 0
+        self.tick(70)
+        self.assertEqual(len(self.children['startup_check.py']), 2)
+        self.children['startup_check.py'][1].poll.return_value = 0
+        self.tick(80); self.tick(90)
+        self.assertTrue(self.service.startup_done)
+        self.assertEqual(len(self.children['startup_check.py']), 2)
+
+    def test_new_container_generation_waits_for_sync_then_dispatches_once(self):
+        self.tick(0, startup_first=True)
+        self.children['startup_check.py'][0].poll.return_value = 0
+        self.tick(10, startup_first=True)
+        self.item['State']['StartedAt'] = '2026-11-03T08:01:00Z'
+        self.tick(20)
+        self.assertFalse(self.service.startup_done)
+        self.assertEqual(len(self.children['startup_check.py']), 1)
+        self.assertIsNone(self.service.startup_attempted_at)
+        self.children['adaptive_schedule.py'][0].poll.return_value = 0
+        self.tick(30)
+        self.assertEqual(len(self.children['startup_check.py']), 2)
+        self.children['startup_check.py'][1].poll.return_value = 0
+        self.tick(40); self.tick(50)
+        self.assertEqual(len(self.children['startup_check.py']), 2)
+        command = self.spawn.call_args_list[2].args[0]
+        self.assertEqual(command[-4:], ['--generation-id', self.item['Id'],
+                                       '--started-at', self.item['State']['StartedAt']])
+
+
 class ContainerTLSReloadTests(unittest.TestCase):
     def test_invalid_generation_preserves_worker_then_valid_generation_reloads_once(self):
         first=Mock();second=Mock()

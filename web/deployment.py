@@ -337,6 +337,8 @@ class Deployment:
                 self.startup_killed = False
             if self.startup_done:
                 return
+            if self.schedule_sync is not None and self.schedule_sync.poll() is None:
+                return
             if (self.startup_attempted_at is not None
                     and 0 <= current - self.startup_attempted_at < STARTUP_CHECK_RETRY_SECONDS):
                 return
@@ -385,6 +387,11 @@ class Deployment:
                 self.schedule_sync = None
                 self.schedule_terminating_at = None
                 self.schedule_killed = False
+                # 慢同步结束后先让等待的启动补查执行，避免再次同周期争锁。
+                if self.startup_generation is not None and not self.startup_done:
+                    return
+            if self.startup_check is not None and self.startup_check.poll() is None:
+                return
             if (self.schedule_attempted_at is not None
                     and 0 <= current - self.schedule_attempted_at < SCHEDULE_SYNC_SECONDS):
                 return
