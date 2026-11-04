@@ -128,6 +128,25 @@ jobs:
         run: |
           mkdir -p reports
           docker build --pull --no-cache --file web/Dockerfile --tag synology-cert-web:security-ci web
+      - name: 在受限镜像内验证 HTTPS、认证与接口防护
+        run: |
+          fixture_directory="$RUNNER_TEMP/runtime-tls"
+          mkdir -m 755 "$fixture_directory"
+          openssl req -x509 -newkey rsa:2048 -nodes -days 2 -subj '/CN=localhost' \
+            -addext 'subjectAltName=DNS:localhost,IP:127.0.0.1' \
+            -keyout "$fixture_directory/key.pem" -out "$fixture_directory/cert.pem"
+          printf '%s\n' '{"mode":"public","revision":"11111111111111111111111111111111"}' > "$fixture_directory/access.json"
+          sudo chown -R 0:10100 "$fixture_directory"
+          sudo chmod 750 "$fixture_directory"
+          sudo chmod 640 "$fixture_directory/key.pem" "$fixture_directory/cert.pem" "$fixture_directory/access.json"
+          docker run --rm --network none --read-only --cap-drop ALL \
+            --security-opt no-new-privileges --memory 384m --pids-limit 96 \
+            --tmpfs /tmp:rw,nosuid,nodev,size=67108864 \
+            --mount "type=bind,source=$fixture_directory,target=/test-tls,readonly" \
+            --mount "type=bind,source=$GITHUB_WORKSPACE/tests,target=/app/tests,readonly" \
+            --env CERTWEB_SMOKE_CERT=/test-tls/cert.pem --env CERTWEB_SMOKE_KEY=/test-tls/key.pem \
+            --env CERTWEB_SMOKE_POLICY=/test-tls/access.json \
+            --entrypoint python synology-cert-web:security-ci -m tests.runtime_image_smoke
       - name: 下载并校验 Trivy 官方发布包
         id: trivy-install
         timeout-minutes: 6

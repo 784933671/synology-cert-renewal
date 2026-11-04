@@ -16,6 +16,8 @@
 
 Docker 运行前端和管理 API。证书签发、DSM 导入及通知继续使用本机执行器和已绑定 DSM 任务（当前 NAS 原任务 7），保持原任务的恢复机制；容器不再建立第二套续期定时器。新设备由 DSM 分配任务编号，编号存于私有部署配置；已有安装保留原绑定和检查时间。无需在网页保存 DSM 管理员密码，也不需要关闭 DSM 双重验证。
 
+管理运行镜像使用固定摘要的官方 Python 3.12 Alpine 镜像，适用于当前支持的 x86_64 NAS。若基础镜像 SQLite 低于 3.54.0，构建时只安装固定 SHA-256 的官方签名 SQLite 3.54.1 软件包，离线检查现有依赖和签名，不切换系统仓库；基础镜像已包含更新版本时不会降级。构建和镜像验收均检查实际 SQLite 版本，避免漏洞数据库尚未收录时漏掉 [SQLite FTS5 公告](https://github.com/CVEProject/cvelistV5/blob/main/cves/2026/119xxx/CVE-2026-119373.json)。该变化不升级 DSM 或其本机 Python。
+
 ## 访问模式与边界
 
 - 管理入口使用 `https://ttxli.cn:18443`，两种模式都只绑定 NAS 的 `10.10.10.37`，只监听 IPv4；IPv6 的管理端口始终拒绝。
@@ -287,6 +289,8 @@ sudo /usr/local/etc/rc.d/S99synology-cert-web.sh start
 ### GitHub 自动安全检查
 
 仓库的“安全检查与回归”工作流在推送、拉取请求、手动运行以及每周一北京时间 10:23（UTC 02:23）执行；定时运行由 GitHub 调度，可能延迟。它检查完整 npm 依赖树、Python 运行依赖以及按当前源码构建的最终 Linux 容器镜像，并运行前端和 Python 回归，包括固定版本 acme.sh 离线集成。
+
+最终镜像还在非 root、只读根目录、无外网、移除 capability 和 384 MiB 内存限制下运行真实 HTTPS 验收，检查 SQLite/FTS5、scrypt、邮箱登录、密码修改、防护设置授权、429、封禁持久化与自助解封。使用临时测试证书和伪邮件桥接，不连接 NAS、DNSPod 或真实邮箱。Trivy 从官方 GitHub 发布包下载并校验固定 SHA-256，下载或校验失败直接阻断。
 
 npm 报告所有严重级别，高危或严重漏洞导致失败；Python 运行依赖发现任何已知漏洞即失败；镜像检查操作系统和语言依赖，高危或严重漏洞即失败，包括尚无补丁的漏洞。扫描失败、数据源不可用也不会报告通过。GitHub Actions 保留作业日志，JSON 报告以 `npm-audit-report`、`python-audit-report`、`container-audit-report` 附件保留 14 天；扫描失败时仍上传已生成的报告。失败后应先检查具体公告、修复依赖与锁文件、重新验证，再按原安装流程升级 NAS。
 
