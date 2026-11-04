@@ -21,6 +21,7 @@ from web.backend.bridge import BridgeClient, BridgeError, safe_data
 from web.backend.config import Config
 
 ORIGIN = "https://ttxli.cn:18443"
+LAN_ORIGIN = "https://10.10.10.37:18443"
 INITIAL_PASSWORD = "fixture-initial-password-42"
 NEW_PASSWORD = "fixture-changed-password-51"
 RUN_ID = 'run-20261103T040000Z-' + 'a' * 32
@@ -149,6 +150,64 @@ class WebApiTests(unittest.IsolatedAsyncioTestCase):
         response = await self.client.post("/api/login", content=json.dumps(payload), headers={"Origin": ORIGIN, "Content-Type": "text/plain"})
         self.assertEqual(response.status_code, 415)
         self.assertIsNone(self.client.cookies.get(COOKIE))
+
+    async def test_lan_ip_serves_health_and_static_with_exact_host_allowlist(self):
+        app = create_app(replace(self.config, allowed_hosts=("ttxli.cn:18443", "10.10.10.37:18443")),
+                         self.store, self.bridge)
+        async with self.make_client(app=app, base=LAN_ORIGIN) as client:
+            self.assertEqual((await client.get("/healthz")).json(), {"ok": True})
+            self.assertEqual((await client.get("/")).status_code, 200)
+            asset = await client.get("/assets/app.js")
+            self.assertEqual(asset.status_code, 200)
+            self.assertEqual(asset.text, "console.log('fixture')")
+            self.assertEqual((await client.get("/api/session")).status_code, 401)
+            for host in ("10.10.10.38:18443", "10.10.10.37", "10.10.10.37:443", "10.10.10.37.evil:18443"):
+                with self.subTest(host=host):
+                    denied = await client.get("/healthz", headers={"Host": host})
+                    self.assertEqual(denied.status_code, 400)
+                    self.assertEqual(denied.json()["error"]["code"], "invalid_host")
+
+    async def test_lan_ip_login_and_first_password_change_preserve_csrf(self):
+        app = create_app(replace(self.config, allowed_hosts=("ttxli.cn:18443", "10.10.10.37:18443")),
+                         self.store, self.bridge)
+        async with self.make_client(app=app, base=LAN_ORIGIN) as client:
+            login = await client.post("/api/login", json={"username": "admin", "password": INITIAL_PASSWORD},
+                                      headers={"Origin": LAN_ORIGIN})
+            self.assertEqual(login.status_code, 200, login.text)
+            self.assertTrue(login.json()["must_change_password"])
+            body = {"current_password": INITIAL_PASSWORD, "new_password": NEW_PASSWORD}
+            denied = await client.post("/api/password", json=body, headers={"Origin": LAN_ORIGIN})
+            self.assertEqual(denied.status_code, 403)
+            self.assertEqual(denied.json()["error"]["code"], "csrf_failed")
+            changed = await client.post("/api/password", json=body,
+                                        headers={"Origin": LAN_ORIGIN, "X-CSRF-Token": login.json()["csrf_token"]})
+            self.assertEqual(changed.status_code, 200, changed.text)
+            self.assertFalse(changed.json()["must_change_password"])
+            self.assertEqual((await client.get("/api/status")).status_code, 200)
+            denied = await client.post("/api/logout", json={}, headers={"Origin": LAN_ORIGIN})
+            self.assertEqual(denied.json()["error"]["code"], "csrf_failed")
+            logged_out = await client.post("/api/logout", json={},
+                                           headers={"Origin": LAN_ORIGIN, "X-CSRF-Token": changed.json()["csrf_token"]})
+            self.assertEqual(logged_out.status_code, 200)
+            self.assertEqual((await client.get("/api/session")).status_code, 401)
+
+    async def test_dual_entry_mutations_require_origin_matching_request_host(self):
+        app = create_app(replace(self.config, allowed_hosts=("ttxli.cn:18443", "10.10.10.37:18443")),
+                         self.store, self.bridge)
+        payload = {"username": "admin", "password": INITIAL_PASSWORD}
+        for origin, other in ((ORIGIN, LAN_ORIGIN), (LAN_ORIGIN, ORIGIN)):
+            async with self.make_client(app=app, base=origin) as client:
+                for headers in ({}, {"Origin": other}, {"Origin": "null"},
+                                {"Origin": origin.replace("https://", "http://")},
+                                {"Origin": origin, "Sec-Fetch-Site": "cross-site"}):
+                    with self.subTest(origin=origin, headers=headers):
+                        denied = await client.post("/api/login", json=payload, headers=headers)
+                        self.assertEqual(denied.status_code, 403)
+                        self.assertEqual(denied.json()["error"]["code"], "origin_forbidden")
+                duplicate = await client.post("/api/login", json=payload,
+                                              headers=[("Origin", origin), ("Origin", other)])
+                self.assertEqual(duplicate.status_code, 400)
+                self.assertEqual(duplicate.json()["error"]["code"], "invalid_request")
 
     async def test_all_mutations_require_csrf(self):
         await self.ready()
