@@ -158,9 +158,21 @@ jobs:
           fixture_directory="$RUNNER_TEMP/runtime-tls"
           cleanup() {
             result=$?
-            if [ "$result" -ne 0 ]; then docker logs "$project_container" || true; fi
-            docker rm -f "$project_container" >/dev/null 2>&1 || true
-            docker network rm "$project_network" >/dev/null 2>&1 || true
+            cleanup_failed=0
+            if [ "$result" -ne 0 ]; then
+              if ! docker logs "$project_container"; then
+                printf '%s\n' '无法读取项目冒烟容器日志，保留原测试退出码。' >&2
+              fi
+            fi
+            if ! docker rm -f "$project_container" >/dev/null 2>&1; then
+              printf '%s\n' '项目冒烟容器清理失败。' >&2
+              cleanup_failed=1
+            fi
+            if ! docker network rm "$project_network" >/dev/null 2>&1; then
+              printf '%s\n' '项目冒烟网络清理失败。' >&2
+              cleanup_failed=1
+            fi
+            if [ "$result" -eq 0 ] && [ "$cleanup_failed" -ne 0 ]; then result=1; fi
             return "$result"
           }
           trap cleanup EXIT

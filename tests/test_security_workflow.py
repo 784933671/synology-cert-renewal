@@ -112,6 +112,53 @@ class SecurityWorkflowTests(unittest.TestCase):
                                  ('docker', '/web'), ('github-actions', '/')})
         self.assertNotIn('auto-merge', config)
 
+    def test_project_cleanup_always_attempts_both_resources_and_preserves_failure_status(self):
+        step = self.workflow.split('      - name: 验证项目真实入口的宿主租约开关和无重启恢复\n', 1)[1]
+        step = step.split('      - name:', 1)[0]
+        script = textwrap.dedent(step.split('        run: |\n', 1)[1])
+        setup_and_trap = script.split('mkdir -m 750 "$project_bridge"', 1)[0]
+        self.assertIn('trap cleanup EXIT', setup_and_trap)
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            commands = root / 'bin'
+            commands.mkdir()
+            docker = commands / 'docker'
+            docker.write_text(textwrap.dedent('''\
+                #!/bin/sh
+                printf '%s\\n' "$*" >> "$DOCKER_CALLS"
+                case "$1 $2" in
+                  'logs certweb-project-123-1') exit "$LOG_STATUS" ;;
+                  'rm -f') exit "$CONTAINER_STATUS" ;;
+                  'network rm') exit "$NETWORK_STATUS" ;;
+                  *) exit 99 ;;
+                esac
+                '''))
+            docker.chmod(0o700)
+            for status, log, container, network, expected in (
+                    (0, 0, 0, 0, 0), (7, 0, 0, 0, 7), (7, 11, 22, 33, 7),
+                    (0, 0, 22, 0, 1), (0, 0, 0, 33, 1), (0, 0, 22, 33, 1)):
+                with self.subTest(status=status, log=log, container=container, network=network):
+                    calls = root / 'docker-calls'
+                    calls.write_text('')
+                    environment = dict(os.environ, PATH=str(commands) + os.pathsep + os.environ.get('PATH', ''),
+                        RUNNER_TEMP=str(root), GITHUB_RUN_ID='123', GITHUB_RUN_ATTEMPT='1', DOCKER_CALLS=str(calls),
+                        SMOKE_STATUS=str(status), LOG_STATUS=str(log), CONTAINER_STATUS=str(container),
+                        NETWORK_STATUS=str(network))
+                    result = subprocess.run(['bash', '-euo', 'pipefail', '-c',
+                                             setup_and_trap + '\nexit "$SMOKE_STATUS"\n'],
+                                            env=environment, cwd=root, capture_output=True, text=True, timeout=5)
+                    self.assertEqual(result.returncode, expected, result.stderr)
+                    expected_calls = ['rm -f certweb-project-123-1', 'network rm certweb-project-123-1']
+                    if status:
+                        expected_calls.insert(0, 'logs certweb-project-123-1')
+                    self.assertEqual(calls.read_text().splitlines(), expected_calls)
+                    if container:
+                        self.assertIn('项目冒烟容器清理失败', result.stderr)
+                    if network:
+                        self.assertIn('项目冒烟网络清理失败', result.stderr)
+                    if status and log:
+                        self.assertIn('保留原测试退出码', result.stderr)
+
 
 if __name__ == '__main__':
     unittest.main()
