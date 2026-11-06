@@ -1,0 +1,115 @@
+{
+  "services": {
+    "certweb": {
+      "cap_drop": [
+        "ALL"
+      ],
+      "container_name": "synology-cert-web",
+      "cpuset": "0",
+      "environment": {
+        "CERTWEB_ACCESS_POLICY_FILE": "/access/access.json",
+        "CERTWEB_ALLOWED_HOSTS": "ttxli.cn:18443,10.10.10.37:18443",
+        "CERTWEB_ALLOWED_NETWORKS": "10.10.10.0/24",
+        "CERTWEB_BIND": "10.10.10.37",
+        "CERTWEB_BRIDGE_SOCKET": "/bridge/certweb.sock",
+        "CERTWEB_DATA_DIR": "/data",
+        "CERTWEB_DENIED_ADDRESSES": "10.10.10.1",
+        "CERTWEB_ORIGIN": "https://ttxli.cn:18443",
+        "CERTWEB_PORT": "18443",
+        "CERTWEB_PROJECT_MODE": "1",
+        "CERTWEB_STATIC_DIR": "/app/static",
+        "CERTWEB_TLS_CERT": "/tls/current.cert",
+        "CERTWEB_TLS_KEY": "/tls/current.key",
+        "TZ": "Asia/Shanghai"
+      },
+      "healthcheck": {
+        "interval": "30s",
+        "retries": 3,
+        "start_period": "20s",
+        "test": [
+          "CMD",
+          "python",
+          "-m",
+          "web.healthcheck"
+        ],
+        "timeout": "6s"
+      },
+      "image": "synology-cert-web:local",
+      "init": true,
+      "labels": {
+        "io.github.784933671.certweb.managed": "true"
+      },
+      "logging": {
+        "driver": "json-file",
+        "options": {
+          "max-file": "3",
+          "max-size": "2m"
+        }
+      },
+      "mem_limit": "402653184",
+      "network_mode": "host",
+      "read_only": true,
+      "restart": "no",
+      "security_opt": [
+        "no-new-privileges:true"
+      ],
+      "stop_grace_period": "25s",
+      "tmpfs": [
+        "/tmp:rw,noexec,nosuid,nodev,size=16m,mode=1777"
+      ],
+      "ulimits": {
+        "nofile": {
+          "hard": 1024,
+          "soft": 1024
+        },
+        "nproc": {
+          "hard": 96,
+          "soft": 96
+        }
+      },
+      "user": "10100:10100",
+      "volumes": [
+        {
+          "bind": {
+            "create_host_path": true
+          },
+          "source": "/usr/local/share/synology-cert-web/data",
+          "target": "/data",
+          "type": "bind"
+        },
+        {
+          "bind": {
+            "create_host_path": true
+          },
+          "read_only": true,
+          "source": "/usr/local/share/synology-cert-web/bridge",
+          "target": "/bridge",
+          "type": "bind"
+        },
+        {
+          "bind": {
+            "create_host_path": true
+          },
+          "read_only": true,
+          "source": "/usr/local/share/synology-cert-web/tls",
+          "target": "/tls",
+          "type": "bind"
+        },
+        {
+          "bind": {
+            "create_host_path": true
+          },
+          "read_only": true,
+          "source": "/usr/local/share/synology-cert-web/access",
+          "target": "/access",
+          "type": "bind"
+        }
+      ]
+    }
+  },
+  "x-certweb-project": {
+    "home": "/usr/local/share/synology-cert-web",
+    "name": "synology-cert-web",
+    "version": 1
+  }
+}
