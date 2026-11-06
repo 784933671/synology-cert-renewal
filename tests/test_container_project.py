@@ -74,6 +74,40 @@ class ContainerProjectTests(unittest.TestCase):
         project.render_project(self.home, 'cert-project', self.runner, code=code)
         self.assertIn(str(code / 'compose.yaml'), self.runner.call_args.args[0])
 
+    def test_render_normalizes_dsm_compose_null_image_defaults(self):
+        expected = json.loads(project.render_project(self.home, 'cert-project', self.runner))
+        for fields in (('command',), ('entrypoint',), ('command', 'entrypoint')):
+            with self.subTest(fields=fields):
+                content = copy.deepcopy(self.manifest)
+                content['services']['certweb'].update({key: None for key in fields})
+                actual = json.loads(project.render_project(
+                    self.home, 'cert-project', Mock(return_value=json.dumps(content))))
+                self.assertEqual(actual, expected)
+                self.assertNotIn('command', actual['services']['certweb'])
+                self.assertNotIn('entrypoint', actual['services']['certweb'])
+
+    def test_render_rejects_empty_and_nonempty_image_command_overrides(self):
+        for field in ('command', 'entrypoint'):
+            for value in ('', [], 'sh', ['sh']):
+                with self.subTest(field=field, value=value):
+                    content = copy.deepcopy(self.manifest)
+                    content['services']['certweb'].update({'command': None, 'entrypoint': None, field: value})
+                    with self.assertRaises(ValueError):
+                        project.render_project(self.home, 'cert-project', Mock(return_value=json.dumps(content)))
+
+    def test_imported_manifest_still_rejects_null_command_fields(self):
+        descriptor = self.export()
+        original = self.manifest_path().read_bytes()
+        for fields in (('command',), ('entrypoint',), ('command', 'entrypoint')):
+            with self.subTest(fields=fields):
+                content = json.loads(original)
+                content['services']['certweb'].update({key: None for key in fields})
+                self.manifest_path().write_text(json.dumps(content))
+                with self.assertRaises(ValueError):
+                    project.load_project(self.home, self.uid)
+        self.manifest_path().write_bytes(original)
+        self.assertEqual(project.load_project(self.home, self.uid), descriptor)
+
     def test_render_requires_absolute_canonical_deployment_paths(self):
         for home, code in ((Path('relative-home'), None), (self.home, Path('relative-code'))):
             with self.subTest(home=home, code=code), self.assertRaises(ValueError):

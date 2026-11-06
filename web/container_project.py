@@ -200,6 +200,13 @@ def render_project(home, name, runner, code=None):
     arguments = [DOCKER, 'compose', '--project-name', name, '--env-file', str(home / 'deployment.env'),
                  '-f', str(code / 'compose.yaml'), 'config', '--format', 'json']
     content = json.loads(runner(arguments, timeout=90))
+    services = content.get('services') if isinstance(content, dict) else None
+    service = services.get('certweb') if isinstance(services, dict) else None
+    if isinstance(service, dict):
+        # DSM Compose 用 null 表示沿用镜像默认值；仅规范化渲染输出。
+        for key in ('command', 'entrypoint'):
+            if key in service and service[key] is None:
+                del service[key]
     service = _service(home, content)
     content.pop('name', None)
     service.pop('build', None)
