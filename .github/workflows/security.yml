@@ -147,6 +147,66 @@ jobs:
             --env CERTWEB_SMOKE_CERT=/test-tls/cert.pem --env CERTWEB_SMOKE_KEY=/test-tls/key.pem \
             --env CERTWEB_SMOKE_POLICY=/test-tls/access.json \
             --entrypoint python synology-cert-web:security-ci -m tests.runtime_image_smoke
+      - name: 验证项目真实入口的宿主租约开关和无重启恢复
+        timeout-minutes: 3
+        run: |
+          project_network="certweb-project-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          project_container="$project_network"
+          project_bridge="$RUNNER_TEMP/project-bridge"
+          project_subnet='172.30.254.0/28'
+          project_bind='172.30.254.2'
+          fixture_directory="$RUNNER_TEMP/runtime-tls"
+          cleanup() {
+            result=$?
+            if [ "$result" -ne 0 ]; then docker logs "$project_container" || true; fi
+            docker rm -f "$project_container" >/dev/null 2>&1 || true
+            docker network rm "$project_network" >/dev/null 2>&1 || true
+            return "$result"
+          }
+          trap cleanup EXIT
+          mkdir -m 750 "$project_bridge"
+          sudo chown 0:10100 "$project_bridge"
+          write_lease() {
+            sudo python3 - "$project_bridge" "$1" <<'PY'
+          import json, os, pathlib, sys, tempfile, time
+          directory = pathlib.Path(sys.argv[1])
+          descriptor, name = tempfile.mkstemp(prefix='.lease-', dir=directory)
+          with os.fdopen(descriptor, 'w') as handle:
+              os.fchown(handle.fileno(), 0, 10100)
+              os.fchmod(handle.fileno(), 0o640)
+              json.dump({'version': 1, 'ready': sys.argv[2] == 'true', 'expires_at': time.time() + 25}, handle)
+              handle.flush()
+              os.fsync(handle.fileno())
+          os.replace(name, directory / 'project-ready.json')
+          PY
+          }
+          docker network create --internal --subnet "$project_subnet" "$project_network" >/dev/null
+          docker run --detach --name "$project_container" --init --restart no \
+            --network "$project_network" --ip "$project_bind" --read-only --cap-drop ALL \
+            --security-opt no-new-privileges --memory 384m --pids-limit 96 \
+            --tmpfs /tmp:rw,nosuid,nodev,size=16777216 \
+            --tmpfs /data:rw,nosuid,nodev,size=16777216,mode=0700,uid=10100,gid=10100 \
+            --mount "type=bind,source=$fixture_directory,target=/test-tls,readonly" \
+            --mount "type=bind,source=$project_bridge,target=/bridge,readonly" \
+            --mount "type=bind,source=$GITHUB_WORKSPACE/tests,target=/app/tests,readonly" \
+            --env CERTWEB_PROJECT_MODE=1 --env CERTWEB_BIND="$project_bind" --env CERTWEB_PORT=18443 \
+            --env CERTWEB_ALLOWED_NETWORKS="$project_subnet" \
+            --env CERTWEB_ALLOWED_HOSTS="localhost:18443,$project_bind:18443" \
+            --env CERTWEB_ORIGIN=https://localhost:18443 \
+            --env CERTWEB_ACCESS_POLICY_FILE=/test-tls/access.json \
+            --env CERTWEB_TLS_CERT=/test-tls/cert.pem --env CERTWEB_TLS_KEY=/test-tls/key.pem \
+            synology-cert-web:security-ci
+          probe() { docker exec "$project_container" python -m tests.runtime_image_smoke --project-probe "$1"; }
+          probe closed
+          write_lease true
+          probe open
+          write_lease false
+          probe closed
+          write_lease true
+          probe open
+          sudo rm "$project_bridge/project-ready.json"
+          probe closed
+          test "$(docker inspect --format '{{.State.Running}} {{.RestartCount}}' "$project_container")" = 'true 0'
       - name: 下载并校验 Trivy 官方发布包
         id: trivy-install
         timeout-minutes: 6

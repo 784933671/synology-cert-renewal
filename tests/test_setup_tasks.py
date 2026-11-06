@@ -211,7 +211,7 @@ class PreparationTests(unittest.TestCase):
         self.native = self.root / 'native';self.native.mkdir(mode=0o700)
         for name in ('config.json', 'certctl.py'):(self.native / name).write_text('{}')
         self.source = self.root / 'source';self.source.mkdir(mode=0o700)
-        self.sources = ['Dockerfile', 'compose.yaml', 'deployment.py', 'host_bridge.py', 'login_mail.py', 'monitor.py', 'observability.py', 'startup_check.py', 'adaptive_schedule.py',
+        self.sources = ['Dockerfile', 'compose.yaml', 'deployment.py', 'container_project.py', 'host_bridge.py', 'login_mail.py', 'monitor.py', 'observability.py', 'startup_check.py', 'adaptive_schedule.py',
                         'access_policy.py', 'backend/app.py', 'frontend/package.json']
         for name in self.sources:
             path = self.source / name;path.parent.mkdir(parents=True, exist_ok=True)

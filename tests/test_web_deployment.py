@@ -918,6 +918,162 @@ class StartupStabilityTests(unittest.TestCase):
         self.assertTrue(any(stage == 'tls' and status == 'blocked' for stage, status, _ in self.events))
 
 
+class ContainerProjectLifecycleTests(unittest.TestCase):
+    def setUp(self):
+        StartupStabilityTests.setUp(self)
+        self.service.project = {'version': 1, 'name': 'cert-project', 'directory': str(self.home / 'project')}
+        self.gates = []
+        def gate(ready):
+            self.gates.append(ready)
+            if not ready:
+                self.service.project_granted = False
+        self.service.project_ready = Mock(side_effect=gate)
+        self.service.container = Mock(side_effect=lambda: {
+            'State': {'Running': self.running, 'Restarting': False},
+            'Config': {'Env': ['CERTWEB_PROJECT_MODE=1']}})
+
+    tick = StartupStabilityTests.tick
+
+    def test_stopped_or_missing_project_waits_without_creating_container(self):
+        self.service.container.return_value = None
+        self.service.container.side_effect = None
+        self.tick(0);self.tick(60);self.tick(120)
+        self.service.compose.assert_not_called()
+        self.assertTrue(self.gates[-1])
+        self.assertEqual(self.service.phase, 'project')
+
+    def test_gui_stop_is_preserved_while_host_supervision_continues(self):
+        self.running = True
+        self.tick(0);self.tick(59)
+        self.assertFalse(self.gates[-1])
+        self.tick(60)
+        self.assertTrue(self.gates[-1])
+        self.running = False
+        self.tick(70);self.tick(130)
+        self.service.compose.assert_not_called()
+        self.service.start_bridge.assert_called()
+        self.assertFalse(self.running)
+
+    def test_dependency_loss_revokes_gate_and_requires_new_stable_window(self):
+        self.running = True
+        self.tick(0);self.tick(60)
+        self.service.bridge_ready.return_value = False
+        self.tick(70)
+        self.assertFalse(self.gates[-1])
+        self.service.bridge_ready.return_value = True
+        self.tick(80);self.tick(139)
+        self.assertFalse(self.gates[-1])
+        self.tick(140)
+        self.assertTrue(self.gates[-1])
+
+    def test_first_grant_requires_persisted_status_and_fresh_stable_window_after_failure(self):
+        self.running = True
+        self.tick(0)
+        original = self.service.log
+        self.service.log = Mock(side_effect=OSError('disk full'))
+        self.tick(60)
+        self.assertFalse(self.gates[-1])
+        self.assertFalse(self.service.project_granted)
+        self.assertIsNone(self.service.ready_since)
+        self.service.log = original
+        self.tick(70);self.tick(129)
+        self.assertFalse(self.gates[-1])
+        self.tick(130)
+        self.assertTrue(self.gates[-1])
+        self.service.compose.assert_not_called()
+
+    def test_shutdown_during_checks_cannot_grant_or_refresh_https(self):
+        for granted in (False, True):
+            with self.subTest(granted=granted):
+                self.service.stopping = False
+                self.service.project_granted = granted
+                self.service.ready_since = 0
+                def stop_requested():
+                    self.service.stopping = True
+                    return {'State': {'Running': True}, 'Config': {'Env': ['CERTWEB_PROJECT_MODE=1']}}
+                self.service.container.side_effect = stop_requested
+                self.tick(60)
+                self.assertFalse(self.gates[-1])
+                self.assertFalse(self.service.project_granted)
+        self.service.compose.assert_not_called()
+
+    def test_old_project_image_without_start_gate_is_stopped(self):
+        self.service.container.side_effect = None
+        for environment in (None, [], ['CERTWEB_PROJECT_MODE=0'], 'CERTWEB_PROJECT_MODE=1',
+                            ['CERTWEB_PROJECT_MODE=0', 'CERTWEB_PROJECT_MODE=1'],
+                            ['CERTWEB_PROJECT_MODE=1', 'CERTWEB_PROJECT_MODE=1']):
+            with self.subTest(environment=environment):
+                self.service.stop_container.reset_mock()
+                self.running = True
+                self.service.container.return_value = {'State': {'Running': True}, 'Config': {'Env': environment}}
+                self.tick(0)
+                self.service.stop_container.assert_called_once()
+        self.service.compose.assert_not_called()
+
+    def test_project_commands_use_saved_identity_and_file(self):
+        self.service.command = Mock(return_value='ok')
+        deployment.Deployment.compose(self.service, 'up', '-d', '--no-build')
+        args = self.service.command.call_args.args[0]
+        self.assertEqual(args[args.index('--project-name') + 1], 'cert-project')
+        self.assertEqual(args[args.index('-f') + 1], str(self.home / 'project/docker-compose.yml'))
+        self.assertNotIn('--env-file', args)
+
+    def test_first_upgrade_preserves_existing_dsm_project_name(self):
+        self.service.project = None
+        item = {'Config': {'Labels': {deployment.MANAGED_LABEL: 'true',
+                'com.docker.compose.project': 'existing-dsm-project', 'com.docker.compose.service': 'certweb'}}}
+        result = Mock(returncode=0, stdout=json.dumps([item]))
+        with patch('web.deployment.subprocess.run', return_value=result):
+            deployment.Deployment.container(self.service)
+        self.service.command = Mock()
+        deployment.Deployment.compose(self.service, 'up', '-d', '--no-build')
+        args = self.service.command.call_args.args[0]
+        self.assertEqual(args[args.index('--project-name') + 1], 'existing-dsm-project')
+
+    def test_foreign_project_is_rejected_without_touching_its_container(self):
+        item = {'Config': {'Labels': {deployment.MANAGED_LABEL: 'true',
+                'com.docker.compose.project': 'foreign', 'com.docker.compose.service': 'certweb'}}}
+        with patch('web.deployment.subprocess.run', return_value=Mock(returncode=0, stdout=json.dumps([item]))):
+            with self.assertRaisesRegex(RuntimeError, '其他项目'):
+                deployment.Deployment.container(self.service)
+        self.assertIsNone(self.service.last_container)
+
+    def test_invalid_inspect_shape_never_becomes_a_verified_container(self):
+        for items in (None, {}, [], [{}, {}], [None], [{'Config': None}],
+                      [{'Config': {'Labels': None}}], [{'Config': {'Labels': {}}, 'State': None}]):
+            with self.subTest(items=items), patch('web.deployment.subprocess.run', return_value=Mock(
+                    returncode=0, stdout=json.dumps(items))):
+                with self.assertRaisesRegex(RuntimeError, '状态无效'):
+                    deployment.Deployment.container(self.service)
+                self.assertIsNone(self.service.last_container)
+
+    def test_foreign_service_is_rejected_even_with_same_project_name(self):
+        item = {'Config': {'Labels': {deployment.MANAGED_LABEL: 'true',
+                'com.docker.compose.project': self.service.project['name'], 'com.docker.compose.service': 'other'}}}
+        with patch('web.deployment.subprocess.run', return_value=Mock(returncode=0, stdout=json.dumps([item]))):
+            with self.assertRaisesRegex(RuntimeError, '其他项目'):
+                deployment.Deployment.container(self.service)
+        self.assertIsNone(self.service.last_container)
+
+    def test_host_gate_is_readable_only_by_container_group_and_expires(self):
+        (self.home / 'bridge').mkdir()
+        with patch('web.deployment.os.fchown') as owner, patch('web.deployment.time.time', return_value=100):
+            deployment.Deployment.project_ready(self.service, True)
+        path = self.home / 'bridge/project-ready.json'
+        self.assertEqual(json.loads(path.read_text()), {'version': 1, 'ready': True, 'expires_at': 125})
+        self.assertEqual(path.stat().st_mode & 0o777, 0o640)
+        owner.assert_called_once_with(unittest.mock.ANY, 0, 10100)
+
+    def test_gate_write_failure_cannot_prevent_docker_stop(self):
+        self.service.project_ready.side_effect = OSError('disk failure')
+        self.service.container.side_effect = [
+            {'State': {'Running': True}}, {'State': {'Running': False}}]
+        self.service.command = Mock()
+        deployment.Deployment.stop_container(self.service)
+        self.service.command.assert_called_once_with(
+            ['/usr/local/bin/docker', 'stop', '-t', '20', 'synology-cert-web'], timeout=30)
+
+
 class StartupRenewalTests(unittest.TestCase):
     def setUp(self):
         temporary = tempfile.TemporaryDirectory(); self.addCleanup(temporary.cleanup)
@@ -1001,6 +1157,26 @@ class StartupRenewalTests(unittest.TestCase):
         self.tick(20); self.tick(30)
         self.item['Id'] = 'b' * 64; self.tick(40)
         self.assertEqual(self.spawn.call_count, 3)
+
+    def test_project_first_manual_start_after_completed_host_check_gets_one_fresh_check(self):
+        self.service.project = {'version': 1, 'name': 'cert-project', 'directory': str(self.home / 'project')}
+        self.service.observed_container = None
+        self.tick(0);self.child.poll.return_value = 0;self.tick(10)
+        self.assertTrue(self.service.startup_done)
+        self.service.observed_container = self.item
+        self.tick(3600);self.tick(3610);self.tick(3620)
+        self.assertEqual(self.spawn.call_count, 2)
+        self.assertEqual(self.spawn.call_args.args[0][-4:],
+                         ['--generation-id', self.item['Id'], '--started-at', self.item['State']['StartedAt']])
+
+    def test_project_initial_container_during_host_check_only_sets_baseline(self):
+        self.service.project = {'version': 1, 'name': 'cert-project', 'directory': str(self.home / 'project')}
+        self.service.observed_container = None
+        self.tick(0)
+        self.service.observed_container = self.item
+        self.tick(10)
+        self.child.poll.return_value = 0;self.tick(20);self.tick(30)
+        self.spawn.assert_called_once()
 
     def test_retryable_paused_or_busy_result_waits_sixty_seconds(self):
         self.tick(0); self.child.poll.return_value = 75
@@ -1243,6 +1419,41 @@ class StartupScheduleCoordinationTests(unittest.TestCase):
         command = self.spawn.call_args_list[2].args[0]
         self.assertEqual(command[-4:], ['--generation-id', self.item['Id'],
                                        '--started-at', self.item['State']['StartedAt']])
+
+    def test_project_stop_preserves_host_schedule_and_https_gate_changes_do_not_repeat_startup(self):
+        self.service.project = {'version': 1, 'name': 'cert-project', 'directory': str(self.home / 'project')}
+        self.item['State']['Running'] = False
+        self.tick(0, startup_first=True)
+        self.children['startup_check.py'][0].poll.return_value = 0
+        self.tick(10, startup_first=True)
+        self.assertEqual(len(self.children['adaptive_schedule.py']), 1)
+        self.children['adaptive_schedule.py'][0].poll.return_value = 0
+        self.tick(20)
+        self.item['State']['Running'] = True
+        self.tick(30)
+        self.assertEqual(len(self.children['startup_check.py']), 2)
+        self.children['startup_check.py'][1].poll.return_value = 0
+        self.service.project_granted = False;self.tick(40)
+        self.service.project_granted = True;self.tick(50)
+        self.assertEqual(len(self.children['startup_check.py']), 2)
+        self.item['State']['Running'] = False
+        self.tick(70)
+        self.assertEqual(len(self.children['adaptive_schedule.py']), 2)
+        self.item['State'].update(Running=True, StartedAt='2026-11-03T08:01:00Z')
+        self.tick(80)
+        self.assertEqual(len(self.children['startup_check.py']), 2)
+        self.children['adaptive_schedule.py'][1].poll.return_value = 0
+        self.tick(90)
+        self.assertEqual(len(self.children['startup_check.py']), 3)
+        self.children['startup_check.py'][2].poll.return_value = 0
+        self.tick(100);self.tick(110)
+        self.assertEqual(len(self.children['startup_check.py']), 3)
+        self.assertTrue(self.service.startup_done)
+        for call in self.spawn.call_args_list:
+            command = call.args[0]
+            self.assertNotIn('--force', command)
+            if command[2].endswith('adaptive_schedule.py'):
+                self.assertNotIn('--run', command)
 
 
 class ContainerTLSReloadTests(unittest.TestCase):

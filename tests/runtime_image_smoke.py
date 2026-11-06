@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import http.client
 from http.cookies import SimpleCookie
+import argparse
 import json
 import os
 from pathlib import Path
@@ -237,7 +238,69 @@ def main():
     print('运行镜像冒烟验证通过。', flush=True)
 
 
+def project_entry_pid():
+    matches = []
+    for directory in Path('/proc').iterdir():
+        if not directory.name.isdigit():
+            continue
+        try:
+            arguments = (directory / 'cmdline').read_bytes().split(b'\0')
+            if arguments[1:3] == [b'-m', b'web.container_entry']:
+                require(directory.stat().st_uid == os.getuid(), '项目入口未以容器普通用户运行')
+                matches.append(int(directory.name))
+        except (FileNotFoundError, ProcessLookupError, PermissionError):
+            continue
+    require(len(matches) == 1, '项目入口进程缺失或重复')
+    return matches[0]
+
+
+def project_probe(expected):
+    """由 CI 在真实项目容器内执行；就绪租约仅由宿主原子写入。"""
+    require(os.getuid() != 0, '项目冒烟测试必须以非 root 身份运行')
+    require(os.environ.get('CERTWEB_PROJECT_MODE') == '1', '项目冒烟测试缺少真实项目模式')
+    bind, port = os.environ['CERTWEB_BIND'], int(os.environ['CERTWEB_PORT'])
+    certificate = Path(os.environ['CERTWEB_TLS_CERT'])
+    context = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+    context.load_verify_locations(cafile=str(certificate))
+    require(context.check_hostname and context.verify_mode == ssl.CERT_REQUIRED, '项目 TLS 必须校验证书和主机名')
+    identity = Path('/tmp/certweb-project-smoke-entry.pid')
+    pid = project_entry_pid()
+    if identity.exists():
+        require(identity.read_text() == str(pid), '租约变化导致项目入口重启')
+    else:
+        identity.write_text(str(pid))
+    deadline, closed_since = time.monotonic() + 20, None
+    while time.monotonic() < deadline:
+        require(project_entry_pid() == pid, '租约变化导致项目入口退出或重启')
+        try:
+            with socket.create_connection((bind, port), timeout=2) as connection:
+                closed_since = None
+                if expected == 'open':
+                    with context.wrap_socket(connection, server_hostname='localhost') as secured:
+                        secured.sendall(('GET /healthz HTTP/1.1\r\nHost: localhost:{}\r\n'
+                                         'Connection: close\r\n\r\n'.format(port)).encode('ascii'))
+                        response = http.client.HTTPResponse(secured)
+                        response.begin()
+                        require(response.status == 200 and json.loads(response.read()) == {'ok': True},
+                                '项目真实 HTTPS 健康检查失败')
+                        require(response.getheader('X-Content-Type-Options') == 'nosniff', '项目安全响应头缺失')
+                        response.close()
+                    print('通过：有效宿主租约开放真实 HTTPS，项目入口保持原进程。', flush=True)
+                    return
+        except ConnectionRefusedError:
+            if expected == 'closed':
+                closed_since = time.monotonic() if closed_since is None else closed_since
+                if time.monotonic() - closed_since >= 2:
+                    print('通过：无效或缺失租约持续关闭 HTTPS，项目入口保持原进程。', flush=True)
+                    return
+        time.sleep(0.1)
+    raise RuntimeError('项目 HTTPS 未在 20 秒内达到预期状态：' + expected)
+
+
 if __name__ == '__main__':
+    parser = argparse.ArgumentParser()
+    parser.add_argument('--project-probe', choices=('open', 'closed'))
+    arguments = parser.parse_args()
     require(sqlite3.sqlite_version_info >= (3, 54, 0), '运行镜像 SQLite 尚未包含 FTS5 安全修复')
     with sqlite3.connect(':memory:') as database:
         database.execute('CREATE VIRTUAL TABLE smoke_fts USING fts5(content)')
@@ -245,4 +308,7 @@ if __name__ == '__main__':
         require(database.execute("SELECT COUNT(*) FROM smoke_fts WHERE smoke_fts MATCH 'renewal'").fetchone()[0] == 1,
                 'SQLite FTS5 功能验证失败')
     print('运行镜像 SQLite ' + sqlite3.sqlite_version, flush=True)
-    main()
+    if arguments.project_probe:
+        project_probe(arguments.project_probe)
+    else:
+        main()

@@ -360,6 +360,164 @@ class WizardTests(unittest.TestCase):
         self.assertNotIn('do-not-print', stderr.getvalue())
         self.assertNotIn('Traceback', stderr.getvalue())
 
+    def prepare_project(self):
+        self.home.mkdir(mode=0o700)
+        for name in ('code', 'data'):
+            (self.home / name).mkdir(mode=0o700)
+        module = self.home / 'code/container_project.py'
+        setup.atomic_bytes(module, b'# installed project support\n')
+        setup.atomic_bytes(self.home / 'data/auth.sqlite3', b'keep-existing-credentials')
+        self.rc = self.root / 'rc'
+        self.rc.write_text('installed')
+        self.project_descriptor = {'version': 1, 'name': 'cert-project', 'directory': str(self.root / 'project')}
+        self.updater = Mock()
+        self.updater.journal = self.home / 'upgrade-state.json'
+        self.updater.native = self.native
+        self.updater.uid = os.getuid()
+        self.updater.project = None
+        (self.native / 'state').mkdir(mode=0o700)
+        lock_method = setup.Upgrade.locked
+        self.updater.locked = lambda path: lock_method(self.updater, path)
+        self.updater.inspect_container.return_value = {'Config': {'Labels': {
+            setup.MANAGED_LABEL: 'true', 'com.docker.compose.project': 'cert-project',
+            'com.docker.compose.service': 'certweb'}}, 'State': {'Running': True}}
+        self.supervisor_alive = True
+        def project_runner(args, **kwargs):
+            self.runner(args, **kwargs)
+            return json.dumps({'supervisor_running': self.supervisor_alive}) if args[-1] == 'status' else ''
+        self.wizard.runner = project_runner
+        for patcher in (patch('web.setup.load_config', return_value={'origin': 'https://nas.example.com:18443'}),
+                        patch('web.setup.RC', self.rc), patch('web.setup.Upgrade', return_value=self.updater),
+                        patch('web.setup.prepare_project', return_value=(self.project_descriptor, b'prepared')),
+                        patch('web.setup.commit_project', return_value=self.project_descriptor),
+                        patch('web.setup.capture_project_state', return_value=object()),
+                        patch('web.setup.restore_project_state')):
+            patched = patcher.start();self.addCleanup(patcher.stop)
+            if patcher.attribute == 'prepare_project':
+                self.exporter = patched
+            elif patcher.attribute == 'commit_project':
+                self.committer = patched
+            elif patcher.attribute == 'restore_project_state':
+                self.restorer = patched
+
+    def test_project_command_preserves_credentials_and_leaves_start_to_dsm(self):
+        self.prepare_project()
+        self.journal(complete=True)
+        self.wizard.configure_project(self.root / 'project', 'cert-project')
+        self.exporter.assert_called_once()
+        self.committer.assert_called_once()
+        self.updater.lifecycle.assert_called_once_with('stop')
+        self.assertEqual([args[-1] for args, _ in self.calls], ['status', 'start', 'status'])
+        self.assertEqual((self.home / 'data/auth.sqlite3').read_bytes(), b'keep-existing-credentials')
+        self.assertFalse(any('up' in args or 'run' in args for args, _ in self.calls))
+
+    def test_project_command_refuses_incomplete_installation_before_export(self):
+        self.prepare_project()
+        self.journal(complete=False)
+        with self.assertRaisesRegex(setup.SetupError, '完成安装'):
+            self.wizard.configure_project(self.root / 'project', 'cert-project')
+        self.exporter.assert_not_called()
+        self.updater.lifecycle.assert_not_called()
+
+    def test_project_name_conflict_does_not_stop_live_service(self):
+        self.prepare_project()
+        with self.assertRaisesRegex(setup.SetupError, '名称'):
+            self.wizard.configure_project(self.root / 'project', 'wrong-project')
+        self.exporter.assert_not_called()
+        self.updater.lifecycle.assert_not_called()
+
+    def test_failed_project_export_does_not_stop_live_service(self):
+        self.prepare_project()
+        self.exporter.side_effect = ValueError('invalid project directory')
+        with self.assertRaises(ValueError):
+            self.wizard.configure_project(self.root / 'project', 'cert-project')
+        self.updater.lifecycle.assert_not_called()
+
+    def test_missing_project_image_keeps_safe_recovery_message_and_runtime(self):
+        self.prepare_project()
+        from web.container_project import ProjectImageError, IMAGE_ERROR
+        self.exporter.side_effect = ProjectImageError(IMAGE_ERROR)
+        with self.assertRaisesRegex(setup.SetupError, 'synology-cert-web:local.*构建镜像'):
+            self.wizard.configure_project(self.root / 'project', 'cert-project')
+        self.updater.lifecycle.assert_not_called()
+        self.committer.assert_not_called()
+
+    def test_container_created_during_render_cannot_lock_in_wrong_project_metadata(self):
+        self.prepare_project()
+        self.updater.inspect_container.side_effect = [None, None, {'Config': {'Labels': {
+            setup.MANAGED_LABEL: 'true', 'com.docker.compose.project': 'old-project',
+            'com.docker.compose.service': 'certweb'}}}]
+        with self.assertRaisesRegex(setup.SetupError, '切换未完成'):
+            self.wizard.configure_project(self.root / 'project', 'cert-project')
+        self.committer.assert_not_called()
+        self.assertFalse((self.home / 'container-project.json').exists())
+        self.assertEqual([args[-1] for args, _ in self.calls], ['status', 'start', 'status'])
+
+    def test_project_switch_busy_renewal_leaves_runtime_and_metadata_unchanged(self):
+        self.prepare_project()
+        with self.updater.locked(self.native / 'state/run.lock'):
+            with self.assertRaisesRegex(setup.UpgradeError, '证书任务正在运行'):
+                self.wizard.configure_project(self.root / 'project', 'cert-project')
+        self.updater.lifecycle.assert_not_called()
+        self.committer.assert_not_called()
+        self.restorer.assert_not_called()
+        self.assertEqual(self.calls, [])
+
+    def test_project_start_failure_restores_before_restarting_old_mode(self):
+        self.prepare_project()
+        events = []
+        self.restorer.side_effect = lambda *args, **kw: events.append('restore')
+        original = self.wizard.runner
+        def runner(args, **kwargs):
+            if args[-1] == 'start':
+                events.append('start')
+                if events == ['start']:
+                    raise setup.SetupError('private start failure')
+            return original(args, **kwargs)
+        self.wizard.runner = runner
+        with self.assertRaisesRegex(setup.SetupError, '已恢复原项目配置'):
+            self.wizard.configure_project(self.root / 'project', 'cert-project')
+        self.assertEqual(events, ['start', 'restore', 'start'])
+        self.assertEqual(self.updater.lifecycle.call_args_list, [unittest.mock.call('stop')] * 2)
+        self.assertEqual((self.home / 'data/auth.sqlite3').read_bytes(), b'keep-existing-credentials')
+
+    def test_project_partial_commit_interrupt_restores_stopped_project_without_starting_container(self):
+        self.prepare_project()
+        self.updater.project = self.project_descriptor
+        self.updater.inspect_container.return_value['State']['Running'] = False
+        self.committer.side_effect = KeyboardInterrupt
+        with self.assertRaisesRegex(setup.SetupError, '已恢复原项目配置'):
+            self.wizard.configure_project(self.root / 'project', 'cert-project')
+        self.restorer.assert_called_once()
+        self.assertNotIn(unittest.mock.call('start'), self.updater.lifecycle.call_args_list)
+        self.assertEqual([args[-1] for args, _ in self.calls], ['status', 'start', 'status'])
+
+    def test_project_failed_switch_restores_running_existing_project(self):
+        self.prepare_project()
+        self.updater.project = self.project_descriptor
+        self.committer.side_effect = OSError('private commit failure')
+        with self.assertRaisesRegex(setup.SetupError, '已恢复原项目配置'):
+            self.wizard.configure_project(self.root / 'project', 'cert-project')
+        self.restorer.assert_called_once()
+        self.assertEqual(self.updater.lifecycle.call_args_list[-1], unittest.mock.call('start'))
+
+    def test_project_rollback_failure_does_not_start_uncertain_configuration(self):
+        self.prepare_project()
+        self.committer.side_effect = OSError('private commit failure')
+        self.restorer.side_effect = ValueError('foreign modification')
+        with self.assertRaisesRegex(setup.SetupError, '恢复也未完成'):
+            self.wizard.configure_project(self.root / 'project', 'cert-project')
+        self.assertEqual([args[-1] for args, _ in self.calls], ['status'])
+
+    def test_project_switch_failure_preserves_originally_stopped_supervisor(self):
+        self.prepare_project()
+        self.supervisor_alive = False
+        self.updater.inspect_container.return_value['State']['Running'] = False
+        self.committer.side_effect = OSError('private commit failure')
+        with self.assertRaisesRegex(setup.SetupError, '已恢复原项目配置'):
+            self.wizard.configure_project(self.root / 'project', 'cert-project')
+        self.assertEqual([args[-1] for args, _ in self.calls], ['status'])
+
 
 if __name__ == '__main__':
     unittest.main()

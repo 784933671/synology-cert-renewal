@@ -13,6 +13,11 @@ import subprocess
 import sys
 import time
 
+if __package__:
+    from .container_project import load_project, refresh_project, project_compose
+else:
+    from container_project import load_project, refresh_project, project_compose
+
 DOCKER = '/usr/local/bin/docker'
 CONTAINER = 'synology-cert-web'
 LABEL = 'io.github.784933671.certweb.managed'
@@ -22,7 +27,7 @@ RENEWAL_WAIT_SECONDS = 1800
 ACME_STAMP = '3.1.6\n807da6498377ee5e0cf43a78091f46f12dc59a89\nddbe1bcbd1a44a2623a2af167ebdc678669e6e2eb396742f2d1d28e02dc14220\n'
 WEB_FILES = (
     '.dockerignore', '__init__.py', 'Dockerfile', 'compose.yaml', 'requirements.txt',
-    'access_policy.py', 'container_entry.py', 'deployment.py', 'healthcheck.py',
+    'access_policy.py', 'container_entry.py', 'container_project.py', 'deployment.py', 'healthcheck.py',
     'host_bridge.py', 'install-web.py', 'login_mail.py', 'monitor.py', 'observability.py', 'startup_check.py', 'adaptive_schedule.py', 'network_guard.py', 'tls_sync.py',
     'frontend/index.html', 'frontend/package.json', 'frontend/package-lock.json',
     'frontend/tsconfig.json', 'frontend/vite.config.ts', 'frontend/vitest.config.ts',
@@ -173,6 +178,7 @@ class Upgrade:
         self.config_path = self.home / 'deployment.json'
         self.config = None
         self.native = None
+        self.project = None
 
     def command(self, args, timeout=60):
         try:
@@ -202,6 +208,7 @@ class Upgrade:
         if (self.native / 'ACME-VERSION').read_text() != ACME_STAMP:
             raise UpgradeError('ACME 版本不同，请使用对应版本的迁移流程')
         self.config = config
+        self.project = load_project(self.home, uid=self.uid)
 
     @contextlib.contextmanager
     def locked(self, path):
@@ -226,10 +233,33 @@ class Upgrade:
                 or not re.fullmatch(r'sha256:[0-9a-f]{64}', state.get('old_image', ''))
                 or not re.fullmatch(r'synology-cert-web:upgrade-[0-9a-f]{32}', state.get('tag', ''))
                 or type(state.get('snapshot')) is not bool
+                or ('legacy_project' in state and (not isinstance(state['legacy_project'], str)
+                    or not re.fullmatch(r'[a-z0-9][a-z0-9_-]{0,63}', state['legacy_project'])))
                 or state.get('phase') not in ('prepared', 'switching', 'starting', 'complete', 'rolled_back', 'rollback_failed')):
             raise UpgradeError('升级恢复记录异常，请检查私有备份')
         directory(self.home / 'upgrades' / state['work'], self.uid, True)
         return state
+
+    def restore_project_identity(self, state):
+        name = state.get('legacy_project')
+        if not name:
+            return
+        path = self.home / 'code/deployment.py'
+        regular(path, self.uid, True)
+        source = path.read_text()
+        original = "'compose', '--project-name', 'synology-cert-web', '--env-file'"
+        selected = "'compose', '--project-name', " + repr(name) + ", '--env-file'"
+        if selected in source or 'self.compose_project' in source:
+            return
+        if source.count(original) != 1:
+            raise UpgradeError('旧监督程序无法保留原项目名称，请检查私有恢复备份')
+        # 仅适配回滚运行副本的项目名，备份及原启动稳定检查保持原样。
+        backup = self.home / 'upgrades' / state['work'] / 'legacy-deployment.py'
+        if not backup.exists():
+            atomic_bytes(backup, path.read_bytes())
+        else:
+            regular(backup, self.uid, True)
+        atomic_bytes(path, source.replace(original, selected, 1).encode())
 
     def lifecycle(self, action, backup=None):
         script = self.home / 'code/deployment.py'
@@ -240,6 +270,8 @@ class Upgrade:
             launcher = "import runpy,sys;n=runpy.run_path(sys.argv[1],run_name='certweb_recovery');n['main'].__globals__['__file__']=sys.argv[2];sys.exit(n['main'](['--config',sys.argv[3],sys.argv[4]]))"
             args = [sys.executable, '-I', '-c', launcher, str(backup / 'deployment.py'), str(script), str(self.config_path), action]
         self.command(args, timeout=370)
+        if action == 'start' and self.project:
+            self.command(project_compose(self.home, self.project, 'up', '-d', '--no-build'), timeout=90)
 
     def inspect_container(self):
         names = self.command([DOCKER, 'ps', '-a', '--filter', 'name=^/' + CONTAINER + '$', '--format', '{{.Names}}']).splitlines()
@@ -248,6 +280,11 @@ class Upgrade:
         item = json.loads(self.command([DOCKER, 'inspect', CONTAINER]))[0]
         if item.get('Config', {}).get('Labels', {}).get(LABEL) != 'true':
             raise UpgradeError('同名容器不属于证书管家')
+        if self.project:
+            labels = item.get('Config', {}).get('Labels', {})
+            if (labels.get('com.docker.compose.project') != self.project['name']
+                    or labels.get('com.docker.compose.service') != 'certweb'):
+                raise UpgradeError('容器项目归属不一致，未执行升级')
         return item
 
     def ensure_writers_stopped(self):
@@ -299,6 +336,12 @@ class Upgrade:
         with (work / 'auth.sqlite3').open('rb') as handle:
             os.fsync(handle.fileno())
         manifest = {'native': entries, 'database_owner': [info.st_uid, info.st_gid]}
+        if self.project:
+            current = load_project(self.home, uid=self.uid)
+            if current != self.project:
+                raise UpgradeError('项目配置在升级期间变化')
+            atomic_bytes(work / 'project-compose.yml', (Path(current['directory']) / 'docker-compose.yml').read_bytes())
+            manifest['project'] = current
         atomic_bytes(work / 'manifest.json', json.dumps(manifest).encode())
 
     def healthy(self, image):
@@ -384,6 +427,10 @@ class Upgrade:
                                 type(entry['exists']) is not bool or type(entry['mode']) is not int or
                                 not 0 <= entry['mode'] <= 0o700 or entry['mode'] & 0o077):
                             raise UpgradeError('升级文件备份权限异常')
+                    if manifest.get('project') != self.project:
+                        raise UpgradeError('项目备份与当前部署不一致')
+                    if self.project:
+                        regular(work / 'project-compose.yml', self.uid, True)
                     if previous.exists():
                         directory(previous, self.uid, True)
                         if (self.home / 'code').exists():
@@ -406,6 +453,11 @@ class Upgrade:
                             regular(side, private=True)
                             side.unlink()
                     atomic_bytes(self.home / 'data/auth.sqlite3', (work / 'auth.sqlite3').read_bytes(), owner=manifest['database_owner'])
+                    if self.project:
+                        atomic_bytes(Path(self.project['directory']) / 'docker-compose.yml',
+                                     (work / 'project-compose.yml').read_bytes())
+                        load_project(self.home, uid=self.uid)
+                self.restore_project_identity(state)
                 self.command([DOCKER, 'tag', state['old_image'], 'synology-cert-web:local'])
         except (Exception, KeyboardInterrupt):
             errors.append('restore')
@@ -452,6 +504,12 @@ class Upgrade:
                     return self.restore(state)
             changes = self.native_changes()
             item = self.inspect_container()
+            labels = item.get('Config', {}).get('Labels', {}) if item else {}
+            legacy_project = labels.get('com.docker.compose.project') if not self.project else None
+            if legacy_project is not None and (not isinstance(legacy_project, str)
+                    or not re.fullmatch(r'[a-z0-9][a-z0-9_-]{0,63}', legacy_project)
+                    or labels.get('com.docker.compose.service') != 'certweb'):
+                raise UpgradeError('原容器的 Compose 项目归属无效，未执行升级')
             old_image = item.get('Image') if item else self.command([DOCKER, 'image', 'inspect', 'synology-cert-web:local', '--format', '{{.Id}}']).strip()
             if not isinstance(old_image, str) or not re.fullmatch(r'sha256:[0-9a-f]{64}', old_image):
                 raise UpgradeError('无法确认已有管理镜像')
@@ -468,6 +526,8 @@ class Upgrade:
             if not re.fullmatch(r'sha256:[0-9a-f]{64}', image):
                 raise UpgradeError('新镜像构建结果无法确认')
             state = {'version': 1, 'work': work.name, 'old_image': old_image, 'tag': tag, 'phase': 'prepared', 'snapshot': False}
+            if legacy_project and legacy_project != 'synology-cert-web':
+                state['legacy_project'] = legacy_project
             self.save_journal(state)
             stop_attempted = False
             try:
@@ -490,6 +550,7 @@ class Upgrade:
                         fsync_directory(self.home)
                         fsync_directory(work)
                         self.command([DOCKER, 'tag', tag, 'synology-cert-web:local'])
+                        refresh_project(self.home, self.command, uid=self.uid)
                         state['phase'] = 'starting'
                         self.save_journal(state)
                 self.lifecycle('start')

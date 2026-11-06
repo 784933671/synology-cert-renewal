@@ -12,6 +12,7 @@ import signal
 import stat
 import subprocess
 import sys
+import tempfile
 import time
 from urllib.parse import urlsplit
 
@@ -20,12 +21,14 @@ if __package__:
     from .network_guard import NetworkGuard, GuardError, validate_network
     from .tls_sync import sync_tls, TLSBusy
     from . import monitor as health_monitor
+    from .container_project import load_project, project_compose
 else:
     sys.path.insert(0, str(Path(__file__).resolve().parent))
     from access_policy import read_policy, initialize_policy, write_policy, write_applied
     from network_guard import NetworkGuard, GuardError, validate_network
     from tls_sync import sync_tls, TLSBusy
     import monitor as health_monitor
+    from container_project import load_project, project_compose
 
 CONTAINER = 'synology-cert-web'
 MANAGED_LABEL = 'io.github.784933671.certweb.managed'
@@ -123,6 +126,9 @@ class Deployment:
         self.config, self.config_path = config, Path(config_path)
         self.home = Path(config['home'])
         self.code = self.home / 'code'
+        self.project = load_project(self.home)
+        self.compose_project = 'synology-cert-web'
+        self.project_granted = False
         self.access_path = self.home / 'access/access.json'
         self.guard = NetworkGuard(config['bind'], config['networks'], config['denied'], config['port'])
         self.bridge = None
@@ -160,20 +166,65 @@ class Deployment:
         return result.stdout
 
     def compose(self, *args):
-        return self.command(['/usr/local/bin/docker', 'compose', '--project-name', 'synology-cert-web', '--env-file', str(self.home / 'deployment.env'), '-f', str(self.code / 'compose.yaml')] + list(args), timeout=90)
+        if self.project:
+            return self.command(project_compose(self.home, self.project, *args), timeout=90)
+        return self.command(['/usr/local/bin/docker', 'compose', '--project-name', self.compose_project, '--env-file', str(self.home / 'deployment.env'), '-f', str(self.code / 'compose.yaml')] + list(args), timeout=90)
+
+    def project_ready(self, ready):
+        if not self.project:
+            return
+        if not ready:
+            self.project_granted = False
+        path = self.home / 'bridge/project-ready.json'
+        descriptor, temporary = tempfile.mkstemp(prefix='.project-ready-', dir=str(path.parent))
+        try:
+            with os.fdopen(descriptor, 'w') as handle:
+                os.fchown(handle.fileno(), 0, 10100)
+                os.fchmod(handle.fileno(), 0o640)
+                json.dump({'version': 1, 'ready': ready, 'expires_at': time.time() + 25}, handle)
+                handle.flush()
+                os.fsync(handle.fileno())
+            os.replace(temporary, str(path))
+        finally:
+            if os.path.exists(temporary):
+                os.unlink(temporary)
 
     def container(self):
         result = subprocess.run(['/usr/local/bin/docker', 'inspect', CONTAINER], env=self.env, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, universal_newlines=True, timeout=15)
         if result.returncode:
             self.command(['/usr/local/bin/docker', 'info', '--format', '{{.ServerVersion}}'], timeout=15)
             return None
-        item = json.loads(result.stdout)[0]
-        if item.get('Config', {}).get('Labels', {}).get(MANAGED_LABEL) != 'true':
+        items = json.loads(result.stdout)
+        if (not isinstance(items, list) or len(items) != 1 or not isinstance(items[0], dict)
+                or not isinstance(items[0].get('Config'), dict)
+                or not isinstance(items[0]['Config'].get('Labels'), dict)
+                or not isinstance(items[0].get('State', {}), dict)):
+            raise RuntimeError('Docker 容器状态无效')
+        item = items[0]
+        labels = item['Config']['Labels']
+        if labels.get(MANAGED_LABEL) != 'true':
             raise RuntimeError('同名容器不属于本服务')
+        if self.project:
+            if (labels.get('com.docker.compose.project') != self.project['name']
+                    or labels.get('com.docker.compose.service') != 'certweb'):
+                raise RuntimeError('管理容器属于其他项目，请核对 Container Manager 项目名称')
+        else:
+            name = labels.get('com.docker.compose.project')
+            if name is not None:
+                if (not isinstance(name, str) or not re.fullmatch(r'[a-z0-9][a-z0-9_-]{0,63}', name)
+                        or labels.get('com.docker.compose.service') != 'certweb'):
+                    raise RuntimeError('现有容器的 Compose 项目归属无效')
+                # 首次升级也沿用已有 DSM 项目名，避免同名容器冲突。
+                self.compose_project = name
         self.last_container = item
         return item
 
     def stop_container(self):
+        try:
+            self.project_ready(False)
+        except OSError:
+            # 就绪文件写入失败也必须继续执行容器停服。
+            self.project_granted = False
         try:
             container = self.container()
             if container and container.get('State', {}).get('Running'):
@@ -294,7 +345,7 @@ class Deployment:
                 pass
 
     def start_startup_check(self):
-        """启动补检独立于 HTTPS；首个容器只建基线，后续真正重启才再检查。"""
+        """启动补检独立于 HTTPS；同步启动只建基线，项目稍后启动或真正重启才再检查。"""
         if self.stopping or self.startup_requested_generation is None:
             return
         item = self.observed_container
@@ -306,7 +357,8 @@ class Deployment:
                                 and isinstance(began, str) and len(began) <= 64
                                 and state.get('Running') is True and not state.get('Restarting') else None)
         if container_generation is not None:
-            if self.startup_container_generation is not None and container_generation != self.startup_container_generation:
+            if ((self.startup_container_generation is not None and container_generation != self.startup_container_generation)
+                    or (self.project and self.startup_container_generation is None and self.startup_done)):
                 self.startup_requested_generation = container_generation
             self.startup_container_generation = container_generation
         generation = self.startup_requested_generation
@@ -601,27 +653,60 @@ class Deployment:
             running = bool(item and item.get('State', {}).get('Running') and not item['State'].get('Restarting'))
             if running:
                 self.started = True
-                self.ready_since = None
+                if not self.project or self.project_granted:
+                    self.ready_since = None
             elif self.started:
                 self.started = False
+                self.project_ready(False)
                 self.ready_since = None
-                self.report('waiting', '检测到管理容器因内存不足退出，等待环境连续稳定后重新启动。'
+                self.report('waiting', '检测到项目容器已停止；宿主监督继续运行，等待从 Container Manager 项目启动。' if self.project else
+                            '检测到管理容器因内存不足退出，等待环境连续稳定后重新启动。'
                             if item and item.get('State', {}).get('OOMKilled') is True
                             else '检测到管理容器已退出，等待环境连续稳定后重新启动。')
             if not tls_ready:
+                self.project_ready(False)
                 self.phase = 'tls'
                 self.ready_since = None
                 self.report('waiting', '续期任务正在处理 HTTPS 材料，暂停管理容器启动计时。')
                 return
             if not bridge_ready:
+                self.project_ready(False)
                 self.phase = 'bridge'
                 self.ready_since = None
                 self.report('waiting', '等待群晖桥接服务就绪，暂停管理容器启动计时。')
                 return
             if not credentials_ready:
+                self.project_ready(False)
                 self.phase = 'credentials'
                 self.ready_since = None
                 self.report('setup', '等待管理员账号初始化。')
+                return
+            if self.project:
+                environment = item.get('Config', {}).get('Env') if item else None
+                if running and (not isinstance(environment, list)
+                                or [value for value in environment if isinstance(value, str)
+                                    and value.startswith('CERTWEB_PROJECT_MODE=')] != ['CERTWEB_PROJECT_MODE=1']):
+                    self.phase = 'project-config'
+                    raise RuntimeError('请在 Container Manager 项目中应用新配置')
+                if not self.project_granted:
+                    current = self.clock()
+                    if self.ready_since is None or current < self.ready_since:
+                        self.ready_since = current
+                    if current - self.ready_since < START_STABLE_SECONDS:
+                        self.project_ready(False)
+                        self.report('stabilizing', '项目启动条件已就绪，等待连续稳定 60 秒后开放管理服务。')
+                        return
+                    if not self.report('starting', '环境已连续稳定 60 秒，正在开放项目 HTTPS 服务。'):
+                        self.project_ready(False)
+                        return
+                if self.stopping:
+                    self.project_ready(False)
+                    return
+                self.project_ready(True)
+                self.project_granted = True
+                self.phase = 'running' if running else 'project'
+                self.report('running' if running else 'waiting', '管理服务由 Container Manager 项目托管。' if running
+                            else '宿主条件已就绪，等待在 Container Manager 项目中启动容器。')
                 return
             if not running:
                 self.phase = 'stability'
@@ -655,6 +740,7 @@ class Deployment:
             self.observed_container = None
             labels = {'policy': '访问策略或防火墙检查失败', 'tls': 'HTTPS 材料检查失败',
                       'bridge': '群晖桥接检查失败', 'docker': 'Docker 状态检查失败',
+                      'project-config': 'Container Manager 项目尚未应用启动检查配置，请在项目中重新构建',
                       'start': '管理容器启动失败'}
             reason = labels.get(self.phase, '管理服务启动条件检查失败') + self.firewall_detail(firewall_failure)
             self.report('stopping', reason + '，正在停止管理容器。')
@@ -678,6 +764,7 @@ class Deployment:
             except BlockingIOError:
                 return 0
             private_json(self.home / 'supervisor.pid', {'pid': os.getpid()})
+            self.project_ready(False)
             for sig in (signal.SIGTERM, signal.SIGINT):
                 signal.signal(sig, lambda *_: setattr(self, 'stopping', True))
             try:

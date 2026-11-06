@@ -28,17 +28,29 @@ class DockerFixture:
         self.running = True
         self.alias = self.image = OLD
         self.failed_build = self.failed_health = self.failed_stop = False
+        self.failed_project_start = False
+        self.stopped_for_maintenance = False
         self.other_writer = False
         self.migrate = False
         self.before_stop = None
         self.after_start = None
+        self.project_name = None
+        self.project_render = None
 
     def __call__(self, args, timeout=60):
         self.calls.append(args)
         if args[0].endswith('docker'):
             command = args[1:]
+            if command[0] == 'compose':
+                if command[-3:] == ['config', '--format', 'json']:
+                    return json.dumps(self.project_render)
+                if command[-3:] == ['up', '-d', '--no-build']:
+                    if self.failed_project_start and self.alias == NEW:
+                        raise RuntimeError('secret-project-start-error')
+                    self.start_container()
+                    return ''
             if command[0] == 'build':
-                if not self.running:
+                if self.stopped_for_maintenance:
                     raise AssertionError('build must precede downtime')
                 if self.failed_build:
                     raise RuntimeError('secret-error-must-not-escape')
@@ -46,6 +58,8 @@ class DockerFixture:
                     self.before_stop()
                 return ''
             if command[:2] == ['image', 'inspect']:
+                if command[2].endswith(':local') and self.alias is None:
+                    raise RuntimeError('local image tag is missing')
                 return self.alias if command[2].endswith(':local') else NEW
             if command[0] == 'tag':
                 self.alias = OLD if command[1] == OLD else NEW
@@ -57,26 +71,35 @@ class DockerFixture:
             if command[:2] == ['inspect', '--format']:
                 return json.dumps([{'RW': True, 'Source': str(self.home / 'data')}])
             if command == ['inspect', 'synology-cert-web']:
-                return json.dumps([{'Image': self.image, 'Config': {'Labels': {'io.github.784933671.certweb.managed': 'true'}},
+                labels = {'io.github.784933671.certweb.managed': 'true'}
+                if self.project_name:
+                    labels.update({'com.docker.compose.project': self.project_name, 'com.docker.compose.service': 'certweb'})
+                return json.dumps([{'Image': self.image, 'Config': {'Labels': labels},
                                     'State': {'Running': self.running, 'Restarting': False,
                                               'Health': {'Status': 'unhealthy' if self.failed_health and self.image == NEW else 'healthy'}}}])
             raise AssertionError(args)
         action = args[-1]
         if action == 'stop':
+            self.stopped_for_maintenance = True
             if self.failed_stop:
                 raise RuntimeError('secret-stop-error')
             self.running = False
         elif action == 'start':
-            self.running = True
-            self.image = self.alias
-            if self.migrate and self.image == NEW:
-                with sqlite3.connect(str(self.home / 'data/auth.sqlite3')) as c:
-                    c.execute('CREATE TABLE upgraded_table (value TEXT)')
-            if self.after_start:
-                self.after_start()
+            self.stopped_for_maintenance = False
+            if not (self.home / 'container-project.json').exists():
+                self.start_container()
         else:
             raise AssertionError(args)
         return ''
+
+    def start_container(self):
+        self.running = True
+        self.image = self.alias
+        if self.migrate and self.image == NEW:
+            with sqlite3.connect(str(self.home / 'data/auth.sqlite3')) as c:
+                c.execute('CREATE TABLE upgraded_table (value TEXT)')
+        if self.after_start:
+            self.after_start()
 
 
 class UpgradeTests(unittest.TestCase):
@@ -469,6 +492,145 @@ class UpgradeTests(unittest.TestCase):
         count = len(self.runner.calls)
         self.assertEqual(self.upgrade.recover(), {'recovered': False})
         self.assertEqual(len(self.runner.calls), count)
+
+    def enable_project(self):
+        from web.container_project import export_project
+        self.runner.project_name = 'cert-project'
+        self.runner.project_render = {'services': {'certweb': {
+            'image': 'synology-cert-web:local', 'container_name': 'synology-cert-web',
+            'network_mode': 'host', 'user': '10100:10100', 'read_only': True, 'init': True,
+            'restart': 'no', 'cap_drop': ['ALL'], 'security_opt': ['no-new-privileges:true'],
+            'labels': {'io.github.784933671.certweb.managed': 'true'},
+            'environment': {'OLD_CONFIG': 'kept'},
+            'volumes': [{'type': 'bind', 'source': str(self.home / name), 'target': '/' + name,
+                         'read_only': name != 'data'} for name in ('data', 'bridge', 'tls', 'access')]}}}
+        self.project = export_project(self.home, self.root / 'project', 'cert-project', self.runner, uid=os.getuid())
+        self.project_file = self.root / 'project/docker-compose.yml'
+        self.old_project = self.project_file.read_bytes()
+        self.runner.calls.clear()
+
+    def test_project_upgrade_refreshes_saved_file_and_starts_same_project(self):
+        self.enable_project()
+        self.runner.project_render['services']['certweb']['environment']['NEW_CONFIG'] = 'updated'
+        self.upgrade.run()
+        manifest = json.loads(self.project_file.read_text())
+        self.assertEqual(manifest['services']['certweb']['environment']['NEW_CONFIG'], 'updated')
+        starts = [args for args in self.runner.calls if args[-3:] == ['up', '-d', '--no-build']]
+        self.assertEqual(len(starts), 1)
+        self.assertEqual(starts[0][starts[0].index('--project-name') + 1], 'cert-project')
+        self.assertEqual(starts[0][starts[0].index('-f') + 1], str(self.project_file))
+        self.assertTrue(self.runner.running)
+        self.assertEqual(self.runner.image, NEW)
+        self.assert_preserved()
+
+    def test_explicit_upgrade_starts_previously_stopped_project_after_build(self):
+        self.enable_project()
+        self.runner.running = False
+        self.assertTrue(self.upgrade.run()['upgraded'])
+        build = next(index for index, args in enumerate(self.runner.calls) if args[1:2] == ['build'])
+        stop = next(index for index, args in enumerate(self.runner.calls) if args[-1] == 'stop')
+        self.assertLess(build, stop)
+        self.assertTrue(self.runner.running)
+        self.assertEqual(self.runner.image, NEW)
+        self.assertEqual(json.loads(self.upgrade.journal.read_text())['phase'], 'complete')
+        self.assert_preserved()
+
+    def test_project_upgrade_recreates_missing_local_tag_before_refresh(self):
+        self.enable_project()
+        self.runner.alias = None
+        self.runner.project_render['services']['certweb']['environment']['NEW_CONFIG'] = 'updated'
+        self.assertTrue(self.upgrade.run()['upgraded'])
+        self.assertEqual((self.runner.alias, self.runner.image), (NEW, NEW))
+        self.assertTrue(self.runner.running)
+        state = json.loads(self.upgrade.journal.read_text())
+        self.assertEqual(state['old_image'], OLD)
+        self.assertEqual(state['phase'], 'complete')
+        manifest = json.loads(self.project_file.read_text())
+        self.assertEqual(manifest['services']['certweb']['environment']['NEW_CONFIG'], 'updated')
+        self.assert_preserved()
+
+    def test_project_refresh_failure_restores_missing_local_tag_to_old_image(self):
+        self.enable_project()
+        self.runner.alias = None
+        self.runner.project_render = {'invalid': 'DO_NOT_PRINT'}
+        with self.assertRaisesRegex(UpgradeError, '已恢复原版本') as caught:
+            self.upgrade.run()
+        self.assertNotIn('DO_NOT_PRINT', str(caught.exception))
+        self.assertEqual((self.runner.alias, self.runner.image), (OLD, OLD))
+        self.assertTrue(self.runner.running)
+        self.assertEqual(self.project_file.read_bytes(), self.old_project)
+        self.assertEqual((self.home / 'code/deployment.py').read_text(), '# original deployment\n')
+        self.assertEqual(json.loads(self.upgrade.journal.read_text())['phase'], 'rolled_back')
+        self.assert_preserved()
+
+    def test_failed_project_compose_start_restores_original_deployment(self):
+        self.enable_project()
+        self.runner.project_render['services']['certweb']['environment']['NEW_CONFIG'] = 'updated'
+        self.runner.failed_project_start = True
+        with self.assertRaisesRegex(UpgradeError, '已恢复原版本') as caught:
+            self.upgrade.run()
+        self.assertNotIn('secret-project-start-error', str(caught.exception))
+        state = json.loads(self.upgrade.journal.read_text())
+        self.assertEqual(self.project_file.read_bytes(), self.old_project)
+        self.assertEqual((self.home / 'data/auth.sqlite3').read_bytes(),
+                         (self.home / 'upgrades' / state['work'] / 'auth.sqlite3').read_bytes())
+        self.assertEqual((self.home / 'code/deployment.py').read_text(), '# original deployment\n')
+        self.assertEqual((self.runner.alias, self.runner.image), (OLD, OLD))
+        self.assertTrue(self.runner.running)
+        self.assertEqual(state['phase'], 'rolled_back')
+        starts = [args for args in self.runner.calls if args[-3:] == ['up', '-d', '--no-build']]
+        self.assertEqual(len(starts), 2)
+        for arguments in starts:
+            self.assertEqual(arguments[arguments.index('--project-name') + 1], 'cert-project')
+            self.assertEqual(arguments[arguments.index('-f') + 1], str(self.project_file))
+        for name in NATIVE_FILES:
+            self.assertEqual((self.native / name).read_text(), 'old:' + name)
+        self.assert_preserved()
+
+    def test_failed_project_upgrade_restores_manifest_and_old_image(self):
+        self.enable_project()
+        self.runner.project_render['services']['certweb']['environment']['NEW_CONFIG'] = 'updated'
+        self.runner.failed_health = True
+        with self.assertRaises(UpgradeError):
+            self.upgrade.run()
+        self.assertEqual(self.project_file.read_bytes(), self.old_project)
+        self.assertEqual(self.runner.image, OLD)
+        self.assert_preserved()
+
+    def test_project_identity_conflict_is_rejected_before_build_or_stop(self):
+        self.enable_project()
+        self.runner.project_name = 'other-project'
+        with self.assertRaises(UpgradeError):
+            self.upgrade.run()
+        self.assertFalse(any(args[-1] == 'stop' or args[1:2] == ['build'] for args in self.runner.calls))
+        self.assertEqual(self.project_file.read_bytes(), self.old_project)
+
+    def test_project_refresh_failure_restores_manifest_before_restart(self):
+        self.enable_project()
+        self.runner.project_render = {'invalid': 'DO_NOT_PRINT'}
+        with self.assertRaises(UpgradeError):
+            self.upgrade.run()
+        self.assertEqual(self.project_file.read_bytes(), self.old_project)
+        self.assertEqual(self.runner.image, OLD)
+
+    def test_first_custom_project_upgrade_failure_retains_name_in_legacy_supervisor(self):
+        self.runner.project_name = 'existing-project'
+        original = "args = ['docker', 'compose', '--project-name', 'synology-cert-web', '--env-file', 'private.env']\n"
+        self.write(self.home / 'code/deployment.py', original)
+        self.runner.failed_health = True
+        with self.assertRaisesRegex(UpgradeError, '已恢复原版本'):
+            self.upgrade.run()
+        state = json.loads(self.upgrade.journal.read_text())
+        self.assertEqual(state['legacy_project'], 'existing-project')
+        self.assertIn("'--project-name', 'existing-project'", (self.home / 'code/deployment.py').read_text())
+        self.assertEqual((self.home / 'upgrades' / state['work'] / 'legacy-deployment.py').read_text(), original)
+        self.assertEqual(self.runner.image, OLD)
+        self.assertFalse(any(args[-3:] == ['up', '-d', '--no-build'] for args in self.runner.calls))
+
+    def test_unrecognized_legacy_supervisor_is_not_rewritten(self):
+        with self.assertRaisesRegex(UpgradeError, '无法保留'):
+            self.upgrade.restore_project_identity({'legacy_project': 'existing-project'})
+        self.assertEqual((self.home / 'code/deployment.py').read_text(), '# original deployment\n')
 
 
 if __name__ == '__main__':

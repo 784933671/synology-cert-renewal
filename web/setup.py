@@ -25,6 +25,8 @@ import time
 if not __package__:
     sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from web.deployment import load_config, MANAGED_LABEL
+from web.container_project import (prepare_project, commit_project, load_project,
+                                   capture_project_state, restore_project_state, ProjectImageError)
 from web.login_mail import email_valid
 from web.network_guard import validate_network
 from web.setup_upgrade import Upgrade, UpgradeError, atomic_bytes, regular, directory, ACME_STAMP, copy_payload, fsync_directory
@@ -491,11 +493,97 @@ class Wizard:
         else:
             print('允许外网模式已选择；路由器端口映射与公网 DNS 需自行配置。')
 
+    def configure_project(self, project_directory, name):
+        config = load_config(self.home / 'deployment.json')
+        journal = self.state / 'install.json'
+        if journal.exists():
+            installation = read_private(journal, self.uid)
+            if not isinstance(installation, dict) or installation.get('complete') is not True:
+                raise SetupError('请先使用原安装包完成安装，再启用项目托管')
+        if not (self.home / 'code/container_project.py').is_file():
+            raise SetupError('请先运行 setup.sh upgrade 安装支持项目托管的版本')
+        regular(self.home / 'code/container_project.py', self.uid, private=True)
+        updater = Upgrade(self.source, self.home, runner=self.runner, uid=self.uid)
+        updater.validate()
+        with updater.locked(self.home / 'upgrade.lock'):
+            if updater.journal.exists() and updater.read_journal()['phase'] not in ('complete', 'rolled_back'):
+                raise SetupError('存在未完成的升级，请先运行 setup.sh recover')
+            if not (self.home / 'data/auth.sqlite3').is_file() or not RC.exists():
+                raise SetupError('请先完成安装并升级到支持项目托管的版本')
+            def check_identity():
+                item = updater.inspect_container()
+                if item:
+                    labels = item.get('Config', {}).get('Labels', {})
+                    if labels.get('com.docker.compose.project') != name or labels.get('com.docker.compose.service') != 'certweb':
+                        raise SetupError('现有容器的项目名称或服务不匹配，请按实际项目名称导出')
+                return item
+            check_identity()
+            try:
+                prepared = prepare_project(self.home, project_directory, name, self.runner, uid=self.uid)
+            except ProjectImageError as exc:
+                raise SetupError(str(exc)) from None
+            start = [sys.executable, '-I', str(self.home / 'code/deployment.py'),
+                     '--config', str(self.home / 'deployment.json'), 'start']
+            def supervisor_running():
+                status = json.loads(self.runner(start[:-1] + ['status']))
+                if not isinstance(status, dict) or type(status.get('supervisor_running')) is not bool:
+                    raise SetupError('无法确认主机监督状态')
+                return status['supervisor_running']
+
+            def verify_supervisor():
+                for _ in range(5):
+                    self.sleep(1)
+                    if supervisor_running():
+                        return
+                raise SetupError('主机监督启动未完成')
+
+            # 与原续期共用互斥锁，切换和回滚都不能中断正在执行的证书任务。
+            with updater.locked(updater.native / 'state/run.lock'):
+                was_supervised = supervisor_running()
+                original = check_identity()
+                was_running = bool(original and original.get('State', {}).get('Running'))
+                snapshot = None
+                try:
+                    updater.lifecycle('stop')
+                    with updater.locked(self.home / 'supervisor.lock'):
+                        updater.ensure_writers_stopped()
+                        check_identity()
+                        snapshot = capture_project_state(self.home, prepared, uid=self.uid)
+                        project = commit_project(self.home, prepared, uid=self.uid)
+                    # 此命令只启动宿主监督；容器由 DSM 项目启动。
+                    self.runner(start)
+                    verify_supervisor()
+                except (Exception, KeyboardInterrupt):
+                    try:
+                        updater.lifecycle('stop')
+                        with updater.locked(self.home / 'supervisor.lock'):
+                            updater.ensure_writers_stopped()
+                            if snapshot is not None:
+                                restore_project_state(self.home, snapshot, uid=self.uid)
+                        if was_supervised or was_running:
+                            if was_running and updater.project:
+                                updater.lifecycle('start')
+                            else:
+                                self.runner(start)
+                            verify_supervisor()
+                    except (Exception, KeyboardInterrupt):
+                        raise SetupError('项目切换未完成，恢复也未完成；请核对私有项目配置和监督状态后重新运行同一命令，原续期任务未修改') from None
+                    raise SetupError('项目切换未完成，已恢复原项目配置和运行方式；原续期任务未修改，请检查后重试') from None
+        print('项目配置：{}\n项目名称：{}\n请在 Container Manager“项目”中使用此目录和配置创建或更新同名项目，再启动。'.format(
+            Path(project['directory']) / 'docker-compose.yml', project['name']))
+        print('宿主监督继续维护桥接、防火墙和证书；容器由项目启停，就绪检查通过后开放 {}。'.format(config['origin']))
+
 
 def main(argv=None):
     parser = argparse.ArgumentParser(description='证书管家：一条命令引导安装、保留配置升级或只读检查')
-    parser.add_argument('command', nargs='?', choices=('auto', 'install', 'upgrade', 'recover', 'check'), default='auto')
+    parser.add_argument('command', nargs='?', choices=('auto', 'install', 'upgrade', 'recover', 'check', 'project'), default='auto')
+    parser.add_argument('--directory', type=Path, help='Container Manager 项目的专用空目录')
+    parser.add_argument('--name', default='synology-cert-web', help='Container Manager 项目名称')
     args = parser.parse_args(argv)
+    if args.command == 'project' and args.directory is None:
+        parser.error('project 需要 --directory 指定项目目录')
+    if args.command != 'project' and (args.directory is not None or args.name != 'synology-cert-web'):
+        parser.error('--directory 和 --name 仅适用于 project')
     os.umask(0o077)
     os.environ['PATH'] = ENV['PATH']
     wizard = Wizard()
@@ -505,6 +593,9 @@ def main(argv=None):
             if (HOME / 'deployment.json').exists():
                 config = load_config(HOME / 'deployment.json')
                 print('已有管理层；入口 {}；任务编号 {}。检查模式未写入配置。'.format(config['origin'], config.get('task_id', 7)))
+                project = load_project(HOME)
+                if project:
+                    print('Container Manager 项目：{}；配置目录 {}。'.format(project['name'], project['directory']))
             else:
                 print('首次安装环境可用；还需在向导中确认邮件、证书和内网参数。检查模式未写入配置。')
             return 0
@@ -517,7 +608,9 @@ def main(argv=None):
                 if not isinstance(state, dict):
                     raise SetupError('安装进度格式不正确，请先检查私有安装记录')
                 command = 'install' if state and not state.get('complete') else 'upgrade' if (HOME / 'deployment.json').exists() else 'install'
-            if command in ('upgrade', 'recover'):
+            if command == 'project':
+                wizard.configure_project(args.directory, args.name)
+            elif command in ('upgrade', 'recover'):
                 updater = Upgrade(SOURCE, HOME)
                 print('正在构建并检查升级镜像；切换前会备份现有代码和认证数据。' if command == 'upgrade' else '正在检查未完成的升级事务。')
                 result = updater.run() if command == 'upgrade' else updater.recover()
