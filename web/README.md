@@ -172,7 +172,7 @@ sudo sh setup.sh project --directory /volume1/docker/synology-cert-web --name sy
 - **重启与保护停服**：`restart` 保持 `no`。NAS 重启后在 DSM 项目启动；保护性停服后先处理日志中的环境问题，再从项目启动。停止主机监督会关闭管理服务，恢复监督也不会擅自拉起容器。
 - **升级与回滚**：继续使用 `sudo sh setup.sh upgrade` / `recover`。这属于明确的维护操作，会沿保存的项目名和同一 `docker-compose.yml` 执行 Compose 启动，必要时重建容器使新镜像生效；升级刷新项目配置，回滚恢复原配置。不要改成禁止重建，否则无法切换镜像。
 
-切换后在目标 NAS 核对 HTTPS、登录、桥接、原续期任务以及 DSM 项目停止/启动行为；已有[部署验收记录](DEPLOYMENT.md)不代表项目模式已完成实机验收。
+每台 NAS 切换后仍须核对 HTTPS、登录、桥接、原续期任务及项目停止/启动行为。本 NAS 已完成 2026-11-06 的 Compose 实机验收，图形界面项目登记尚需同名导入；范围与证据见[部署验收记录](DEPLOYMENT.md)。
 
 ## 高级分步安装
 
