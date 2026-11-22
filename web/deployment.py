@@ -594,6 +594,23 @@ class Deployment:
         diagnostic = event['diagnostic']
         return '（IPv{}：{}）'.format(diagnostic['family'], FIREWALL_REASONS[diagnostic['reason']])
 
+    @staticmethod
+    def project_uses_readiness_gate(item):
+        environment = item.get('Config', {}).get('Env') if item else None
+        return (isinstance(environment, list)
+                and [value for value in environment if isinstance(value, str)
+                     and value.startswith('CERTWEB_PROJECT_MODE=')] == ['CERTWEB_PROJECT_MODE=1'])
+
+    def can_repair_starting_project(self):
+        try:
+            # 项目可在两次轮询间启动。先撤销旧租约，再确认容器仍受就绪检查约束。
+            self.project_ready(False)
+            item = self.container()
+        except (OSError, ValueError, TypeError, KeyError, RuntimeError, subprocess.TimeoutExpired):
+            return False
+        state = (item or {}).get('State', {})
+        return state.get('Running') is True and not state.get('Restarting') and self.project_uses_readiness_gate(item)
+
     def record_firewall_failure(self, event):
         if event is None:
             return
@@ -629,8 +646,12 @@ class Deployment:
         if not self.guard.valid():
             failure = self.take_firewall_failure()
             repaired, repair_failure = False, None
-            attempted = bool(self.started and failure and failure['diagnostic']['reason'] not in ('entry_order_unknown', 'query_failed'))
-            ready_before_repair = self.ready_since
+            attempted = False
+            if failure and failure['diagnostic']['reason'] not in ('entry_order_unknown', 'query_failed'):
+                attempted = self.started
+                if self.project and not attempted:
+                    attempted = self.can_repair_starting_project()
+            ready_before_repair = None if self.project and not self.project_granted else self.ready_since
             if attempted:
                 self.report('repairing', '检测到管理入口防火墙规则变化' + self.firewall_detail(failure) + '，正在原子修复本服务规则。')
                 try:
@@ -729,10 +750,7 @@ class Deployment:
                 self.report('setup', '等待管理员账号初始化。')
                 return
             if self.project:
-                environment = item.get('Config', {}).get('Env') if item else None
-                has_gate = (isinstance(environment, list)
-                            and [value for value in environment if isinstance(value, str)
-                                 and value.startswith('CERTWEB_PROJECT_MODE=')] == ['CERTWEB_PROJECT_MODE=1'])
+                has_gate = self.project_uses_readiness_gate(item)
                 if running and not has_gate:
                     self.phase = 'project-config'
                     raise RuntimeError('请在 Container Manager 项目中应用新配置')

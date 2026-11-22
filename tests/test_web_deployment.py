@@ -1035,6 +1035,71 @@ class ContainerProjectLifecycleTests(unittest.TestCase):
         self.tick(140)
         self.assertTrue(self.gates[-1])
 
+    def missing_project_jump(self):
+        self.service.guard.last_diagnostic = {
+            'version': 1, 'family': 4, 'reason': 'jump_missing', 'hook': 'INPUT_FIREWALL',
+            'jump_position': -1, 'reference_count': 0, 'chain_exists': True,
+            'fingerprints': dict.fromkeys(('entry', 'hook', 'owned_chain', 'references', 'expected'), 'a' * 64),
+        }
+        return False
+
+    def test_project_firewall_repair_keeps_new_container_running_and_restarts_stability_window(self):
+        self.tick(0)
+        self.tick(60)
+        self.assertTrue(self.gates[-1])
+        self.running = True
+        self.service.guard.valid.side_effect = self.missing_project_jump
+
+        def repaired():
+            self.assertFalse(self.gates[-1])
+            self.service.guard.valid.side_effect = None
+            return True
+
+        self.service.guard.repair_live = Mock(side_effect=repaired)
+        self.tick(70)
+        self.service.guard.repair_live.assert_called_once()
+        self.service.stop_container.assert_not_called()
+        self.service.guard.install.assert_not_called()
+        self.assertTrue(self.running)
+        self.assertFalse(self.gates[-1])
+
+        self.service.guard.valid.side_effect = self.missing_project_jump
+        self.tick(100)
+        self.tick(159)
+        self.assertFalse(self.gates[-1])
+        self.tick(160)
+        self.assertTrue(self.gates[-1])
+        self.service.stop_container.assert_not_called()
+        self.service.compose.assert_not_called()
+
+    def test_project_firewall_repair_failure_keeps_protective_stop(self):
+        self.running = True
+        self.service.guard.valid.side_effect = self.missing_project_jump
+        sequence = []
+        self.service.guard.repair_live = Mock(side_effect=lambda: sequence.append('atomic'))
+        stop = self.service.stop_container.side_effect
+
+        def stopped():
+            sequence.append('stop')
+            stop()
+
+        self.service.stop_container.side_effect = stopped
+        self.service.guard.install.side_effect = lambda: sequence.append('cold')
+        self.tick(0)
+        self.assertEqual(sequence, ['atomic', 'stop', 'cold'])
+        self.assertFalse(self.running)
+        self.assertFalse(self.gates[-1])
+
+    def test_project_firewall_repair_requires_a_verified_container_gate(self):
+        self.running = True
+        self.service.container.side_effect = lambda: {'State': {'Running': self.running}, 'Config': {'Env': []}}
+        self.service.guard.valid.side_effect = self.missing_project_jump
+        self.service.guard.repair_live = Mock(return_value=True)
+        self.tick(0)
+        self.service.guard.repair_live.assert_not_called()
+        self.service.stop_container.assert_called_once()
+        self.assertFalse(self.gates[-1])
+
     def test_first_grant_requires_persisted_status_and_fresh_stable_window_after_failure(self):
         self.running = True
         self.tick(0)
