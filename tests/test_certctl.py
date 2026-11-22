@@ -227,6 +227,14 @@ class CertificateTests(unittest.TestCase):
             certctl.fingerprint(self.controller.current_cert()))
         self.controller.log = mock.Mock()
 
+    def mock_certificate_clock(self):
+        clock = mock.Mock(wraps=certctl.time)
+        clock.sleep = mock.Mock()
+        patch = mock.patch.object(certctl, 'time', clock)
+        patch.start()
+        self.addCleanup(patch.stop)
+        return clock
+
     def test_bootstrap_tls_probe_reads_untrusted_leaf_fingerprint_and_sends_sni(self):
         context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
         context.load_cert_chain(str(self.fixtures / 'new.pem'), str(self.fixtures / 'new.key'))
@@ -394,6 +402,386 @@ class CertificateTests(unittest.TestCase):
         self.assertNotIn(self.controller.config['secret_id'], state_text)
         self.assertNotIn(self.controller.config['secret_key'], state_text)
 
+    def test_startup_trust_failure_retries_without_issuing(self):
+        self.configure_runtime_mocks()
+        self.controller.config['renew_before_days'] = 2
+        self.prepare_candidate('old')
+        trust_store = self.root / 'startup-ca.pem'
+        trust_store.touch()
+        run_command = subprocess.run
+
+        def finish_loading_trust_store(command, **options):
+            result = run_command(command, **options)
+            if command[:2] == ['openssl', 'verify'] and result.returncode:
+                shutil.copyfile(self.fixtures / 'ca.pem', trust_store)
+            return result
+
+        def issue_or_deploy(arguments):
+            if '--issue' in arguments:
+                self.prepare_candidate('new')
+            elif '--deploy' in arguments:
+                self.install_current('new')
+            return 0
+
+        self.controller.invoke_acme = mock.Mock(side_effect=issue_or_deploy)
+        with mock.patch.dict(os.environ, {'SSL_CERT_FILE': str(trust_store)}), \
+                mock.patch.object(subprocess, 'run', side_effect=finish_loading_trust_store):
+            self.controller.run()
+
+        self.assertEqual(certctl.fingerprint(self.controller.current_cert()), self.old_fingerprint)
+        self.controller.invoke_acme.assert_not_called()
+        self.assertFalse((self.controller.state / 'recovery-backups').exists())
+        self.assertTrue(certctl.read_json(self.controller.state / 'last-result.json')['success'])
+
+    def test_persistent_trust_failure_preserves_material_outside_renewal_window(self):
+        self.configure_runtime_mocks()
+        self.controller.config['renew_before_days'] = 2
+        self.prepare_candidate('old')
+        trust_store = self.root / 'startup-ca.pem'
+        trust_store.touch()
+        self.controller.invoke_acme = mock.Mock(return_value=1)
+
+        with mock.patch.dict(os.environ, {'SSL_CERT_FILE': str(trust_store)}):
+            with self.assertRaisesRegex(certctl.Failure, '系统信任校验'):
+                self.controller.run()
+
+        self.controller.invoke_acme.assert_not_called()
+        self.assertEqual(certctl.fingerprint(self.controller.candidate()), self.old_fingerprint)
+        self.assertEqual(certctl.fingerprint(self.controller.current_cert()), self.old_fingerprint)
+        self.assertFalse((self.controller.state / 'pending.json').exists())
+        self.assertFalse((self.controller.state / 'run-baseline.json').exists())
+        self.assertFalse((self.controller.state / 'recovery-backups').exists())
+
+        self.controller.run()
+        self.assertFalse((self.controller.state / 'run-baseline.json').exists())
+        self.controller.invoke_acme.assert_not_called()
+
+    def test_temporary_trust_failure_preserves_pending_candidate_during_renewal_window(self):
+        self.configure_runtime_mocks()
+        self.controller.config['renew_before_days'] = 2
+        self.install_current('short')
+        self.prepare_candidate('new')
+        self.record_owned_candidate()
+        state = self.controller.state
+        pending = state / 'pending.json'
+        trust_store = self.root / 'startup-ca.pem'
+        trust_store.touch()
+        self.controller.invoke_acme = mock.Mock(return_value=1)
+
+        with mock.patch.dict(os.environ, {'SSL_CERT_FILE': str(trust_store)}):
+            for pending_recorded in (False, True):
+                with self.subTest(pending_recorded=pending_recorded):
+                    if pending_recorded:
+                        self.controller.save_pending(self.new_fingerprint, self.controller.binding_state(self.info))
+                    pending_before = pending.read_bytes() if pending_recorded else None
+                    baseline_before = (state / 'run-baseline.json').read_bytes()
+
+                    with self.assertRaisesRegex(certctl.CandidateTrustFailure, '系统信任校验'):
+                        self.controller.run()
+
+                    self.controller.invoke_acme.assert_not_called()
+                    self.assertEqual(certctl.fingerprint(self.controller.candidate()), self.new_fingerprint)
+                    self.assertEqual((state / 'run-baseline.json').read_bytes(), baseline_before)
+                    self.assertEqual(pending.read_bytes() if pending.exists() else None, pending_before)
+                    self.assertFalse((state / 'recovery-backups').exists())
+
+        def deploy(arguments):
+            self.assertEqual(arguments[0], '--deploy')
+            self.install_current('new')
+            return 0
+
+        self.controller.invoke_acme.side_effect = deploy
+        self.controller.run()
+        self.controller.invoke_acme.assert_called_once()
+        self.assertEqual(certctl.fingerprint(self.controller.current_cert()), self.new_fingerprint)
+        self.assertFalse(pending.exists())
+
+    def test_legacy_renewal_deploys_issued_candidate_left_without_pending_record(self):
+        self.configure_runtime_mocks()
+        self.prepare_candidate('new')
+        self.record_owned_candidate()
+        pending = self.controller.state / 'pending.json'
+        trust_store = self.root / 'startup-ca.pem'
+        trust_store.touch()
+
+        def acme(arguments):
+            if arguments[0] == '--deploy':
+                self.install_current('new')
+                return 0
+            return 2
+
+        self.controller.invoke_acme = mock.Mock(side_effect=acme)
+        with mock.patch.dict(os.environ, {'SSL_CERT_FILE': str(trust_store)}):
+            with self.assertRaises(certctl.CandidateTrustFailure):
+                self.controller.run()
+        self.controller.invoke_acme.assert_not_called()
+        self.assertFalse(pending.exists())
+
+        self.controller.run()
+
+        self.controller.invoke_acme.assert_called_once_with(
+            ['--deploy', '-d', 'ttxli.cn', '--deploy-hook', 'synology_dsm'])
+        self.assertEqual(certctl.fingerprint(self.controller.current_cert()), self.new_fingerprint)
+
+    def test_due_renewal_waits_until_system_trust_recovers(self):
+        self.configure_runtime_mocks()
+        clock = self.mock_certificate_clock()
+        self.controller.config['renew_before_days'] = 2
+        self.install_current('short')
+        self.prepare_candidate('short')
+        trust_store = self.root / 'startup-ca.pem'
+        trust_store.touch()
+
+        def acme(arguments):
+            if arguments[0] == '--renew':
+                self.assertTrue(self.controller.candidate().is_file())
+                self.prepare_candidate('new')
+            else:
+                self.assertEqual(arguments[0], '--deploy')
+                self.install_current('new')
+            return 0
+
+        self.controller.invoke_acme = mock.Mock(side_effect=acme)
+        with mock.patch.dict(os.environ, {'SSL_CERT_FILE': str(trust_store)}):
+            with self.assertRaisesRegex(certctl.Failure, '系统信任校验'):
+                self.controller.run()
+
+        self.controller.invoke_acme.assert_not_called()
+        self.assertEqual(clock.sleep.call_args_list, [mock.call(15), mock.call(30), mock.call(60)])
+        self.assertFalse((self.controller.state / 'pending.json').exists())
+        self.assertFalse((self.controller.state / 'recovery-backups').exists())
+
+        self.controller.run()
+
+        self.assertEqual([call.args[0][0] for call in self.controller.invoke_acme.call_args_list], ['--renew', '--deploy'])
+        self.assertFalse((self.controller.state / 'recovery-backups').exists())
+
+    def test_transient_private_key_read_retries_without_recovery_or_signing(self):
+        self.configure_runtime_mocks()
+        clock = self.mock_certificate_clock()
+        self.controller.config['renew_before_days'] = 2
+        self.prepare_candidate('old')
+        run_command = subprocess.run
+        key_failures = []
+
+        def timed_out_key_read(command, **options):
+            if command[:2] == ['openssl', 'pkey'] and len(key_failures) < 3:
+                key_failures.append(command[1])
+                raise subprocess.TimeoutExpired(command, 20)
+            return run_command(command, **options)
+
+        self.controller.invoke_acme = mock.Mock(return_value=1)
+        with mock.patch.object(subprocess, 'run', side_effect=timed_out_key_read):
+            self.controller.run()
+
+        self.assertEqual(len(key_failures), 3)
+        self.assertEqual(clock.sleep.call_args_list, [mock.call(15), mock.call(30), mock.call(60)])
+        self.controller.invoke_acme.assert_not_called()
+        self.assertEqual(certctl.fingerprint(self.controller.candidate()), self.old_fingerprint)
+        self.assertFalse((self.controller.state / 'recovery-backups').exists())
+        self.assertFalse((self.controller.state / 'pending.json').exists())
+
+    def test_persistent_openssl_timeout_does_not_overwrite_pending_candidate(self):
+        self.configure_runtime_mocks()
+        clock = self.mock_certificate_clock()
+        self.controller.config['renew_before_days'] = 2
+        self.install_current('short')
+        self.prepare_candidate('new')
+        self.record_owned_candidate()
+        pending = self.controller.state / 'pending.json'
+        self.controller.save_pending(self.new_fingerprint, self.controller.binding_state(self.info))
+        original_marker = pending.read_bytes()
+        run_command = subprocess.run
+
+        def timed_out_key_read(command, **options):
+            if command[:2] == ['openssl', 'pkey']:
+                raise subprocess.TimeoutExpired(command, 20)
+            return run_command(command, **options)
+
+        self.controller.invoke_acme = mock.Mock(return_value=1)
+        with mock.patch.object(subprocess, 'run', side_effect=timed_out_key_read):
+            with self.assertRaisesRegex(certctl.Failure, '暂时无法判断.*超时'):
+                self.controller.run()
+
+        self.assertEqual(clock.sleep.call_args_list, [mock.call(15), mock.call(30), mock.call(60)])
+        self.controller.invoke_acme.assert_not_called()
+        self.assertEqual(pending.read_bytes(), original_marker)
+        self.assertEqual(certctl.fingerprint(self.controller.candidate()), self.new_fingerprint)
+        self.assertFalse((self.controller.state / 'recovery-backups').exists())
+
+    def test_clock_step_during_expiry_check_cannot_trigger_renewal_or_recovery(self):
+        self.configure_runtime_mocks()
+        self.controller.config['renew_before_days'] = 2
+        self.prepare_candidate('old')
+        run_command = subprocess.run
+        real_now = certctl.time.time()
+        clock = self.mock_certificate_clock()
+        wall_clock = [real_now]
+        stepped = []
+
+        def move_clock_during_expiry_read(command, **options):
+            if (command[:2] == ['openssl', 'x509'] and str(self.controller.candidate()) in command
+                    and ('-checkend' in command or '-enddate' in command) and not stepped):
+                stepped.append(True)
+                wall_clock[0] += 100 * 86400
+            return run_command(command, **options)
+
+        self.controller.invoke_acme = mock.Mock(return_value=1)
+        clock.time.side_effect = lambda: wall_clock[0]
+        clock.sleep.side_effect = lambda _delay: wall_clock.__setitem__(0, real_now)
+        with mock.patch.object(subprocess, 'run', side_effect=move_clock_during_expiry_read):
+            self.controller.run()
+
+        self.assertTrue(stepped)
+        clock.sleep.assert_called_once_with(15)
+        self.controller.invoke_acme.assert_not_called()
+        self.assertEqual(certctl.fingerprint(self.controller.candidate()), self.old_fingerprint)
+        self.assertFalse((self.controller.state / 'recovery-backups').exists())
+
+    def test_clock_which_stays_shifted_after_preflight_blocks_this_run(self):
+        self.configure_runtime_mocks()
+        self.controller.config['renew_before_days'] = 2
+        self.prepare_candidate('old')
+        wall_clock = [certctl.time.time()]
+        clock = self.mock_certificate_clock()
+        clock.time.side_effect = lambda: wall_clock[0]
+        preflight = self.controller.preflight_with_history
+
+        def jump_after_preflight(**options):
+            info = preflight(**options)
+            wall_clock[0] += 100 * 86400
+            return info
+
+        self.controller.invoke_acme = mock.Mock(return_value=1)
+        with mock.patch.object(self.controller, 'preflight_with_history', side_effect=jump_after_preflight):
+            with self.assertRaisesRegex(certctl.Failure, '时钟跳变'):
+                self.controller.run()
+
+        self.assertEqual(clock.sleep.call_args_list, [mock.call(15), mock.call(30), mock.call(60)])
+        self.controller.invoke_acme.assert_not_called()
+        self.assertEqual(certctl.fingerprint(self.controller.candidate()), self.old_fingerprint)
+        self.assertFalse((self.controller.state / 'recovery-backups').exists())
+
+    def test_out_of_memory_during_chain_verification_is_not_material_damage(self):
+        self.configure_runtime_mocks()
+        self.controller.config['renew_before_days'] = 2
+        self.prepare_candidate('old')
+        clock = self.mock_certificate_clock()
+        run_command = subprocess.run
+
+        def out_of_memory(command, **options):
+            if command[:2] == ['openssl', 'verify']:
+                return subprocess.CompletedProcess(command, 2, stderr=b'error 17 at 0 depth lookup: out of memory')
+            return run_command(command, **options)
+
+        self.controller.invoke_acme = mock.Mock(return_value=1)
+        with mock.patch.object(subprocess, 'run', side_effect=out_of_memory):
+            with self.assertRaisesRegex(certctl.Failure, '暂时无法判断.*错误码 17'):
+                self.controller.run()
+
+        self.assertEqual(clock.sleep.call_args_list, [mock.call(15), mock.call(30), mock.call(60)])
+        self.controller.invoke_acme.assert_not_called()
+        self.assertTrue(self.controller.candidate().exists())
+        self.assertFalse((self.controller.state / 'recovery-backups').exists())
+
+    def test_unreadable_expiry_does_not_run_an_extra_attempt_when_logging(self):
+        self.configure_runtime_mocks()
+        self.prepare_candidate('old')
+        clock = self.mock_certificate_clock()
+        run_command = subprocess.run
+        expiry_calls = []
+
+        def unavailable_expiry(command, **options):
+            if command[:2] == ['openssl', 'x509'] and '-enddate' in command:
+                expiry_calls.append(command)
+                raise subprocess.TimeoutExpired(command, 20)
+            return run_command(command, **options)
+
+        self.controller.invoke_acme = mock.Mock(return_value=1)
+        with mock.patch.object(subprocess, 'run', side_effect=unavailable_expiry):
+            with self.assertRaisesRegex(certctl.Failure, '暂时无法判断.*超时'):
+                self.controller.run()
+
+        self.assertEqual(len(expiry_calls), 4)
+        self.assertEqual(clock.sleep.call_args_list, [mock.call(15), mock.call(30), mock.call(60)])
+        self.controller.invoke_acme.assert_not_called()
+        self.controller.log.assert_any_call('当前 DSM 证书到期时间无法读取。')
+
+    def test_sigterm_during_openssl_trust_check_stops_before_signing(self):
+        self.configure_runtime_mocks()
+        self.controller.config['renew_before_days'] = 2
+        self.install_current('short')
+        self.prepare_candidate('short')
+        self.controller.invoke_acme = mock.Mock(return_value=1)
+        run_command = subprocess.run
+
+        def interrupt_verify(command, **options):
+            if command[:2] == ['openssl', 'verify']:
+                certctl.interrupted(certctl.signal.SIGTERM, None)
+            return run_command(command, **options)
+
+        with mock.patch.object(subprocess, 'run', side_effect=interrupt_verify):
+            with self.assertRaises((KeyboardInterrupt, InterruptedError)):
+                self.controller.run()
+
+        self.controller.invoke_acme.assert_not_called()
+        for name in ('pending.json', 'run-baseline.json', 'recovery-backups'):
+            self.assertFalse((self.controller.state / name).exists())
+
+    def test_late_trust_failure_in_skipped_check_leaves_no_recovery_marker(self):
+        self.configure_runtime_mocks()
+        self.controller.config['renew_before_days'] = 2
+        self.prepare_candidate('old')
+        trust_store = self.root / 'startup-ca.pem'
+        shutil.copyfile(self.fixtures / 'ca.pem', trust_store)
+        self.controller.invoke_acme = mock.Mock()
+        run_command = subprocess.run
+
+        def refresh_store_after_verify(command, **options):
+            result = run_command(command, **options)
+            if command[:2] == ['openssl', 'verify'] and '-untrusted' in command and result.returncode == 0:
+                trust_store.write_bytes(b'')
+            return result
+
+        with mock.patch.dict(os.environ, {'SSL_CERT_FILE': str(trust_store)}), \
+                mock.patch.object(subprocess, 'run', side_effect=refresh_store_after_verify):
+            with self.assertRaisesRegex(certctl.Failure, '系统信任校验'):
+                self.controller.run()
+        self.controller.invoke_acme.assert_not_called()
+        self.assertFalse((self.controller.state / 'run-baseline.json').exists())
+        self.assertEqual(certctl.fingerprint(self.controller.current_cert()), self.old_fingerprint)
+
+    def test_wrong_chain_signer_still_recovers_outside_renewal_window(self):
+        self.assert_unusable_issuer_chain_recovers((self.fixtures / 'wrong.pem').read_bytes())
+
+    def test_unparseable_issuer_still_recovers_outside_renewal_window(self):
+        self.assert_unusable_issuer_chain_recovers(b'-----BEGIN CERTIFICATE-----\nAAAA\n-----END CERTIFICATE-----\n')
+
+    def assert_unusable_issuer_chain_recovers(self, wrong_ca):
+        self.configure_runtime_mocks()
+        self.controller.config['renew_before_days'] = 2
+        self.prepare_candidate('old')
+        (self.controller.candidate_dir() / 'ca.cer').write_bytes(wrong_ca)
+        (self.controller.candidate_dir() / 'fullchain.cer').write_bytes(
+            self.controller.candidate().read_bytes() + wrong_ca)
+        trust_store = self.root / 'startup-ca.pem'
+        trust_store.touch()
+
+        def issue_or_deploy(arguments):
+            if arguments[0] == '--issue':
+                self.prepare_candidate('new')
+                shutil.copyfile(self.fixtures / 'ca.pem', trust_store)
+            else:
+                self.assertEqual(arguments[0], '--deploy')
+                self.install_current('new')
+            return 0
+
+        self.controller.invoke_acme = mock.Mock(side_effect=issue_or_deploy)
+        with mock.patch.dict(os.environ, {'SSL_CERT_FILE': str(trust_store)}):
+            self.controller.run()
+        self.assertEqual(certctl.fingerprint(self.controller.current_cert()), self.new_fingerprint)
+        self.assertTrue((self.controller.state / 'recovery-backups').is_dir())
+
     def test_near_expiry_pending_certificate_is_reissued_before_deployment(self):
         self.configure_runtime_mocks()
         self.prepare_candidate('short')
@@ -416,11 +804,22 @@ class CertificateTests(unittest.TestCase):
         self.assertIn('--issue', calls[0])
         self.assertEqual(certctl.fingerprint(self.controller.current_cert()), self.new_fingerprint)
         self.assertFalse((self.controller.state / 'pending.json').exists())
+        reason = next(call.args[0] for call in self.controller.log.call_args_list if '换证原因' in call.args[0])
+        self.assertIn('候选证书有效期校验失败', reason)
+        self.assertIn('14 天', reason)
 
     def test_corrupt_pending_material_is_reissued_without_reusing_old_key_or_schedule(self):
         self.configure_runtime_mocks()
-        for filename in ('fullchain.cer', 'ca.cer', 'ttxli.cn.key', 'ttxli.cn.cer', 'missing-leaf'):
+        damaged_materials = {
+            'fullchain.cer': '证书链中缺少有效 PEM 证书',
+            'ca.cer': '证书链中缺少有效 PEM 证书',
+            'ttxli.cn.key': '候选证书私钥无法读取',
+            'ttxli.cn.cer': '候选证书无法读取',
+            'missing-leaf': '候选证书文件缺失',
+        }
+        for filename, expected_reason in damaged_materials.items():
             with self.subTest(filename=filename):
+                self.controller.log.reset_mock()
                 self.install_current('old')
                 self.prepare_candidate()
                 self.record_owned_candidate()
@@ -457,6 +856,8 @@ class CertificateTests(unittest.TestCase):
                 self.assertLessEqual(len(snapshots), certctl.RECOVERY_LIMIT)
                 self.assertTrue(any((path / 'ttxli.cn' / 'ttxli.cn.csr').read_text() == 'unusable old CSR'
                                     for path in snapshots))
+                reason = next(call.args[0] for call in self.controller.log.call_args_list if '换证原因' in call.args[0])
+                self.assertIn(expected_reason, reason)
 
     def test_failed_recovery_is_rate_limited_and_stops_after_three_attempts(self):
         self.configure_runtime_mocks()

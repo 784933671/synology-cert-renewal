@@ -68,7 +68,7 @@ class RunLockTests(unittest.TestCase):
         return certctl.main(['--home', str(self.home), command])
 
     def test_cli_only_run_uses_sixty_second_wait(self):
-        for name in ('assert_manual_idle', 'load', 'preflight', 'log', 'history_context',
+        for name in ('assert_manual_idle', 'load', 'preflight_with_history', 'log', 'history_context',
                      'configure', 'release_manual_protection', 'retire_manual_target', 'status'):
             setattr(self.controller, name, mock.Mock())
         with cli(self.controller), mock.patch.object(self.controller, 'locked', wraps=self.controller.locked) as locked:

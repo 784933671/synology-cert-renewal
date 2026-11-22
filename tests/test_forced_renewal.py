@@ -304,14 +304,19 @@ class ForcedRenewalTests(unittest.TestCase):
 
     def test_pre_issue_expiry_consumes_no_force(self):
         request = self.request()
+        clock = self.fixture.mock_certificate_clock()
+        monotonic_started = clock.monotonic()
+        clock.time.return_value = request['requested_at']
+        clock.monotonic.return_value = monotonic_started
+
         def delayed(**kwargs):
-            clock.return_value = request['expires_at']
+            clock.time.return_value = request['expires_at']
+            clock.monotonic.return_value = monotonic_started + request['expires_at'] - request['requested_at']
             return self.controller.metadata()
         self.controller.preflight = mock.Mock(side_effect=delayed)
         self.controller.invoke_acme = mock.Mock()
-        with mock.patch.object(certctl.time, 'time', return_value=request['requested_at']) as clock:
-            with self.assertRaisesRegex(certctl.Failure, '过期'):
-                self.controller.run()
+        with self.assertRaisesRegex(certctl.Failure, '过期'):
+            self.controller.run()
         self.controller.invoke_acme.assert_not_called()
         self.assertEqual(self.state()['state'], 'expired')
         self.assertFalse(self.state()['force_consumed'])

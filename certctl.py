@@ -34,6 +34,12 @@ SYSTEM_PATH = '/usr/syno/sbin:/usr/syno/bin:/usr/local/bin:/usr/bin:/bin:/usr/sb
 RECOVERY_INTERVAL = 24 * 60 * 60
 SHORT_RECOVERY_INTERVAL = 6 * 60 * 60
 RECOVERY_LIMIT = 3
+MIN_CANDIDATE_VALID_DAYS = 14
+CERTIFICATE_RECHECK_DELAYS = (15, 30, 60)
+CLOCK_STEP_SECONDS = 5
+# 随附链校验中，可确认签名、公钥或颁发者材料有问题的 X.509 错误。
+ISSUER_MATERIAL_ERRORS = frozenset((2, 4, 6, 7, 20, 21))
+BEIJING = datetime.timezone(datetime.timedelta(hours=8))
 MANUAL_RENEWAL_TTL = 10 * 60
 MANUAL_RENEWAL_COOLDOWN = 60 * 60
 RUN_LOCK_WAIT_SECONDS = 60
@@ -55,6 +61,14 @@ except Exception:
 
 
 class Failure(Exception):
+    pass
+
+
+class CertificateCheckUnavailable(Failure):
+    pass
+
+
+class CandidateTrustFailure(CertificateCheckUnavailable):
     pass
 
 
@@ -98,19 +112,31 @@ def read_json(path):
         raise Failure('无法读取有效 JSON：{}'.format(path))
 
 
-def capture(args, timeout=20, data=None):
+def capture(args, timeout=20, data=None, *, operation=None):
+    program = Path(args[0]).name
     try:
         result = subprocess.run(args, input=data, stdout=subprocess.PIPE,
                                 stderr=subprocess.PIPE, timeout=timeout, check=False)
     except (OSError, subprocess.TimeoutExpired):
-        raise Failure('命令无法执行或超时：{}'.format(Path(args[0]).name))
+        error = CertificateCheckUnavailable if program == 'openssl' else Failure
+        if operation is not None:
+            raise error('{}（{} 无法执行或超时）。'.format(operation, program)) from None
+        raise error('命令无法执行或超时：{}'.format(program)) from None
     if result.returncode:
-        raise Failure('命令失败：{}，请检查系统环境。'.format(Path(args[0]).name))
+        if program == 'openssl' and (result.returncode < 0 or re.search(
+                rb'Permission denied|Input/output error|Resource temporarily unavailable',
+                result.stderr or b'', re.I)):
+            raise CertificateCheckUnavailable('{}（OpenSSL 当前不可用，退出码 {}）。'.format(
+                operation or '证书检查无法完成', result.returncode))
+        if operation is not None:
+            raise Failure('{}（{} 退出码 {}）。'.format(operation, program, result.returncode))
+        raise Failure('命令失败：{}，请检查系统环境。'.format(program))
     return result.stdout
 
 
-def certificate_domains(path):
-    content = capture(['openssl', 'x509', '-in', str(path), '-noout', '-text']).decode()
+def certificate_domains(path, *, operation=None):
+    content = capture(['openssl', 'x509', '-in', str(path), '-noout', '-text'],
+                      operation=operation).decode()
     domains = sorted(set(re.findall(r'DNS:([^,\s]+)', content)))
     if not domains:
         raise Failure('现有证书没有 DNS SAN，无法自动推导应保留的域名。')
@@ -122,23 +148,35 @@ def fingerprint(path):
 
 
 def certificate_expiry(path):
-    value = capture(['openssl', 'x509', '-in', str(path), '-noout', '-enddate']).decode().strip()
     try:
+        value = capture(['openssl', 'x509', '-in', str(path), '-noout', '-enddate'],
+                        operation='证书到期时间无法读取').decode().strip()
         if not value.startswith('notAfter='):
             raise ValueError()
         return int(ssl.cert_time_to_seconds(value[len('notAfter='):]))
+    except CertificateCheckUnavailable:
+        raise
+    except Failure as error:
+        raise CertificateCheckUnavailable(str(error)) from None
     except (ValueError, OverflowError):
-        raise Failure('无法读取证书到期时间。')
+        raise CertificateCheckUnavailable('无法读取证书到期时间。') from None
 
 
 def pem_chain(path):
     try:
         content = path.read_text()
+    except FileNotFoundError:
+        raise Failure('证书链文件缺失。') from None
+    except OSError:
+        raise CertificateCheckUnavailable('证书链文件暂时无法读取。') from None
+    except ValueError:
+        raise Failure('证书链中缺少有效 PEM 证书。') from None
+    try:
         blocks = re.findall(r'-----BEGIN CERTIFICATE-----.*?-----END CERTIFICATE-----', content, re.S)
         if not blocks:
             raise ValueError()
         return [ssl.PEM_cert_to_DER_cert(block) for block in blocks]
-    except (OSError, ValueError, ssl.SSLError):
+    except (ValueError, ssl.SSLError):
         raise Failure('证书链中缺少有效 PEM 证书。')
 
 
@@ -239,6 +277,7 @@ class Controller:
         self.history_error = None
         self.history_actions = False
         self.history_finished = False
+        self.certificate_clock_offset = None
 
     def _history_warning(self):
         if self.history_error is None:
@@ -325,7 +364,10 @@ class Controller:
             yield
         except BaseException as error:
             status = 'interrupted' if isinstance(error, (KeyboardInterrupt, InterruptedError, SystemExit)) else 'failed'
-            self.history_stage(stage, status, '阶段被中断。' if status == 'interrupted' else '阶段未完成，请查看本轮失败记录。')
+            detail = '阶段被中断。' if status == 'interrupted' else '阶段未完成，请查看本轮失败记录。'
+            if stage == 'certificate_validation' and isinstance(error, Failure):
+                detail = str(error)
+            self.history_stage(stage, status, detail)
             raise
         else:
             self.history_stage(stage, 'succeeded', (message + '；已完成。') if message else '阶段完成。')
@@ -413,6 +455,8 @@ class Controller:
             report = {'stage': 'unknown', 'stage_label': '未能确定失败阶段', 'category': 'unknown',
                       'code': '', 'summary': '本轮执行失败，现有证据不足以确定具体原因。',
                       'hint': '查看本次失败记录并检查运行目录权限及网络。', 'evidence': 'unknown'}
+        if isinstance(error, CertificateCheckUnavailable):
+            report.update(summary='暂时无法判断证书状态。', hint='按详细说明检查 NAS 时间、OpenSSL 或系统信任库，后续任务会复查。')
         report.update({'at': now(), 'message': message})
         try:
             private(self.state, directory=True)
@@ -422,8 +466,21 @@ class Controller:
         report.update(archive)
         try:
             private(self.state, directory=True)
-            save_json(self.state / 'last-result.json', {'at': report['at'], 'success': False,
-                                                       'message': message, 'failure': report})
+            path = self.state / 'last-result.json'
+            result = {'at': report['at'], 'success': False, 'message': message, 'failure': report}
+            if (self.state / 'pending.json').exists():
+                # 旧待部署记录可能仍依赖最近一次核验成功的指纹迁移签发来源。
+                try:
+                    private(path)
+                    previous = read_json(path)
+                except (Failure, OSError):
+                    previous = None
+                if isinstance(previous, dict):
+                    key = 'fingerprint' if previous.get('success') is True else 'last_successful_fingerprint'
+                    verified = previous.get(key)
+                    if isinstance(verified, str) and re.fullmatch(r'[0-9a-f]{64}', verified):
+                        result['last_successful_fingerprint'] = verified
+            save_json(path, result)
         except (Failure, OSError):
             report['archive_error'] = '无法更新运行结果，请检查运行目录权限和可用空间。'
         lines = ['失败阶段：' + report['stage_label'], '错误摘要：' + report['summary']]
@@ -471,14 +528,63 @@ class Controller:
 
     def log(self, message):
         line = '{} {}'.format(now(), message)
-        print(line, flush=True)
         path = self.state / 'events.log'
-        if path.exists():
-            private(path)
-            if path.stat().st_size > 1024 * 1024:
-                os.replace(str(path), str(path) + '.1')
-        with path.open('a', encoding='utf-8') as handle:
-            handle.write(line + '\n')
+        stream = sys.stdout
+        try:
+            if path.exists():
+                private(path)
+                if path.stat().st_size > 1024 * 1024:
+                    os.replace(str(path), str(path) + '.1')
+            with path.open('a', encoding='utf-8') as handle:
+                handle.write(line + '\n')
+        except (Failure, OSError):
+            line += '\n无法写入 state/events.log，请检查日志权限和可用空间。'
+            stream = sys.stderr
+        try:
+            print(line, file=stream, flush=True)
+        except OSError:
+            pass
+
+    def _record_preflight(self, status, message, expires_at):
+        expiry = '当前 DSM 证书到期时间无法读取。'
+        if expires_at is not None:
+            try:
+                expires = datetime.datetime.fromtimestamp(expires_at, BEIJING)
+                expiry = '当前 DSM 证书到期时间：{}（北京时间）。'.format(expires.strftime('%Y-%m-%d %H:%M:%S'))
+            except (OSError, ValueError, OverflowError):
+                pass
+        self.log(expiry)
+        self.history_stage('preflight', status, message + expiry)
+
+    def _retry_certificate_check(self, inspect):
+        # 只复查无副作用的步骤。墙钟跳变时丢弃该次有效期及信任判断。
+        reference = self.certificate_clock_offset
+        if reference is None:
+            reference = time.time() - time.monotonic()
+        clock_error = CertificateCheckUnavailable('检查期间检测到 NAS 时钟跳变。')
+        for delay in CERTIFICATE_RECHECK_DELAYS + (None,):
+            error = clock_error
+            if abs(time.time() - time.monotonic() - reference) <= CLOCK_STEP_SECONDS:
+                try:
+                    result = inspect()
+                except Failure as failure:
+                    error = failure
+                except InterruptedError:
+                    raise
+                except OSError:
+                    error = CertificateCheckUnavailable('证书检查所需文件暂时无法访问。')
+                else:
+                    error = None
+                if abs(time.time() - time.monotonic() - reference) > CLOCK_STEP_SECONDS:
+                    error = clock_error
+            if error is None:
+                return result
+            if not isinstance(error, CertificateCheckUnavailable):
+                raise error
+            if delay is None:
+                raise type(error)('证书暂时无法判断，3 次复查仍未通过。' + str(error)) from None
+            self.log('证书暂时无法判断，{} 秒后复查。{}'.format(delay, error))
+            time.sleep(delay)
 
     def load(self):
         private(self.config_file)
@@ -507,6 +613,8 @@ class Controller:
             dependencies += ('synouser', 'synogroup', 'synosetkeyvalue', 'synogetkeyvalue')
         for command in dependencies:
             if not shutil.which(command):
+                if command == 'openssl':
+                    raise CertificateCheckUnavailable('系统 OpenSSL 命令暂不可用。')
                 raise Failure('缺少系统命令：{}'.format(command))
         if method == 'synology_dsm':
             policy = capture(['synogetkeyvalue', '/etc/synoinfo.conf', 'otp_enforce_option']).decode().strip()
@@ -624,6 +732,25 @@ class Controller:
                 raise ValueError()
         except (ValueError, AttributeError):
             raise Failure('无法通过本机 HTTP 端口访问 DSM API，请检查端口和 HTTP 自动跳转设置。')
+        return info
+
+    def preflight_with_history(self, check_endpoints=True):
+        expires_at = None
+
+        def inspect():
+            nonlocal expires_at
+            expires_at = None
+            self.metadata()
+            expires_at = certificate_expiry(self.current_cert())
+            return self.preflight(check_endpoints=check_endpoints)
+
+        try:
+            info = self._retry_certificate_check(inspect)
+        except Failure as error:
+            detail = str(error) if isinstance(error, CertificateCheckUnavailable) else '预检查未通过。'
+            self._record_preflight('failed', detail, expires_at)
+            raise
+        self._record_preflight('succeeded', '配置、系统与 DSM 证书目标检查通过。', expires_at)
         return info
 
     def configure(self):
@@ -857,6 +984,8 @@ class Controller:
             return None
         try:
             return fingerprint(self.candidate())
+        except CertificateCheckUnavailable:
+            raise
         except Failure:
             return 'unreadable'
 
@@ -869,6 +998,9 @@ class Controller:
             os.close(descriptor)
 
     def run_baseline(self, before):
+        return self._retry_certificate_check(lambda: self._run_baseline(before))
+
+    def _run_baseline(self, before):
         path = self.state / 'run-baseline.json'
         current, candidate = fingerprint(self.current_cert()), self.candidate_identity()
         previous = None
@@ -906,8 +1038,9 @@ class Controller:
                         if isinstance(loaded, dict):
                             value.update(loaded)
                 recorded = pending.get('baseline_fingerprint')
-                if recorded is None and result.get('success') is True:
-                    recorded = result.get('fingerprint')
+                if recorded is None:
+                    key = 'fingerprint' if result.get('success') is True else 'last_successful_fingerprint'
+                    recorded = result.get(key)
                 if pending.get('fingerprint') != candidate or recorded != current:
                     raise Failure('当前群晖证书与历史候选不同，且缺少可核实的签发来源；拒绝用旧候选覆盖，请核对外部换证及待部署记录。')
                 baseline.update(candidate_before=current, issuance_started=True, issued_fingerprint=candidate)
@@ -923,47 +1056,85 @@ class Controller:
             raise Failure('候选证书不是本次已记录签发的结果，拒绝覆盖当前群晖证书。')
         return baseline
 
-    def record_issuance(self, before, completed=False):
+    def record_issuance(self, before, completed=False, reason=None):
         # 调用 CA 前保存意图；响应丢失后只能恢复基于该基线生成的材料。
-        baseline = self.run_baseline(before)
-        if completed:
+        def inspect():
+            baseline = self._run_baseline(before)
             candidate = self.candidate_identity()
-            baseline['issued_fingerprint'] = candidate if candidate not in (None, 'unreadable') else None
-        else:
-            baseline.update(issuance_started=True, issued_fingerprint=None,
-                            certificate_fingerprint=fingerprint(self.current_cert()),
-                            candidate_before=self.candidate_identity())
-        self.save_run_baseline(baseline)
+            if completed:
+                baseline['issued_fingerprint'] = candidate if candidate not in (None, 'unreadable') else None
+            else:
+                baseline.update(issuance_started=True, issued_fingerprint=None,
+                                certificate_fingerprint=fingerprint(self.current_cert()),
+                                candidate_before=candidate, issuance_reason=reason)
+            return baseline
+
+        self.save_run_baseline(self._retry_certificate_check(inspect))
 
     def save_pending(self, expected, before):
         baseline = self.run_baseline(before)
         self.save_run_baseline(baseline)
         save_json(self.state / 'pending.json', {'fingerprint': expected, 'at': now(),
                                               'baseline_fingerprint': baseline['certificate_fingerprint']})
+        return baseline
 
-    def renewal_time(self):
+    def mark_candidate_recovery(self, error, request=None):
+        pending = self.state / 'pending.json'
+        state = {'at': now(), 'needs_recovery': True}
+        if pending.exists():
+            private(pending)
+            previous = read_json(pending)
+            if isinstance(previous, dict) and previous.get('needs_recovery') is True:
+                state = previous
+        if request:
+            state['manual_request_id'] = request['request_id']
+        secrets = self.diagnostic_secrets()
+        saved = state.get('recovery_reason')
+        reason = diagnostics.sanitize(saved, secrets=secrets, limit=240).strip() if isinstance(saved, str) else ''
+        if not reason:
+            detail = diagnostics.sanitize(str(error), secrets=secrets, limit=180).strip().rstrip('。')
+            reason = '证书材料校验失败后恢复签发（{}）'.format(detail)
+        # 先保存原因。隔离后原文件可能已不存在，但后续签发仍需说明为何恢复。
+        state['recovery_reason'] = reason
+        save_json(pending, state)
+        return reason
+
+    def _renewal_time(self):
         days = self.config.get('renew_before_days')
         return certificate_expiry(self.candidate()) - days * 86400 if days is not None else None
 
+    def renewal_time(self):
+        return self._retry_certificate_check(self._renewal_time)
+
     def renewal_due(self):
-        renewal = self.renewal_time()
-        return renewal is not None and time.time() >= renewal
+        def inspect():
+            renewal = self._renewal_time()
+            return renewal is not None and time.time() >= renewal
+
+        return self._retry_certificate_check(inspect)
 
     def candidate_valid(self):
         with self.history_step('certificate_validation', '核对域名、有效期、密钥及系统信任链'):
-            return self._candidate_valid()
+            return self._retry_certificate_check(self._candidate_valid)
 
     def _candidate_valid(self):
         cert = self.candidate()
         key = self.candidate_dir() / (self.config['domains'][0] + '.key')
-        if set(certificate_domains(cert)) != set(self.config['domains']):
+        if not cert.is_file():
+            raise Failure('候选证书文件缺失。')
+        if not key.is_file():
+            raise Failure('候选证书私钥文件缺失。')
+        if set(certificate_domains(cert, operation='候选证书无法读取')) != set(self.config['domains']):
             raise Failure('新证书域名与已配置域名不一致，拒绝部署。')
         # 已部署证书正常变老时走续期；新导入的证书仍须至少剩余 14 天。
-        minimum = 0 if ('renew_before_days' in self.config
-                        and fingerprint(cert) == fingerprint(self.current_cert())) else 1209600
-        capture(['openssl', 'x509', '-in', str(cert), '-noout', '-checkend', str(minimum)])
-        public_cert = capture(['openssl', 'x509', '-in', str(cert), '-pubkey', '-noout'])
-        public_key = capture(['openssl', 'pkey', '-in', str(key), '-pubout'])
+        minimum_days = 0 if ('renew_before_days' in self.config
+                             and fingerprint(cert) == fingerprint(self.current_cert())) else MIN_CANDIDATE_VALID_DAYS
+        if certificate_expiry(cert) <= time.time() + minimum_days * 86400:
+            raise Failure('候选证书有效期校验失败（要求至少剩余 {} 天）。'.format(minimum_days))
+        public_cert = capture(['openssl', 'x509', '-in', str(cert), '-pubkey', '-noout'],
+                              operation='候选证书公钥无法读取')
+        public_key = capture(['openssl', 'pkey', '-in', str(key), '-pubout'],
+                             operation='候选证书私钥无法读取')
         if public_cert.strip() != public_key.strip():
             raise Failure('新证书与私钥不匹配，拒绝部署。')
         chain = self.candidate_dir() / 'fullchain.cer'
@@ -972,15 +1143,55 @@ class Controller:
             raise Failure('新证书链不完整，拒绝部署。')
         names = sorted({probe['server_name'] for probe in self.config['probes']})
         for name in names:
-            capture(['openssl', 'verify', '-purpose', 'sslserver', '-verify_hostname', name,
-                     '-untrusted', str(ca), str(cert)])
+            self._verify_candidate_trust(cert, ca, name)
+
+    @staticmethod
+    def _openssl_verification_failure(command):
+        try:
+            result = subprocess.run(command, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE,
+                                    timeout=20, check=False)
+        except (OSError, subprocess.TimeoutExpired):
+            return 'OpenSSL 无法执行或超时', None
+        if result.returncode == 0:
+            return None, None
+        # 只记录数值错误码，避免把命令输出或文件路径写入执行记录。
+        error_code = re.search(rb'\berror ([0-9]{1,3}) at [0-9]+ depth lookup\b', result.stderr)
+        if error_code:
+            code = int(error_code[1])
+            return 'OpenSSL X.509 错误码 {}'.format(code), code
+        return 'OpenSSL 退出码 {}'.format(result.returncode), None
+
+    def _verify_candidate_trust(self, cert, ca, name):
+        options = ['openssl', 'verify', '-purpose', 'sslserver', '-verify_hostname', name]
+        command = options + ['-untrusted', str(ca), str(cert)]
+        reason, code = self._openssl_verification_failure(command)
+        if reason is None:
+            return
+        issuers = pem_chain(ca)
+        issuer_context = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+        try:
+            for issuer in issuers:
+                issuer_context.load_verify_locations(cadata=issuer)
+        except ssl.SSLError:
+            raise Failure('候选证书的颁发者链包含无法解析的证书。') from None
+        if code is None:
+            raise CertificateCheckUnavailable('候选证书的系统信任校验未完成（{}）。'.format(reason))
+        if pem_chain(cert)[0] in issuers:
+            raise Failure('候选证书被重复放入颁发者链，拒绝部署。')
+        # 仅用随附证书链判定材料是否损坏，部署仍要求系统信任校验成功。
+        chain_reason, chain_code = self._openssl_verification_failure(
+            options + ['-partial_chain', '-trusted', str(ca), str(cert)])
+        if chain_code in ISSUER_MATERIAL_ERRORS:
+            raise Failure('候选证书与随附颁发者链校验失败（{}）。'.format(chain_reason))
+        raise CandidateTrustFailure('候选证书的系统信任校验未通过（{}）。请检查 NAS 时间与 CA 信任库。'.format(reason))
 
     def backup(self, info):
         with self.history_step('backup', '确认部署前证书与服务绑定备份'):
             return self._backup(info)
 
     def _backup(self, info):
-        signature = fingerprint(self.current_cert()) + hashlib.sha256(
+        current = self._retry_certificate_check(lambda: fingerprint(self.current_cert()))
+        signature = current + hashlib.sha256(
             json.dumps(self.binding_state(info), sort_keys=True).encode()).hexdigest()[:12]
         root = self.state / 'backups'
         root.mkdir(mode=0o700, exist_ok=True)
@@ -1341,8 +1552,9 @@ class Controller:
         if state is None or state['last_notified_fingerprint'] == expected:
             return
         if state['pending'] is None or state['pending']['fingerprint'] != expected:
+            expires_at = self._retry_certificate_check(lambda: certificate_expiry(self.current_cert()))
             state['pending'] = {'fingerprint': expected, 'completed_at': now(),
-                                'expires_at': certificate_expiry(self.current_cert()),
+                                'expires_at': expires_at,
                                 'domains': list(self.config['domains'])}
             save_json(self.state / 'success-notification.json', state)
 
@@ -1356,9 +1568,8 @@ class Controller:
                 or sender.startswith('-')
                 or not re.fullmatch(r'[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,63}', sender)):
             raise Failure('群晖邮件服务未启用或发件邮箱无效；证书已生效，待发送成功通知已保留。')
-        beijing = datetime.timezone(datetime.timedelta(hours=8))
-        completed = datetime.datetime.fromisoformat(event['completed_at']).astimezone(beijing)
-        expires = datetime.datetime.fromtimestamp(event['expires_at'], beijing)
+        completed = datetime.datetime.fromisoformat(event['completed_at']).astimezone(BEIJING)
+        expires = datetime.datetime.fromtimestamp(event['expires_at'], BEIJING)
         # DSM ssmtp 从标准输入读取 LF 文本，再自行转换 SMTP 行结束符。
         message = EmailMessage(policy=SMTP.clone(linesep='\n', max_line_length=0))
         message['From'] = sender
@@ -1422,14 +1633,25 @@ class Controller:
         self.failure_stage = 'success_notification'
         self.initialize_success_notification()
         self.failure_stage = 'dsm_deploy'
-        self.history_stage('deployment', message='导入候选证书并核对服务绑定')
         # 跨续期只保护目标绑定；导入前后仍核对全部绑定，捕获接口副作用。
         current = self.binding_state(self.metadata())
         if self.target_bindings(current) != self.target_bindings(before):
             raise Failure('导入前目标证书绑定已改变，停止导入证书。')
         before = current
-        expected = fingerprint(self.candidate())
-        self.save_pending(expected, before)
+        expected = self._retry_certificate_check(lambda: fingerprint(self.candidate()))
+        baseline = self.save_pending(expected, before)
+        same_certificate = expected == baseline['certificate_fingerprint']
+        previous_reason = baseline.get('issuance_reason')
+        reason = (diagnostics.sanitize(previous_reason, secrets=self.diagnostic_secrets(), limit=240).strip()
+                  if isinstance(previous_reason, str) else '')
+        if same_certificate:
+            detail = '重新部署原因：恢复同一张证书的部署及 HTTPS 验证。'
+            if reason and baseline.get('candidate_before') != expected:
+                detail += '原签发原因：{}。'.format(reason)
+        else:
+            detail = '换证原因：{}。'.format(reason or '继续部署此前已签发的证书')
+        self.log(detail)
+        self.history_stage('deployment', message='导入候选证书并核对服务绑定。' + detail)
         import_bindings = self.state / 'import-bindings.json'
         save_json(import_bindings, before)
         if self.deployment_method() == 'local_api':
@@ -1442,20 +1664,22 @@ class Controller:
         if self.binding_state(after) != before:
             raise Failure('证书部署后服务绑定发生变化，请根据备份在 DSM 中核对恢复。')
         import_bindings.unlink(missing_ok=True)
-        if fingerprint(self.current_cert()) != expected:
+        if self._retry_certificate_check(lambda: fingerprint(self.current_cert())) != expected:
             raise Failure('部署接口返回成功，但 DSM 中证书指纹未更新；下次任务将重试。')
         self.history_actions = True
-        self.history_stage('deployment', 'succeeded', 'DSM 中的证书指纹与候选一致，服务绑定保持不变。')
+        self.history_stage('deployment', 'succeeded', detail + 'DSM 中的证书指纹与候选一致，服务绑定保持不变。')
         self.failure_stage = 'tls_verify'
         self.verify_probes(expected, attempts=6)
         self.failure_stage = 'success_notification'
         self.queue_success_notification(expected)
         (self.state / 'pending.json').unlink(missing_ok=True)
-        self.log('新证书已部署；所有配置的 HTTPS 端点证书链、域名及指纹校验通过。')
+        action = '证书已重新部署' if same_certificate else '新证书已部署'
+        self.log(action + '，所有配置的 HTTPS 端点证书链、域名及指纹校验通过。')
 
     def run(self):
         self.begin_history('routine')
         self.history_stage('preflight', message='读取配置并核对原有运行状态')
+        self.certificate_clock_offset = time.time() - time.monotonic()
         try:
             result = self._run_request()
         except BaseException as error:
@@ -1471,6 +1695,8 @@ class Controller:
                                 '检查正常，本轮无需签发、替换或发送成功通知。' if skipped else
                                 '本轮执行完成；各阶段实际结果见时间线。')
             return result
+        finally:
+            self.certificate_clock_offset = None
 
     def _run_request(self):
         self.load()
@@ -1492,12 +1718,13 @@ class Controller:
             if force:
                 force.update(state='running', message='正在检查申请条件并申请新证书。')
                 self.save_manual_renewal(force)
-                self.assert_manual_prerequisites()
+                self._retry_certificate_check(self.assert_manual_prerequisites)
             if force or recovery:
                 if (request['certificate_id'] != self.config['certificate_id']
                         or request['domains'] != self.config['domains']):
                     raise Failure('手动申请的目标或域名已改变，停止执行。')
-            if force and request['baseline_fingerprint'] != fingerprint(self.current_cert()):
+            if force and request['baseline_fingerprint'] != self._retry_certificate_check(
+                    lambda: fingerprint(self.current_cert())):
                 raise Failure('提交请求后当前证书已改变，本次不再申请新证书。')
             self._run(force=force, recovery=recovery)
         except (Exception, KeyboardInterrupt):
@@ -1523,7 +1750,7 @@ class Controller:
         self.acme_evidence, self.acme_events, self.cleanup_events = '', [], []
         cleanup_ok = self.retry_dns_cleanup()
         self.failure_stage = 'preflight'
-        info = self.preflight(check_endpoints=False)
+        info = self.preflight_with_history(check_endpoints=False)
         self.failure_stage = 'success_notification'
         self.initialize_success_notification()
         self.failure_stage = 'preflight'
@@ -1534,17 +1761,22 @@ class Controller:
                 raise Failure('前次导入后服务绑定发生变化，请先按备份核查恢复。')
             import_bindings.unlink()
         baseline = self.state / 'run-baseline.json'
+        pending = self.state / 'pending.json'
         baseline_data = self.run_baseline(before)
-        self.history_stage('preflight', 'succeeded', '配置、系统、证书目标、绑定与来源检查通过。')
+        undeployed_candidate = (baseline_data['issuance_started'] and self._retry_certificate_check(self.candidate_identity)
+                                not in (None, 'unreadable', baseline_data['certificate_fingerprint']))
         self.failure_stage = 'backup'
         self.backup(info)
         if force or recovery:
             baseline_data['manual_request_id'] = (force or recovery)['request_id']
-        self.save_run_baseline(baseline_data)
+        # 已有待部署记录可能依赖最后一次成功结果迁移来源，失败记录覆盖前先保留。
+        if baseline.exists() or pending.exists() or force or recovery:
+            self.save_run_baseline(baseline_data)
         self.failure_stage = 'preflight'
-        pending = self.state / 'pending.json'
         primary = self.config['domains'][0]
         conf = self.candidate_dir() / (primary + '.conf')
+        material_recovery_reason = None
+        resumed_deployment = False
         if self.candidate().exists() and not conf.is_file():
             raise Failure('已有 ACME 证书但配置缺失，停止以避免错误跳过续期。')
         if pending.exists():
@@ -1553,11 +1785,13 @@ class Controller:
             self.failure_stage = 'certificate_validation'
             try:
                 self.candidate_valid()
-            except Failure:
-                recovery_state = {'at': now(), 'needs_recovery': True}
-                if force or recovery:
-                    recovery_state['manual_request_id'] = (force or recovery)['request_id']
-                save_json(pending, recovery_state)
+            except CertificateCheckUnavailable:
+                # 已签发材料可能尚未写入待部署记录。环境异常时保留并等待下次任务。
+                raise
+            except Failure as error:
+                if not baseline.exists():
+                    self.save_run_baseline(baseline_data)
+                material_recovery_reason = self.mark_candidate_recovery(error, force or recovery)
                 if recovery:
                     raise Failure('手动申请的候选证书无效，已停止；不会通过恢复流程再次签发。')
                 if force:
@@ -1566,11 +1800,13 @@ class Controller:
                 self.recover_candidate()
             else:
                 (self.state / 'recovery.json').unlink(missing_ok=True)
-                if pending.exists() and (recovery or not self.renewal_due()):
+                if (pending.exists() or undeployed_candidate) and (recovery or not self.renewal_due()):
                     self.deploy_and_verify(before)
+                    resumed_deployment = undeployed_candidate
         else:
             self.failure_stage = 'tls_verify'
-            self.verify_probes(fingerprint(self.current_cert()), verify_chain=False)
+            current = self._retry_certificate_check(lambda: fingerprint(self.current_cert()))
+            self.verify_probes(current, verify_chain=False)
         if self.candidate().exists():
             args = ['--renew', '-d', primary]
             if force:
@@ -1586,6 +1822,9 @@ class Controller:
             result = 2
             self.history_stage('issuance', 'skipped', '只恢复已消耗的申请，本轮不再次签发。')
             self.log('恢复已消耗的手动申请，仅完成现有证书部署与清理，不再次签发。')
+        elif resumed_deployment:
+            result = 2
+            self.history_stage('issuance', 'skipped', '已恢复部署此前取得的证书，本轮无需再次签发。')
         elif not force and 'renew_before_days' in self.config and self.candidate().exists() and not self.renewal_due():
             # 门控在包装器中执行，历史 ACME 日期或 CA 窗口不能提前触发签发。
             result = 2
@@ -1595,18 +1834,32 @@ class Controller:
             self.failure_stage = 'acme'
             if force:
                 self.consume_manual_renewal(force)
-            self.record_issuance(before)
-            self.history_stage('issuance', message='调用 acme.sh 进行 DNS 验证及证书申请')
+                reason = '手动立即申请'
+            elif material_recovery_reason:
+                reason = material_recovery_reason
+            elif args[0] == '--issue':
+                reason = '本机没有可用的 ACME 候选证书，需申请证书'
+            elif 'renew_before_days' in self.config:
+                reason = '已进入到期前 {} 天的续期窗口'.format(self.config['renew_before_days'])
+            else:
+                reason = '按 ACME 原续期计划检查并申请'
+            if not baseline.exists():
+                self.save_run_baseline(baseline_data)
+            self.record_issuance(before, reason=reason)
+            detail = '签发原因：{}。'.format(reason)
+            self.log(detail)
+            self.history_stage('issuance', message='调用 acme.sh 进行 DNS 验证及证书申请。' + detail)
             try:
                 result = self.invoke_acme(args)
             except BaseException as error:
                 state = 'interrupted' if isinstance(error, (KeyboardInterrupt, InterruptedError, SystemExit)) else 'failed'
-                self.history_stage('issuance', state, '签发调用未完成，保留已记录的签发意图。')
+                self.history_stage('issuance', state, detail + '签发调用未完成，保留已记录的签发意图。')
                 raise
             else:
+                summary = ('签发流程返回成功，仍需校验并部署材料。' if result == 0 else
+                           'acme.sh 返回跳过，仍需校验现有材料。' if result == 2 else '签发流程返回失败。')
                 self.history_stage('issuance', 'succeeded' if result == 0 else 'skipped' if result == 2 else 'failed',
-                                   '签发流程返回成功，仍需校验并部署材料。' if result == 0 else
-                                   'acme.sh 返回跳过，仍需校验现有材料。' if result == 2 else '签发流程返回失败。')
+                                   detail + summary)
                 self.history_actions = self.history_actions or result == 0
             finally:
                 self.history_dns()
@@ -1614,30 +1867,32 @@ class Controller:
             if force:
                 force['issuance_result'] = result
                 self.save_manual_renewal(force)
-        if self.candidate().exists() and fingerprint(self.candidate()) != fingerprint(self.current_cert()):
-            self.save_pending(fingerprint(self.candidate()), before)
+        candidate = self._retry_certificate_check(self.candidate_identity)
+        if (candidate not in (None, 'unreadable')
+                and candidate != self._retry_certificate_check(lambda: fingerprint(self.current_cert()))):
+            self.save_pending(candidate, before)
         if result not in (0, 2):
             self.failure_stage = 'acme'
             raise Failure('签发或续期失败；部署前备份已保留。详见 state/acme-last.log。')
-        if force and (result == 2 or not self.candidate().is_file()
-                      or fingerprint(self.candidate()) == force['baseline_fingerprint']):
-            raise Failure('立即申请未生成不同指纹的新证书，不能将跳过或旧证书当作成功。')
         self.failure_stage = 'certificate_validation'
-        if not self.candidate().is_file():
-            recovery_state = {'at': now(), 'needs_recovery': True}
-            if force or recovery:
-                recovery_state['manual_request_id'] = (force or recovery)['request_id']
-            save_json(pending, recovery_state)
-            raise Failure('ACME 未生成预期证书，不能将跳过状态当作签发成功。')
+        if candidate is None:
+            error = Failure('ACME 未生成预期证书，不能将跳过状态当作签发成功。')
+            self.mark_candidate_recovery(error, force or recovery)
+            self.history_stage('certificate_validation', 'failed', str(error), timed=False)
+            raise error
         self.candidate_valid()
+        if force and (result == 2 or candidate == force['baseline_fingerprint']):
+            self.failure_stage = 'acme'
+            raise Failure('立即申请未生成不同指纹的新证书，不能将跳过或旧证书当作成功。')
         if not recovery and self.renewal_due():
             raise Failure('已进入续期窗口，但尚未获得有效的新证书；下次任务重试。')
         (self.state / 'recovery.json').unlink(missing_ok=True)
         self.failure_stage = 'dsm_deploy'
         if self.target_bindings(self.binding_state(self.metadata())) != self.target_bindings(before):
             raise Failure('续期后服务绑定发生变化，请核对备份，停止后续自动操作。')
-        expected = fingerprint(self.candidate())
-        if expected != fingerprint(self.current_cert()) or pending.exists():
+        expected, current = self._retry_certificate_check(
+            lambda: (fingerprint(self.candidate()), fingerprint(self.current_cert())))
+        if expected != current or pending.exists():
             self.deploy_and_verify(before)
         else:
             self.failure_stage = 'tls_verify'
@@ -1677,7 +1932,8 @@ class Controller:
 
 
 def interrupted(_signal, _frame):
-    raise InterruptedError('操作被中断。')
+    # 与 SIGINT 一样按任务中断处理，让信号穿过文件和子进程的 OSError 恢复分支。
+    raise KeyboardInterrupt('操作被中断。')
 
 
 def main(argv=None):
@@ -1717,7 +1973,7 @@ def main(argv=None):
                     controller.assert_manual_idle()
                     controller.load()
                     controller.history_context('check')
-                    controller.preflight()
+                    controller.preflight_with_history()
                     controller.log('预检查通过：系统、唯一证书、域名、服务绑定与接口正常。')
                 except BaseException as error:
                     status = 'skipped' if isinstance(error, Busy) else 'interrupted' if isinstance(
@@ -1725,7 +1981,6 @@ def main(argv=None):
                     controller.finish_history(status, '只读预检查未完成，未执行证书申请或替换。')
                     raise
                 else:
-                    controller.history_stage('preflight', 'succeeded', '只读预检查通过。')
                     controller.finish_history('succeeded', '只读预检查通过，未申请或替换证书。')
             else:
                 controller.status()

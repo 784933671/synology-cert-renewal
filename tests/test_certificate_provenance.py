@@ -131,6 +131,28 @@ class CertificateProvenanceTests(unittest.TestCase):
         self.controller.invoke_acme.assert_not_called()
         self.controller.deploy_local_api.assert_called_once()
 
+    def test_expiry_read_failure_preserves_legacy_pending_provenance(self):
+        self.fixture.prepare_candidate('new')
+        pending = self.controller.state / 'pending.json'
+        certctl.save_json(pending, {'fingerprint': self.fixture.new_fingerprint})
+        certctl.save_json(self.controller.state / 'last-result.json', {
+            'success': True, 'fingerprint': self.fixture.old_fingerprint})
+        original = pending.read_bytes()
+
+        with mock.patch.object(certctl, 'certificate_expiry',
+                               side_effect=certctl.CertificateCheckUnavailable('OpenSSL 暂不可用')):
+            with self.assertRaises(certctl.CertificateCheckUnavailable) as failure:
+                self.controller.run()
+        with mock.patch.object(certctl.sys, 'stderr'):
+            self.assertEqual(self.controller.report_failure(failure.exception), 1)
+
+        self.controller.deploy_local_api.assert_not_called()
+        self.assertEqual(pending.read_bytes(), original)
+        self.controller.run()
+        self.controller.invoke_acme.assert_not_called()
+        self.controller.deploy_local_api.assert_called_once()
+        self.assertFalse(pending.exists())
+
     def test_legacy_pending_without_known_baseline_is_preserved_for_review(self):
         self.fixture.prepare_candidate('new')
         path = self.controller.state / 'pending.json'

@@ -1,5 +1,8 @@
+import contextlib
 import copy
+from datetime import datetime, timedelta, timezone
 import importlib.util
+import io
 import json
 import os
 from pathlib import Path
@@ -306,15 +309,30 @@ class RunHistoryBusinessTests(unittest.TestCase):
 
     def test_ordinary_outside_window_check_is_recorded_as_skip_without_false_dns_success(self):
         self.controller.invoke_acme = mock.Mock(side_effect=AssertionError('不得签发'))
+        expiry = certctl.certificate_expiry(self.controller.current_cert())
         self.controller.run()
         self.controller.invoke_acme.assert_not_called()
         self.assertEqual(self.detail()['kind'], 'routine')
         self.assertEqual(self.detail()['status'], 'skipped')
+        expected_expiry = datetime.fromtimestamp(expiry, timezone(timedelta(hours=8))).strftime('%Y-%m-%d %H:%M:%S')
+        self.assertIn('当前 DSM 证书到期时间：' + expected_expiry + '（北京时间）',
+                      self.stage('preflight')[-1]['message'])
+        self.assertTrue(any(expected_expiry in call.args[0] for call in self.controller.log.call_args_list))
         for name in ('issuance', 'dns_validation', 'deployment', 'notification'):
             self.assertEqual(self.stage(name)[-1]['status'], 'skipped')
         self.assertEqual(self.stage('tls_verify')[-1]['status'], 'succeeded')
         self.assertEqual(self.detail()['domains'], ['ttxli.cn', '*.ttxli.cn'])
         self.assertEqual(self.detail()['certificate_id'], 'ABC123')
+
+    def test_failed_preflight_still_reports_expiry_of_identified_certificate(self):
+        self.controller.preflight = mock.Mock(side_effect=certctl.Failure('无法连接 HTTPS 验证端点'))
+        with self.assertRaisesRegex(certctl.Failure, '无法连接 HTTPS'):
+            self.controller.run()
+
+        self.assertEqual(self.stage('preflight')[-1]['status'], 'failed')
+        self.assertIn('当前 DSM 证书到期时间：', self.stage('preflight')[-1]['message'])
+        self.assertTrue(any('当前 DSM 证书到期时间：' in call.args[0]
+                            for call in self.controller.log.call_args_list))
 
     def test_due_renewal_records_real_boundaries_but_no_invented_dns_timing(self):
         self.fixture.install_current('short')
@@ -326,10 +344,56 @@ class RunHistoryBusinessTests(unittest.TestCase):
         for name in ('issuance', 'deployment', 'tls_verify', 'dns_cleanup_check'):
             self.assertEqual(self.stage(name)[-1]['status'], 'succeeded')
             self.assertIsNotNone(self.stage(name)[-1]['started_at'])
+        self.assertIn('到期前 2 天的续期窗口', self.stage('deployment')[-1]['message'])
         dns = self.stage('dns_validation')[-1]
         self.assertEqual(dns['status'], 'unknown')
         self.assertIsNone(dns['duration_seconds'])
         self.assertIsNone(dns['started_at'])
+
+    def test_unwritable_event_log_does_not_block_signing_or_deployment(self):
+        self.fixture.install_current('short')
+        self.fixture.prepare_candidate('short')
+        self.controller.log = certctl.Controller.log.__get__(self.controller)
+        self.controller.invoke_acme = mock.Mock(side_effect=self.issue_and_deploy)
+        event_log = self.controller.state / 'events.log'
+        open_path = Path.open
+
+        def cannot_open_event_log(path, *args, **kwargs):
+            if path == event_log:
+                raise PermissionError('event log is read-only')
+            return open_path(path, *args, **kwargs)
+
+        errors = io.StringIO()
+        with mock.patch.object(Path, 'open', cannot_open_event_log), contextlib.redirect_stderr(errors):
+            self.controller.run()
+
+        self.assertIn('events.log', errors.getvalue())
+        self.assertEqual([call.args[0][0] for call in self.controller.invoke_acme.call_args_list], ['--renew', '--deploy'])
+        self.assertEqual(self.detail()['status'], 'succeeded')
+        self.assertIn('当前 DSM 证书到期时间：', self.stage('preflight')[-1]['message'])
+        self.assertIn('到期前 2 天的续期窗口', self.stage('deployment')[-1]['message'])
+
+    def test_sigterm_while_logging_expiry_stops_before_signing(self):
+        self.fixture.install_current('short')
+        self.fixture.prepare_candidate('short')
+        self.controller.invoke_acme = mock.Mock(side_effect=self.issue_and_deploy)
+        self.controller.log = certctl.Controller.log.__get__(self.controller)
+        event_log = self.controller.state / 'events.log'
+        open_path = Path.open
+
+        def interrupt_event_log(path, *args, **kwargs):
+            if path == event_log:
+                certctl.interrupted(certctl.signal.SIGTERM, None)
+            return open_path(path, *args, **kwargs)
+
+        with mock.patch.object(Path, 'open', interrupt_event_log):
+            with self.assertRaises((KeyboardInterrupt, InterruptedError)):
+                self.controller.run()
+
+        self.controller.invoke_acme.assert_not_called()
+        self.assertEqual(self.detail()['status'], 'interrupted')
+        self.assertEqual(self.stage('issuance')[-1]['status'], 'skipped')
+        self.assertFalse((self.controller.state / 'run-baseline.json').exists())
 
     def test_forced_request_record_and_following_routine_check_do_not_reissue(self):
         self.request()
@@ -338,10 +402,114 @@ class RunHistoryBusinessTests(unittest.TestCase):
         self.assertEqual(self.detail()['kind'], 'forced')
         self.assertEqual(self.detail()['status'], 'succeeded')
         self.assertIn('--force', self.controller.invoke_acme.call_args_list[0].args[0])
+        self.assertIn('手动立即申请', self.stage('deployment')[-1]['message'])
         self.controller.run()
         self.assertEqual(self.controller.invoke_acme.call_count, 2)
         self.assertEqual(self.detail()['status'], 'skipped')
         self.assertEqual(self.store.list()['total'], 2)
+
+    def test_deployment_retry_retains_original_replacement_reason(self):
+        self.fixture.install_current('short')
+        self.fixture.prepare_candidate('short')
+
+        def failed_deployment(arguments):
+            if arguments[0] == '--deploy':
+                return 1
+            return self.issue_and_deploy(arguments)
+
+        self.controller.invoke_acme = mock.Mock(side_effect=failed_deployment)
+        with self.assertRaisesRegex(certctl.Failure, 'DSM 部署失败'):
+            self.controller.run()
+        self.controller.invoke_acme = mock.Mock(side_effect=self.issue_and_deploy)
+        self.controller.run()
+
+        self.assertEqual(self.controller.invoke_acme.call_args.args[0][0], '--deploy')
+        self.assertIn('到期前 2 天的续期窗口', self.stage('deployment')[-1]['message'])
+
+    def test_same_certificate_retry_reports_tls_recovery_instead_of_issuance(self):
+        del self.controller.config['renew_before_days']
+        self.controller.invoke_acme = mock.Mock(return_value=2)
+        with mock.patch.object(self.controller, 'verify_probes', side_effect=certctl.Failure('TLS verification failed')):
+            with self.assertRaisesRegex(certctl.Failure, 'TLS verification failed'):
+                self.controller.run()
+
+        self.controller.invoke_acme = mock.Mock(side_effect=lambda args: 0 if args[0] == '--deploy' else 2)
+        self.controller.run()
+
+        message = self.stage('deployment')[-1]['message']
+        self.assertIn('重新部署原因：恢复同一张证书的部署及 HTTPS 验证', message)
+        self.assertTrue(any('证书已重新部署' in call.args[0] for call in self.controller.log.call_args_list))
+
+    def test_material_recovery_records_the_validation_failure_and_replacement_reason(self):
+        shutil.copyfile(self.fixture.fixtures / 'new.key', self.controller.candidate_dir() / 'ttxli.cn.key')
+        self.controller.invoke_acme = mock.Mock(side_effect=self.issue_and_deploy)
+        self.controller.run()
+
+        self.assertIn('私钥不匹配', self.stage('certificate_validation')[0]['message'])
+        self.assertIn('私钥不匹配', self.stage('deployment')[-1]['message'])
+
+    def test_recovery_reason_survives_interruption_after_material_is_quarantined(self):
+        shutil.copyfile(self.fixture.fixtures / 'new.key', self.controller.candidate_dir() / 'ttxli.cn.key')
+        self.controller.invoke_acme = mock.Mock(side_effect=self.issue_and_deploy)
+        recover_candidate = self.controller.recover_candidate
+        started = certctl.time.time()
+
+        def quarantine_then_interrupt():
+            recover_candidate()
+            raise SystemExit('interrupted after quarantine')
+
+        with mock.patch.object(self.controller, 'recover_candidate', side_effect=quarantine_then_interrupt):
+            with self.assertRaises(SystemExit):
+                self.controller.run()
+        self.assertFalse(self.controller.candidate_dir().exists())
+        self.controller.invoke_acme.assert_not_called()
+        self.assertEqual(self.detail()['status'], 'interrupted')
+
+        retry = started + certctl.SHORT_RECOVERY_INTERVAL + 60
+        with mock.patch.object(certctl.time, 'time', return_value=retry):
+            self.controller.run()
+
+        self.assertEqual([call.args[0][0] for call in self.controller.invoke_acme.call_args_list], ['--issue', '--deploy'])
+        self.assertIn('私钥不匹配', self.stage('issuance')[-1]['message'])
+        self.assertIn('私钥不匹配', self.stage('deployment')[-1]['message'])
+
+    def test_unreadable_leaf_from_successful_renewal_is_reported_during_validation(self):
+        self.fixture.install_current('short')
+        self.fixture.prepare_candidate('short')
+
+        def renew(arguments):
+            self.assertEqual(arguments[0], '--renew')
+            self.controller.candidate().write_text('invalid certificate')
+            return 0
+
+        self.controller.invoke_acme = mock.Mock(side_effect=renew)
+        with self.assertRaisesRegex(certctl.Failure, '候选证书无法读取'):
+            self.controller.run()
+
+        self.controller.invoke_acme.assert_called_once()
+        self.assertEqual(self.stage('issuance')[-1]['status'], 'succeeded')
+        validation = self.stage('certificate_validation')[-1]
+        self.assertEqual(validation['status'], 'failed')
+        self.assertIn('候选证书无法读取', validation['message'])
+        self.assertEqual(self.stage('deployment')[-1]['status'], 'skipped')
+
+    def test_missing_leaf_from_successful_forced_issuance_retains_recovery_state(self):
+        self.request()
+
+        def issue(arguments):
+            self.assertIn('--force', arguments)
+            self.controller.candidate().unlink()
+            return 0
+
+        self.controller.invoke_acme = mock.Mock(side_effect=issue)
+        with self.assertRaisesRegex(certctl.Failure, 'ACME 未生成预期证书'):
+            self.controller.run()
+
+        self.controller.invoke_acme.assert_called_once()
+        self.assertTrue(self.controller.manual_renewal()['force_consumed'])
+        pending = certctl.read_json(self.controller.state / 'pending.json')
+        self.assertTrue(pending['needs_recovery'])
+        self.assertIn('ACME 未生成预期证书', pending['recovery_reason'])
 
     def test_dns_failure_exposes_classification_without_output_or_credentials(self):
         self.request()

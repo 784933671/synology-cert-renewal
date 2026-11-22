@@ -934,6 +934,75 @@ class ContainerProjectLifecycleTests(unittest.TestCase):
 
     tick = StartupStabilityTests.tick
 
+    def run_supervisor(self, ticks, uptime=120):
+        read_text = Path.read_text
+        boot_files = {
+            Path('/proc/uptime'): '{}.00 0.00\n'.format(uptime),
+            Path('/proc/sys/kernel/random/boot_id'): '11111111-1111-1111-1111-111111111111\n',
+        }
+
+        def read(path, *args, **kwargs):
+            if path in boot_files:
+                return boot_files[path]
+            return read_text(path, *args, **kwargs)
+
+        reconcile = self.service.reconcile
+        times = iter(ticks)
+
+        def reconcile_once():
+            when = next(times, None)
+            if when is None:
+                self.service.stopping = True
+                return
+            self.now = when
+            reconcile()
+
+        self.service.stopping = False
+        with patch.object(Path, 'read_text', read), patch.object(self.service, 'reconcile', reconcile_once), \
+                patch('web.deployment.signal.signal'), patch('web.deployment.time.sleep'):
+            self.assertEqual(self.service.serve(), 0)
+
+    def test_recent_nas_boot_starts_existing_project_once_after_stability(self):
+        calls = []
+
+        def start(*args):
+            calls.append((self.now, args, self.gates[-1]))
+            self.running = True
+
+        self.service.compose.side_effect = start
+        self.run_supervisor((0, 59, 60, 70))
+        self.run_supervisor((90, 150, 160))
+        self.assertEqual(calls, [(60, ('start', 'certweb'), True)])
+
+    def test_recent_nas_boot_retries_failed_project_start_after_new_stability_window(self):
+        calls = []
+        stop = self.service.stop_container.side_effect
+
+        def stop_project():
+            self.service.project_ready(False)
+            stop()
+
+        def start(*args):
+            calls.append((self.now, args, self.gates[-1]))
+            if len(calls) == 1:
+                raise RuntimeError('Docker was not ready')
+            self.running = True
+
+        self.service.compose.side_effect = start
+        self.service.stop_container.side_effect = stop_project
+        self.run_supervisor((0, 60, 70, 129, 130, 140))
+        self.assertEqual(calls, [(60, ('start', 'certweb'), True), (130, ('start', 'certweb'), True)])
+
+    def test_manual_supervisor_restart_during_day_leaves_project_stopped(self):
+        self.run_supervisor((0, 60, 70), uptime=7200)
+        self.service.compose.assert_not_called()
+
+    def test_recent_nas_boot_does_not_start_a_project_without_the_readiness_gate(self):
+        self.service.container.side_effect = lambda: {'State': {'Running': False, 'Restarting': False},
+                                                       'Config': {'Env': []}}
+        self.run_supervisor((0, 60, 70))
+        self.service.compose.assert_not_called()
+
     def test_stopped_or_missing_project_waits_without_creating_container(self):
         self.service.container.return_value = None
         self.service.container.side_effect = None

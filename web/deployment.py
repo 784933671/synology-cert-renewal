@@ -34,6 +34,7 @@ CONTAINER = 'synology-cert-web'
 MANAGED_LABEL = 'io.github.784933671.certweb.managed'
 DEFAULT_CONFIG = Path('/usr/local/share/synology-cert-web/deployment.json')
 START_STABLE_SECONDS = 60
+PROJECT_BOOT_SECONDS = 30 * 60
 STARTUP_CHECK_RETRY_SECONDS = 60
 SCHEDULE_SYNC_SECONDS = 60
 SCHEDULE_SYNC_TIMEOUT = 120
@@ -127,6 +128,7 @@ class Deployment:
         self.home = Path(config['home'])
         self.code = self.home / 'code'
         self.project = load_project(self.home)
+        self.project_boot = None
         self.compose_project = 'synology-cert-web'
         self.project_granted = False
         self.access_path = self.home / 'access/access.json'
@@ -188,6 +190,51 @@ class Deployment:
         finally:
             if os.path.exists(temporary):
                 os.unlink(temporary)
+
+    def prepare_project_boot(self):
+        self.project_boot = None
+        if not self.project:
+            return
+        try:
+            uptime = float(Path('/proc/uptime').read_text().split()[0])
+            if not 0 <= uptime < PROJECT_BOOT_SECONDS:
+                return
+            boot_id = Path('/proc/sys/kernel/random/boot_id').read_text().strip()
+            if not re.fullmatch(r'[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}', boot_id):
+                raise ValueError('无法识别的开机标识')
+            previous = health_monitor.read_json(self.home / 'project-boot.json', {}, os.geteuid())
+            if not isinstance(previous, dict) or previous and not isinstance(previous.get('boot_id'), str):
+                raise ValueError('无法识别的项目开机记录')
+        except (OSError, ValueError, IndexError):
+            self.report('waiting', '无法核对开机记录，等待从 Container Manager 项目启动。')
+            return
+        if previous.get('boot_id') != boot_id:
+            self.project_boot = (boot_id, self.clock() + PROJECT_BOOT_SECONDS - uptime)
+
+    def start_project_at_boot(self, running):
+        if self.project_boot is None:
+            return running
+        boot_id, deadline = self.project_boot
+        if self.clock() >= deadline:
+            self.project_boot = None
+            return running
+        if not running:
+            self.phase = 'start'
+            if not self.report('starting', '开机启动条件已稳定，正在启动现有 Container Manager 项目。'):
+                return False
+            self.compose('start', 'certweb')
+            self.observed_container = self.container()
+            state = (self.observed_container or {}).get('State', {})
+            if not state.get('Running') or state.get('Restarting'):
+                raise RuntimeError('项目容器启动后未保持运行')
+            self.started = True
+            self.report('running', '已在 DSM 开机时启动 Container Manager 项目。')
+        self.project_boot = None
+        try:
+            health_monitor.write_json(self.home / 'project-boot.json', {'boot_id': boot_id}, os.geteuid())
+        except (OSError, ValueError):
+            self.report('running', '项目已运行，写入本次开机记录失败。')
+        return True
 
     def container(self):
         result = subprocess.run(['/usr/local/bin/docker', 'inspect', CONTAINER], env=self.env, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, universal_newlines=True, timeout=15)
@@ -683,9 +730,10 @@ class Deployment:
                 return
             if self.project:
                 environment = item.get('Config', {}).get('Env') if item else None
-                if running and (not isinstance(environment, list)
-                                or [value for value in environment if isinstance(value, str)
-                                    and value.startswith('CERTWEB_PROJECT_MODE=')] != ['CERTWEB_PROJECT_MODE=1']):
+                has_gate = (isinstance(environment, list)
+                            and [value for value in environment if isinstance(value, str)
+                                 and value.startswith('CERTWEB_PROJECT_MODE=')] == ['CERTWEB_PROJECT_MODE=1'])
+                if running and not has_gate:
                     self.phase = 'project-config'
                     raise RuntimeError('请在 Container Manager 项目中应用新配置')
                 if not self.project_granted:
@@ -704,6 +752,8 @@ class Deployment:
                     return
                 self.project_ready(True)
                 self.project_granted = True
+                if has_gate:
+                    running = self.start_project_at_boot(running)
                 self.phase = 'running' if running else 'project'
                 self.report('running' if running else 'waiting', '管理服务由 Container Manager 项目托管。' if running
                             else '宿主条件已就绪，等待在 Container Manager 项目中启动容器。')
@@ -768,6 +818,7 @@ class Deployment:
             for sig in (signal.SIGTERM, signal.SIGINT):
                 signal.signal(sig, lambda *_: setattr(self, 'stopping', True))
             try:
+                self.prepare_project_boot()
                 self.startup_requested_generation = (secrets.token_hex(32), dt.datetime.now(dt.timezone.utc).isoformat())
                 self.start_schedule_sync()
                 self.start_startup_check()

@@ -887,8 +887,7 @@ class Bridge:
         try:
             controller.begin_history('check')
             controller.history_stage('preflight')
-            controller.preflight()
-            controller.history_stage('preflight', 'succeeded')
+            controller.preflight_with_history()
             result.update(success=True, message='预检查通过：系统、证书、域名、服务绑定与接口正常。')
         except Exception as error:
             if isinstance(error, executor.Failure):
