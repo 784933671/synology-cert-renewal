@@ -8,6 +8,8 @@ RUN npm run build
 FROM python:3.12-alpine@sha256:e6dae589c1c05976188fd3bd019afd091445fc533ed2ea29001beddc7368a9c8
 ENV PYTHONUNBUFFERED=1 PYTHONDONTWRITEBYTECODE=1 PIP_DISABLE_PIP_VERSION_CHECK=1
 WORKDIR /app
+# 基础镜像尚未包含 Kerberos 安全修复，从当前 Alpine 稳定仓库安装修复版。
+RUN apk add --no-cache 'krb5-libs>=1.22.3-r0'
 # 上游稳定镜像暂未包含 SQLite FTS5 修复；仅补官方签名单包，不切换系统仓库。
 RUN test "$(apk --print-arch)" = x86_64 \
     && if ! python -c 'import sqlite3; assert sqlite3.sqlite_version_info >= (3, 54, 0)'; then \
